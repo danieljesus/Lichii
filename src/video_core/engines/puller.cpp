@@ -62,6 +62,55 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
+// EDEN_NX2_ACQUIRE_FASTPATH=1: before draining the split GPU thread's back half for a GEQUAL
+// acquire, look at the word guest memory already holds. Semaphore payloads only grow, and what
+// the back still has queued (or the buffer cache holds) is newer, so a word that already meets
+// the value stays met once the back catches up: the drain can be skipped.
+bool AcquireFastPathEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_ACQUIRE_FASTPATH");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+struct AcquireFastPathStats {
+    std::atomic<u64> hits{};
+    std::atomic<u64> misses{};
+    std::atomic<s64> last_report{};
+};
+
+AcquireFastPathStats& FastPathStats() {
+    static AcquireFastPathStats stats;
+    return stats;
+}
+
+void NoteFastPath(bool hit) {
+    auto& stats = FastPathStats();
+    (hit ? stats.hits : stats.misses).fetch_add(1, std::memory_order_relaxed);
+    const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 last = stats.last_report.load(std::memory_order_relaxed);
+    if (now - last >= 10 && stats.last_report.compare_exchange_strong(last, now)) {
+        const u64 hits = stats.hits.exchange(0, std::memory_order_relaxed);
+        const u64 misses = stats.misses.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(HW_GPU, "Acquire fast path: {} drains skipped, {} drains needed ({:.1f}% skipped)",
+                 hits, misses,
+                 hits + misses == 0 ? 0.0 : 100.0 * static_cast<double>(hits) / (hits + misses));
+    }
+}
+
+/// True when a GEQUAL acquire is already met by the word in guest memory (no drain needed).
+bool AcquireMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value, bool gequal) {
+    if (!gequal || !AcquireFastPathEnabled()) {
+        return false;
+    }
+    const bool met = dma_pusher.memory_manager.Read<u32>(address) >= value;
+    NoteFastPath(met);
+    return met;
+}
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
@@ -87,6 +136,11 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
+        return true;
+    }
+    if (AcquireMetWithoutDrain(dma_pusher, pending_acquire->address, pending_acquire->value,
+                               static_cast<GpuSemaphoreOperation>(pending_acquire->operation) ==
+                                   GpuSemaphoreOperation::AcquireGequal)) {
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
@@ -272,6 +326,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (AcquireMetWithoutDrain(dma_pusher, acquire.address, acquire.value,
+                                   op == GpuSemaphoreOperation::AcquireGequal)) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
