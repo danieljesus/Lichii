@@ -279,7 +279,13 @@ public:
     enum class SeparatePool : u32 {
         SparsePages,
         DeviceBuffers,
+        /// EDEN_NX2_RT_POOL: single-sample 2D render targets, in larger blocks (see
+        /// RenderTargetPoolBlockSize) that the driver keeps while targets come and go.
+        RenderTargets,
     };
+    /// Block size of the RenderTargets pool: EDEN_NX2_RT_POOL's value in MiB (16 or more),
+    /// 128 MiB for any other value, 0 when the variable is unset (the pool is off).
+    static VkDeviceSize RenderTargetPoolBlockSize();
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
@@ -1276,7 +1282,7 @@ private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
     mutable std::mutex separate_pools_mutex;
-    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
+    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 3> separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.
