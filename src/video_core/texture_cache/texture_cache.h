@@ -157,8 +157,52 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
+    // GPU-written images are read back before they go. One GPU wait per image cost about 3 waits
+    // a frame in Ocarina of Time on a Steam Deck: a pass records its read-backs and waits once,
+    // then writes them back, untracks and deletes the images in the single-image path's order.
+    // Bounds the staging memory one batch holds before it is flushed.
+    constexpr u64 MaxBatchDownloadBytes = 64_MiB;
+    struct GcDownload {
+        ImageId image_id;
+        decltype(runtime.DownloadStagingBuffer(0)) map;
+        decltype(FullDownloadCopies(std::declval<const ImageInfo&>())) copies;
+    };
+    std::vector<GcDownload> pending_downloads;
+    u64 pending_download_bytes = 0; // staging bytes held by the batch
+    u64 pending_image_bytes = 0;    // device memory the batch's images free once deleted
+    const auto UsedMemory = [this, &pending_image_bytes] {
+        return total_used_memory - (std::min)(total_used_memory, pending_image_bytes);
+    };
+    const auto Evict = [this](ImageId image_id) {
+        auto& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+        UnregisterImage(image_id);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+    };
+    const auto FlushDownloads = [&] {
+        if (pending_downloads.empty()) {
+            return;
+        }
+        runtime.Finish();
+        for (auto& pending : pending_downloads) {
+            auto& image = slot_images[pending.image_id];
+            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, pending.copies,
+                         pending.map.mapped_span, swizzle_data_buffer);
+            ++gc_download_deletes;
+            ClearStaleImage(image);
+            Evict(pending.image_id);
+        }
+        pending_downloads.clear();
+        pending_download_bytes = 0;
+        pending_image_bytes = 0;
+    };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, out_of_memory](ImageId image_id) {
+                          &evict_old_costly, out_of_memory, &pending_downloads,
+                          &pending_download_bytes, &pending_image_bytes, &UsedMemory, &Evict,
+                          &FlushDownloads](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -174,28 +218,25 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
         if (must_download) {
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
+            auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
-            ++gc_download_deletes;
-            ClearStaleImage(image);
+            pending_download_bytes += image.unswizzled_size_bytes;
+            pending_image_bytes += ImageMemoryBytes(image);
+            pending_downloads.push_back({image_id, std::move(map), std::move(copies)});
+            if (pending_download_bytes >= MaxBatchDownloadBytes) {
+                FlushDownloads();
+            }
         } else {
             MarkStale(image); // before UntrackImage (see MarkStale)
+            Evict(image_id);
         }
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, image_id);
-        }
-        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
-        UnregisterImage(image_id);
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         if (out_of_memory) {
             return false;
         }
-        if (aggressive_mode && total_used_memory < critical_memory) {
+        if (aggressive_mode && UsedMemory() < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
-        } else if (high_priority_mode && total_used_memory < expected_memory) {
+        } else if (high_priority_mode && UsedMemory() < expected_memory) {
             num_iterations >>= 1;
             high_priority_mode = false;
         }
@@ -251,6 +292,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         } else {
             lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
         }
+        FlushDownloads();
     };
     Configure(false);
     static const u64 old_age = [] {
@@ -260,6 +302,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
         evict_old_costly = true;
         lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
+        FlushDownloads();
         evict_old_costly = false;
     }
     Collect();
