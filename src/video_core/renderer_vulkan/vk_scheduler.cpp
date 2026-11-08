@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <map>
+#include <mutex>
 #include <chrono>
 #include <cstdlib>
 #include <memory>
@@ -236,6 +240,11 @@ bool Scheduler::WaitSubmitted(u64 tick) {
     return true;
 }
 
+namespace {
+// TEMP measurement (not for merge): an address inside this binary for dladdr.
+void TempFinishTraceAnchor() {}
+} // namespace
+
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                        std::source_location location) {
     if (state.renderpass) {
@@ -244,6 +253,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
+    const auto finish_trace_begin = std::chrono::steady_clock::now();
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
@@ -257,6 +267,41 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
         g_profile_finishes.fetch_add(1, std::memory_order_relaxed);
         g_profile_finish_ns.fetch_add(VideoCommon::Nx2Profile::Now() - start,
                                       std::memory_order_relaxed);
+    }
+    // TEMP measurement (not for merge): who waits for the GPU, by call stack.
+    static const bool finish_trace = std::getenv("EDEN_TEMP_FINISH_TRACE") != nullptr;
+    if (finish_trace) {
+        static std::mutex mutex;
+        static std::map<std::array<uintptr_t, 6>, std::pair<u64, u64>> sites;
+        static auto last = std::chrono::steady_clock::now();
+        static const uintptr_t base = [] {
+            Dl_info info{};
+            dladdr(reinterpret_cast<void*>(&TempFinishTraceAnchor), &info);
+            return reinterpret_cast<uintptr_t>(info.dli_fbase);
+        }();
+        void* frames[8]{};
+        const int depth = backtrace(frames, 8);
+        std::array<uintptr_t, 6> key{};
+        for (int i = 1; i < depth && i <= 6; ++i) {
+            key[i - 1] = reinterpret_cast<uintptr_t>(frames[i]) - base;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const u64 waited = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(now - finish_trace_begin)
+                .count());
+        std::scoped_lock lock{mutex};
+        auto& site = sites[key];
+        ++site.first;
+        site.second += waited;
+        if (now - last >= std::chrono::seconds{10}) {
+            for (const auto& [stack, totals] : sites) {
+                LOG_INFO(Render_Vulkan, "FINISH TEMP {} calls {} us: {:x} {:x} {:x} {:x} {:x} {:x}",
+                         totals.first, totals.second, stack[0], stack[1], stack[2], stack[3],
+                         stack[4], stack[5]);
+            }
+            sites.clear();
+            last = now;
+        }
     }
 }
 

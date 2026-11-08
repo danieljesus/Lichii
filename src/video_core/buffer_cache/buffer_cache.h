@@ -283,7 +283,8 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                                            device_addr_end_aligned - device_addr_start_aligned);
     // A preflushable mark persists and downloads later GPU writes at every fence. Native titles
     // instead keep read traps and flush on demand.
-    const bool preflush = !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    const bool preflush = !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+                          preflush_native_reads.load(std::memory_order_relaxed);
     if (!area->preemtive) {
         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
             Nx2DownloadTrace::Marked(device_addr_start_aligned,
@@ -323,7 +324,9 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
                                                        ranges.emplace_back(start, end - start);
                                                    });
             });
+            const auto start = std::chrono::steady_clock::now();
             DownloadRangesMemory(ranges);
+            NoteReactiveDownload(std::chrono::steady_clock::now() - start);
             return;
         }
     }
@@ -334,6 +337,36 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
             DownloadBufferMemory(buffer, start, end - start);
         }
     });
+}
+
+template <class P>
+void BufferCache<P>::NoteReactiveDownload(std::chrono::steady_clock::duration duration) {
+    // Trap-and-flush reads cost one GPU idle wait per read burst. A fast GPU finishes its queue
+    // in ~0.2 ms and that stays cheap, but where the GPU is the slower side (Ocarina of Time on a
+    // Steam Deck: ~22 bursts a second, ~7 ms each, 150 ms a second with a guest core and the
+    // GPU thread stalled) the ranges are downloaded at fences instead, as for other titles.
+    // TEMP A/B switch (not for merge).
+    static const bool temp_off = std::getenv("EDEN_TEMP_NO_ADAPTIVE") != nullptr;
+    if (temp_off || preflush_native_reads.load(std::memory_order_relaxed)) {
+        return;
+    }
+    constexpr double SlowDownloadMs = 2.0;
+    constexpr u32 MinSamples = 32;
+    const double ms = std::chrono::duration<double, std::milli>(duration).count();
+    reactive_download_ms = reactive_download_samples == 0
+                               ? ms
+                               : reactive_download_ms * 0.9 + ms * 0.1;
+    if (++reactive_download_samples < MinSamples || reactive_download_ms < SlowDownloadMs) {
+        return;
+    }
+    preflush_native_reads.store(true, std::memory_order_relaxed);
+    cpu_read_ranges.ForEach([&](DAddr lower, DAddr upper) {
+        memory_tracker.MarkRegionAsPreflushable(lower, upper - lower);
+    });
+    LOG_INFO(HW_GPU,
+             "Buffer cache: guest reads of GPU writes wait {:.1f} ms on average, downloading "
+             "them at fences from now on",
+             reactive_download_ms);
 }
 
 template <class P>

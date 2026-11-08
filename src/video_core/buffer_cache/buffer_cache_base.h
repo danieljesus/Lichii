@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -615,6 +617,8 @@ private:
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
 
+    void NoteReactiveDownload(std::chrono::steady_clock::duration duration);
+
     void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
 
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
@@ -756,6 +760,10 @@ private:
     /// writes in all of them, so the reads that usually follow it find nothing left to flush.
     Common::RangeSet<DAddr> cpu_read_ranges;
     bool download_cpu_read_ranges{};
+    /// Switch 2 titles: set once trap-and-flush reads turned out slow (NoteReactiveDownload).
+    std::atomic<bool> preflush_native_reads{};
+    double reactive_download_ms{};
+    u32 reactive_download_samples{};
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
