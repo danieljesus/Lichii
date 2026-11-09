@@ -1081,11 +1081,11 @@ private:
     static constexpr u16 EarlyAfterReads = 2;
     /// Writes in a row without a read that stop them.
     static constexpr u16 MaxUnreadWrites = 4;
-    static constexpr size_t MaxReadBackPages = 64;
+    static constexpr size_t MaxReadBackPages = 256;
     /// Early download bytes a frame, and early downloads not yet in guest memory: past them, reads
     /// flush on demand.
-    static constexpr u64 EarlyBytesPerFrame = 1_MiB;
-    static constexpr u32 MaxPendingEarlyDownloads = 32;
+    static constexpr u64 EarlyBytesPerFrame = 4_MiB;
+    static constexpr u32 MaxPendingEarlyDownloads = 128;
     /// EDEN_NX2_EARLY_READ_DOWNLOADS=0: none (for comparisons).
     static bool EarlyDownloadsEnabled() {
         static const bool enabled = [] {
