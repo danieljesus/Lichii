@@ -15,6 +15,7 @@
 #include <iterator>
 #include <numeric>
 #include <thread>
+#include <unordered_map>
 
 #include "common/fs/path_util.h"
 #include "common/scope_exit.h"
@@ -28,7 +29,11 @@
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/frontend/framebuffer_layout.h"
+#include "core/hle/kernel/k_handle_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/k_synchronization_object.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/memory.h"
 #include "hid_core/hid_core.h"
 #include "video_core/gpu.h"
@@ -506,6 +511,52 @@ json HostTiming(ToolState& state, const json& params) {
     return {{"previous", previous}, {"stats", stats.load()}};
 }
 
+// TEST (local, for hang reports): every thread of the application, its state, what it waits
+// for (the handles of the synchronization objects it is linked to, or the address keys) and where
+// it stopped.
+json GuestThreads(ToolState& state, const json& /*params*/) {
+    Kernel::KProcess& process = Application(state);
+    Kernel::KernelCore& kernel = state.system.Kernel();
+    std::unordered_map<const Kernel::KThread*, json> waits;
+    const auto& table = process.GetHandleTable();
+    for (size_t i = 0; i < table.GetTableSize(); ++i) {
+        Kernel::Handle handle{};
+        auto object = table.GetObjectByIndex(kernel, &handle, i);
+        if (object.IsNull()) {
+            continue;
+        }
+        auto* sync = object->DynamicCast<Kernel::KSynchronizationObject*>();
+        if (sync == nullptr) {
+            continue;
+        }
+        for (const Kernel::KThread* thread : sync->GetWaitingThreadsForDebugging(kernel)) {
+            waits[thread].push_back(
+                fmt::format("{:#x} {}", handle, object->GetTypeObj().GetName()));
+        }
+    }
+    json threads = json::array();
+    Kernel::KScopedSchedulerLock lock{kernel};
+    for (const Kernel::KThread& thread : process.GetThreadList()) {
+        const auto& context = thread.GetContext();
+        json entry = {
+            {"id", thread.GetThreadId()},
+            {"state", static_cast<u32>(thread.GetState())},
+            {"wait_reason", static_cast<u32>(thread.GetWaitReasonForDebugging())},
+            {"priority", thread.GetPriority()},
+            {"core", thread.GetActiveCore()},
+            {"pc", HexAddress(context.pc)},
+            {"lr", HexAddress(context.lr)},
+            {"address_key", HexAddress(GetInteger(thread.GetAddressKey()))},
+            {"arbiter_key", HexAddress(thread.GetAddressArbiterKey())},
+        };
+        if (const auto it = waits.find(&thread); it != waits.end()) {
+            entry["waits_on"] = it->second;
+        }
+        threads.push_back(std::move(entry));
+    }
+    return {{"threads", std::move(threads)}};
+}
+
 json ReadMemory(ToolState& state, const json& params) {
     const u64 address = AddressParam(params, "address");
     const u64 size = ReadSize(params, address);
@@ -702,6 +753,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"sample", handler(SampleThreads)},
         {"speed_limit", handler(SpeedLimit)},
         {"host_timing", handler(HostTiming)},
+        {"guest_threads", handler(GuestThreads)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},
