@@ -252,6 +252,12 @@ TOOLS = [
                        "on or off; read it with log_tail. Returns the previous and current state.",
         "inputSchema": {"type": "object", "properties": {"stats": {"type": "boolean"}}},
     },
+    {
+        "name": "guest_threads",
+        "description": "TEST: every thread of the running application with its kernel state, wait "
+                       "reason, pc/lr and the handles of the objects it waits on (for hangs).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 TOOL_NAMES = {tool["name"] for tool in TOOLS}
