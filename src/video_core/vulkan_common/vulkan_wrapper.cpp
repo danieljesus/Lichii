@@ -16,6 +16,10 @@
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+namespace Vulkan::TempAllocTrace {
+void Forget(VmaAllocation allocation) noexcept;
+}
+
 namespace Vulkan::vk {
 
 namespace {
@@ -525,6 +529,7 @@ void Image::SetObjectNameEXT(const char* name) const {
 
 void Image::Release() const noexcept {
     if (handle) {
+        TempAllocTrace::Forget(allocation);
         vmaDestroyImage(allocator, handle, allocation);
     }
 }
@@ -560,6 +565,7 @@ void Buffer::SetObjectNameEXT(const char* name) const {
 
 void Buffer::Release() const noexcept {
     if (handle) {
+        TempAllocTrace::Forget(allocation);
         vmaDestroyBuffer(allocator, handle, allocation);
     }
 }

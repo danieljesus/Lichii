@@ -5,6 +5,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <unordered_map>
+#include <mutex>
+#include <map>
+#include <chrono>
 #include <limits>
 #include <array>
 #include <atomic>
@@ -237,7 +241,9 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         id != VK_DRIVER_ID_MESA_RADV) {
         return false;
     }
-    return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
+    // TEMP experiment (not for merge): EDEN_TEMP_NO_UNEVEN_RGBA8=1 keeps these in BC1/BC3.
+    static const bool temp_off = std::getenv("EDEN_TEMP_NO_UNEVEN_RGBA8") != nullptr;
+    return !temp_off && HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
 }
 
 // A large image over Switch 2 sparse blocks nobody has written (title 1's terrain layer pools, 2.9
@@ -2974,6 +2980,73 @@ void TextureCacheRuntime::TickFrame() {
     });
 }
 
+
+// TEMP measurement (not for merge): EDEN_TEMP_ALLOC_TRACE=1 also logs live texture-cache image
+// memory by guest format, host bytes against guest bytes.
+namespace {
+namespace TempImageStats {
+struct Entry {
+    u32 format;
+    u64 host;
+    u64 guest;
+};
+std::mutex& Mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+std::unordered_map<const void*, Entry>& Live() {
+    static std::unordered_map<const void*, Entry> live;
+    return live;
+}
+bool Enabled() {
+    static const bool enabled = std::getenv("EDEN_TEMP_ALLOC_TRACE") != nullptr;
+    return enabled;
+}
+void Add(const void* image, u32 format, u64 host, u64 guest) {
+    if (!Enabled()) {
+        return;
+    }
+    std::scoped_lock lock{Mutex()};
+    Live()[image] = {format, host, guest};
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds{10}) {
+        return;
+    }
+    last = now;
+    std::map<u32, std::array<u64, 3>> by_format;
+    u64 host_total{}, guest_total{};
+    for (const auto& [ptr, entry] : Live()) {
+        auto& totals = by_format[entry.format];
+        totals[0] += entry.host;
+        totals[1] += entry.guest;
+        ++totals[2];
+        host_total += entry.host;
+        guest_total += entry.guest;
+    }
+    std::vector<std::pair<u64, u32>> order;
+    for (const auto& [fmt, totals] : by_format) {
+        order.emplace_back(totals[0], fmt);
+    }
+    std::sort(order.rbegin(), order.rend());
+    LOG_INFO(Render_Vulkan, "IMG TEMP: {} images, host {} MiB, guest {} MiB", Live().size(),
+             host_total >> 20, guest_total >> 20);
+    for (size_t i = 0; i < (std::min)(order.size(), size_t{10}); ++i) {
+        const auto& totals = by_format[order[i].second];
+        LOG_INFO(Render_Vulkan, "IMG TEMP format {}: {} images, host {} MiB, guest {} MiB",
+                 order[i].second, totals[2], totals[0] >> 20, totals[1] >> 20);
+    }
+}
+void Remove(const void* image) {
+    if (!Enabled()) {
+        return;
+    }
+    std::scoped_lock lock{Mutex()};
+    Live().erase(image);
+}
+} // namespace TempImageStats
+} // Anonymous namespace
+
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
              VAddr cpu_addr_)
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
@@ -2994,6 +3067,8 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
                                true)),
       aspect_mask(ImageAspectMask(info.format)) {
+    TempImageStats::Add(this, static_cast<u32>(info.format), original_image.GetMemoryBlock().size,
+                        guest_size_bytes);
     if (OutOfMemory()) {
         return;
     }
@@ -3071,6 +3146,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
 
 Image::~Image() {
+    TempImageStats::Remove(this);
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         if (original_image) {
             runtime->EraseResolveShadow(*original_image);

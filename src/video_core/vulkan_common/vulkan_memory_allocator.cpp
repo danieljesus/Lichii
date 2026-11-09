@@ -5,6 +5,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <unordered_map>
+#include <mutex>
+#include <map>
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <cstdlib>
+#include <chrono>
 #include <array>
 #include <bit>
 #include <limits>
@@ -25,6 +32,87 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+
+// TEMP measurement (not for merge): EDEN_TEMP_ALLOC_TRACE=1 logs, every 10 s, the device memory
+// still allocated per allocation call stack.
+namespace Vulkan::TempAllocTrace {
+void Note(VmaAllocation allocation, u64 size) noexcept;
+void Forget(VmaAllocation allocation) noexcept;
+namespace {
+struct TraceState {
+    std::mutex mutex;
+    std::unordered_map<VmaAllocation, std::pair<std::array<uintptr_t, 6>, u64>> live;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+TraceState& State() {
+    static TraceState state;
+    return state;
+}
+bool Enabled() {
+    static const bool enabled = std::getenv("EDEN_TEMP_ALLOC_TRACE") != nullptr;
+    return enabled;
+}
+uintptr_t Base() {
+    static const uintptr_t base = [] {
+        Dl_info info{};
+        dladdr(reinterpret_cast<void*>(&Enabled), &info);
+        return reinterpret_cast<uintptr_t>(info.dli_fbase);
+    }();
+    return base;
+}
+void Report(TraceState& state) {
+    std::map<std::array<uintptr_t, 6>, std::pair<u64, u64>> sites;
+    u64 total{};
+    for (const auto& [allocation, entry] : state.live) {
+        auto& site = sites[entry.first];
+        ++site.first;
+        site.second += entry.second;
+        total += entry.second;
+    }
+    std::vector<std::pair<u64, const std::array<uintptr_t, 6>*>> order;
+    for (const auto& [stack, totals] : sites) {
+        order.emplace_back(totals.second, &stack);
+    }
+    std::sort(order.rbegin(), order.rend());
+    LOG_INFO(Render_Vulkan, "ALLOC TEMP: {} MiB live in {} allocations", total >> 20, state.live.size());
+    for (size_t i = 0; i < (std::min)(order.size(), size_t{14}); ++i) {
+        const auto& stack = *order[i].second;
+        LOG_INFO(Render_Vulkan, "ALLOC TEMP {} MiB in {}: {:x} {:x} {:x} {:x} {:x} {:x}",
+                 order[i].first >> 20, sites[stack].first, stack[0], stack[1], stack[2], stack[3],
+                 stack[4], stack[5]);
+    }
+}
+} // Anonymous namespace
+
+void Note(VmaAllocation allocation, u64 size) noexcept {
+    if (!Enabled() || allocation == nullptr) {
+        return;
+    }
+    void* frames[8]{};
+    const int depth = backtrace(frames, 8);
+    std::array<uintptr_t, 6> key{};
+    for (int i = 1; i < depth && i <= 6; ++i) {
+        key[static_cast<size_t>(i - 1)] = reinterpret_cast<uintptr_t>(frames[i]) - Base();
+    }
+    auto& state = State();
+    std::scoped_lock lock{state.mutex};
+    state.live[allocation] = {key, size};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state.last >= std::chrono::seconds{10}) {
+        state.last = now;
+        Report(state);
+    }
+}
+
+void Forget(VmaAllocation allocation) noexcept {
+    if (!Enabled() || allocation == nullptr) {
+        return;
+    }
+    auto& state = State();
+    std::scoped_lock lock{state.mutex};
+    state.live.erase(allocation);
+}
+} // namespace Vulkan::TempAllocTrace
 
 namespace Vulkan {
 namespace {
@@ -173,6 +261,7 @@ void MemoryCommit::Release() {
             vmaUnmapMemory(allocator, allocation);
             mapped_ptr = nullptr;
         }
+        TempAllocTrace::Forget(allocation);
         vmaFreeMemory(allocator, allocation);
     }
     allocation = nullptr;
@@ -321,6 +410,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         );
     }
 
+    TempAllocTrace::Note(allocation, alloc_info.size);
     image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                       device.GetDispatchLoader());
     return VK_SUCCESS;
@@ -469,6 +559,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .offset = alloc_info.offset,
         .memory_type = alloc_info.memoryType,
     };
+    TempAllocTrace::Note(allocation, alloc_info.size);
     return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data, is_coherent,
                       location, device.GetDispatchLoader());
 }
@@ -519,6 +610,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .offset = alloc_info.offset,
         .memory_type = alloc_info.memoryType,
     };
+    TempAllocTrace::Note(allocation, alloc_info.size);
     return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data, is_coherent,
                       location, device.GetDispatchLoader());
 }
@@ -553,6 +645,7 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
     }
 
     vk::Check(res);
+    TempAllocTrace::Note(a, info.size);
     return MemoryCommit(allocator, a, info);
 }
 
@@ -591,6 +684,7 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
 
     vk::Check(res);
     vk::Check(vmaBindBufferMemory2(allocator, a, 0, raw, nullptr));
+    TempAllocTrace::Note(a, info.size);
     return MemoryCommit(allocator, a, info);
 }
 
