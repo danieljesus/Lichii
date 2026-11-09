@@ -430,7 +430,6 @@ void TextureCache<P>::TickFrame() {
                     const u64 reserved = margin + pressure_margin + slack_margin;
                     critical_memory = budget - (std::min)(reserved, budget / 2);
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
-                    ApplyThresholdOverrides(false);
                     u64 other_memory = 0;
                     if constexpr (requires { runtime.GetDeviceHeapMemoryBudget(); }) {
                         // An integrated GPU's budget is the share of system memory it is capped
@@ -462,6 +461,8 @@ void TextureCache<P>::TickFrame() {
                                 critical_memory - (std::min)(gap, critical_memory / 2);
                         }
                     }
+                    // TEST: the EDEN_NX2_TC_* overrides after #823's raise, so they can lower it.
+                    ApplyThresholdOverrides(false);
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time). Compared after the cap: before it, every check differed from
                     // the capped value by more than 256 MiB and logged twice a second.
