@@ -59,6 +59,10 @@ public:
         return service_name;
     }
 
+    std::string_view DebugName() const override {
+        return service_name;
+    }
+
     /// @brief Returns the maximum number of sessions that can be connected to this service at the same
     /// time.
     u32 GetMaxSessions() const noexcept {

@@ -36,6 +36,11 @@ public:
         return m_native_handle;
     }
 
+    /// TEST (guest_threads): waited on by a server right now.
+    bool IsLinkedForDebugging() const {
+        return m_multi_wait != nullptr;
+    }
+
 private:
     friend class MultiWait;
     Common::IntrusiveListNode m_list_node{};

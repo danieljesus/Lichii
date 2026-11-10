@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 
 #include "common/scope_exit.h"
@@ -136,8 +139,51 @@ void ServerManager::RunServer(std::unique_ptr<ServerManager>&& server_manager) {
     server_manager->m_system.RunServer(std::move(server_manager));
 }
 
+namespace {
+struct DebugSessionEntry {
+    ServerManager* server;
+    std::string name;
+};
+std::mutex g_debug_sessions_mutex;
+std::unordered_map<const Kernel::KServerSession*, DebugSessionEntry> g_debug_sessions;
+} // namespace
+
+std::string ServerManager::DebugDescribe(const Kernel::KServerSession* server_session) {
+    DebugSessionEntry entry;
+    {
+        std::scoped_lock lk{g_debug_sessions_mutex};
+        const auto it = g_debug_sessions.find(server_session);
+        if (it == g_debug_sessions.end()) {
+            return "not registered";
+        }
+        entry = it->second;
+    }
+    std::scoped_lock ll{entry.server->m_deferred_list_mutex};
+    for (const Session& session : entry.server->m_sessions) {
+        if (session.GetNativeHandle() != server_session) {
+            continue;
+        }
+        const bool deferred =
+            std::find(entry.server->m_deferred_sessions.begin(),
+                      entry.server->m_deferred_sessions.end(),
+                      &session) != entry.server->m_deferred_sessions.end();
+        return fmt::format("{} ({})", entry.name,
+                           deferred                              ? "deferred"
+                           : session.IsLinkedForDebugging() ? "waited on"
+                                                                 : "not waited on");
+    }
+    return entry.name + " (session gone)";
+}
+
 Result ServerManager::RegisterSession(Kernel::KServerSession* server_session,
                                       std::shared_ptr<SessionRequestManager> manager) {
+    {
+        std::scoped_lock lk{g_debug_sessions_mutex};
+        g_debug_sessions[server_session] = {
+            this, manager && manager->HasSessionHandler()
+                      ? std::string{manager->SessionHandler().DebugName()}
+                      : std::string{"?"}};
+    }
     // We are taking ownership of the server session, so don't open it.
     auto* session = new Session(m_system.Kernel(), server_session, std::move(manager));
 
@@ -503,6 +549,11 @@ void ServerManager::RetireDeferredRequest(Session* session) {
 }
 
 void ServerManager::DestroySession(Session* session) {
+    {
+        std::scoped_lock lk{g_debug_sessions_mutex};
+        g_debug_sessions.erase(
+            static_cast<const Kernel::KServerSession*>(session->GetNativeHandle()));
+    }
     // Unlink.
     {
         std::scoped_lock lk{m_deferred_list_mutex};
