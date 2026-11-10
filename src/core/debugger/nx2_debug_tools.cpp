@@ -29,13 +29,16 @@
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/frontend/framebuffer_layout.h"
+#include "core/hle/kernel/k_client_session.h"
 #include "core/hle/kernel/k_handle_table.h"
+#include "core/hle/kernel/k_session.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_synchronization_object.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "core/hle/service/server_manager.h"
 #include "core/memory.h"
 #include "hid_core/hid_core.h"
 #include "video_core/gpu.h"
@@ -565,7 +568,14 @@ json GuestThreads(ToolState& state, const json& /*params*/) {
             auto object = table.GetObjectWithoutPseudoHandle<Kernel::KAutoObject>(kernel, handle);
             entry["x0"] = fmt::format("{:#x} {}", handle,
                                       object.IsNull() ? "?" : object->GetTypeObj().GetName());
-            std::array<u32, 8> words{};
+            if (!object.IsNull()) {
+                if (auto* client = object->DynamicCast<Kernel::KClientSession*>();
+                    client != nullptr && client->GetParent() != nullptr) {
+                    entry["service"] = ::Service::ServerManager::DebugDescribe(
+                        &client->GetParent()->GetServerSession());
+                }
+            }
+            std::array<u32, 16> words{};
             process.GetMemory().ReadBlock(GetInteger(thread.GetTlsAddress()), words.data(),
                                           sizeof(words));
             entry["tls"] = fmt::format("{:08x}", fmt::join(words, " "));
