@@ -36,6 +36,10 @@ class Session;
 
 class ServerManager {
 public:
+    /// TEST (guest_threads): the service a server session belongs to and its state in its server
+    /// (waited on, deferred or neither: a request is being handled or was lost).
+    static std::string DebugDescribe(const Kernel::KServerSession* server_session);
+
     /// Called on a server thread with the context of a deferred request that is retired because
     /// its client closed the session, before the context and session go. The request is never
     /// retried again.
