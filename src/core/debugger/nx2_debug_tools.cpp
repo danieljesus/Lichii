@@ -31,9 +31,11 @@
 #include "core/frontend/framebuffer_layout.h"
 #include "core/hle/kernel/k_handle_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_synchronization_object.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/service/kernel_helpers.h"
 #include "core/memory.h"
 #include "hid_core/hid_core.h"
 #include "video_core/gpu.h"
@@ -529,9 +531,12 @@ json GuestThreads(ToolState& state, const json& /*params*/) {
         if (sync == nullptr) {
             continue;
         }
+        std::string name = object->GetTypeObj().GetName();
+        if (auto* event = object->DynamicCast<Kernel::KReadableEvent*>(); event != nullptr) {
+            name += " " + ::Service::KernelHelpers::DebugEventName(event);
+        }
         for (const Kernel::KThread* thread : sync->GetWaitingThreadsForDebugging(kernel)) {
-            waits[thread].push_back(
-                fmt::format("{:#x} {}", handle, object->GetTypeObj().GetName()));
+            waits[thread].push_back(fmt::format("{:#x} {}", handle, name));
         }
     }
     json threads = json::array();
@@ -551,6 +556,19 @@ json GuestThreads(ToolState& state, const json& /*params*/) {
         };
         if (const auto it = waits.find(&thread); it != waits.end()) {
             entry["waits_on"] = it->second;
+        }
+        // A thread waiting with no reason is usually in an IPC call: x0 is the session handle and
+        // the message header sits at the start of its TLS.
+        if (thread.GetState() == Kernel::ThreadState::Waiting &&
+            thread.GetWaitReasonForDebugging() == Kernel::ThreadWaitReasonForDebugging::None) {
+            const auto handle = static_cast<Kernel::Handle>(context.r[0]);
+            auto object = table.GetObjectWithoutPseudoHandle<Kernel::KAutoObject>(kernel, handle);
+            entry["x0"] = fmt::format("{:#x} {}", handle,
+                                      object.IsNull() ? "?" : object->GetTypeObj().GetName());
+            std::array<u32, 8> words{};
+            process.GetMemory().ReadBlock(GetInteger(thread.GetTlsAddress()), words.data(),
+                                          sizeof(words));
+            entry["tls"] = fmt::format("{:08x}", fmt::join(words, " "));
         }
         threads.push_back(std::move(entry));
     }
