@@ -162,7 +162,7 @@ else()
             $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=all>
             $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=extra>
             $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=missing-declarations>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=shadow>
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Wshadow>
             $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=unused>)
     else()
         add_compile_options(
