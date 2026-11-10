@@ -79,6 +79,11 @@ public:
     virtual Result HandleSyncRequest(Kernel::KServerSession& session,
                                      HLERequestContext& context) = 0;
 
+    /// TEST (guest_threads): the service's name, empty when unknown.
+    virtual std::string_view DebugName() const {
+        return {};
+    }
+
 protected:
     Kernel::KernelCore& kernel;
 };
