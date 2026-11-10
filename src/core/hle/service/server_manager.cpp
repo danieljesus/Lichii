@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <atomic>
+#include <array>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -78,7 +81,37 @@ public:
         return m_context;
     }
 
+    /// TEST (hang trap): the last events of this session in its server, oldest first.
+    enum class DebugEvent : u8 { Linked, Moved, Selected, Received, Replied, Deferred, Retired };
+    void NoteDebug(DebugEvent event, u32 value = 0) {
+        const u32 i = m_debug_next.fetch_add(1, std::memory_order_relaxed) % m_debug_events.size();
+        m_debug_events[i] = {std::chrono::steady_clock::now(), event, value};
+    }
+    std::string DescribeDebugEvents() const {
+        static constexpr std::array<const char*, 7> names{"linked",   "moved",    "selected", "received",
+                                                          "replied", "deferred", "retired"};
+        const auto now = std::chrono::steady_clock::now();
+        const u32 next = m_debug_next.load(std::memory_order_relaxed);
+        const u32 size = static_cast<u32>(m_debug_events.size());
+        std::string out;
+        for (u32 n = next > size ? next - size : 0; n < next; ++n) {
+            const DebugRecord& record = m_debug_events[n % size];
+            out += fmt::format(
+                "{}{}({:#x})@-{}ms", out.empty() ? "" : " ", names[static_cast<size_t>(record.event)],
+                record.value,
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - record.when).count());
+        }
+        return out;
+    }
+
 private:
+    struct DebugRecord {
+        std::chrono::steady_clock::time_point when;
+        DebugEvent event;
+        u32 value;
+    };
+    std::array<DebugRecord, 16> m_debug_events{};
+    std::atomic<u32> m_debug_next{};
     std::shared_ptr<SessionRequestManager> m_manager;
     std::shared_ptr<HLERequestContext> m_context;
     Kernel::KernelCore& m_kernel;
@@ -167,10 +200,11 @@ std::string ServerManager::DebugDescribe(const Kernel::KServerSession* server_se
             std::find(entry.server->m_deferred_sessions.begin(),
                       entry.server->m_deferred_sessions.end(),
                       &session) != entry.server->m_deferred_sessions.end();
-        return fmt::format("{} ({})", entry.name,
+        return fmt::format("{} ({}) [{}]", entry.name,
                            deferred                              ? "deferred"
                            : session.IsLinkedForDebugging() ? "waited on"
-                                                                 : "not waited on");
+                                                                 : "not waited on",
+                           session.DescribeDebugEvents());
     }
     return entry.name + " (session gone)";
 }
@@ -320,6 +354,9 @@ Result ServerManager::LoopProcess() {
 }
 
 void ServerManager::LinkToDeferredList(MultiWaitHolder* holder) {
+    if (holder->GetUserData() == static_cast<uintptr_t>(UserDataTag::Session)) {
+        static_cast<Session*>(holder)->NoteDebug(Session::DebugEvent::Linked);
+    }
     // Link.
     {
         std::scoped_lock lk{m_deferred_list_mutex};
@@ -353,6 +390,9 @@ MultiWaitHolder* ServerManager::WaitSignaled() {
             m_wakeup_event->Clear(m_system.Kernel());
         } else {
             // Unlink and handle the event.
+            if (selected->GetUserData() == static_cast<uintptr_t>(UserDataTag::Session)) {
+                static_cast<Session*>(selected)->NoteDebug(Session::DebugEvent::Selected);
+            }
             selected->UnlinkFromMultiWait();
             return selected;
         }
@@ -415,6 +455,7 @@ Result ServerManager::OnSessionEvent(Session* session) {
     // Try to receive a message.
     auto* server_session = static_cast<Kernel::KServerSession*>(session->GetNativeHandle());
     res = server_session->ReceiveRequestHLE(m_system.Kernel(), &session->GetContext(), session->GetManager());
+    session->NoteDebug(Session::DebugEvent::Received, res.raw);
 
     // If the session has been closed, we're done.
     if (res == Kernel::ResultSessionClosed) {
@@ -472,6 +513,7 @@ Result ServerManager::CompleteSyncRequest(Session* session) {
             run_again = !retire && m_deferral_epoch != deferral_epoch;
             if (!retire && !run_again) {
                 m_deferred_sessions.push_back(session);
+                session->NoteDebug(Session::DebugEvent::Deferred);
             }
         }
         if (run_again) {
@@ -485,6 +527,7 @@ Result ServerManager::CompleteSyncRequest(Session* session) {
 
     // Send the reply.
     res = server_session->SendReplyHLE(m_system.Kernel(), service_res == IPC::ResultSessionClosed);
+    session->NoteDebug(Session::DebugEvent::Replied, res.raw);
 
     // The reply is written: release the context, and with it the client thread, before another
     // thread may receive the next request on this session.
