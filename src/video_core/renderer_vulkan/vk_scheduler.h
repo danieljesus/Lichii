@@ -16,6 +16,7 @@
 #include <utility>
 #include <queue>
 #include <source_location>
+#include <span>
 #include <vector>
 
 #include "common/alignment.h"
@@ -551,6 +552,11 @@ private:
     bool graphics_pipeline_missing{};
     u64 render_pass_serial{};
     std::unique_ptr<CommandPool> command_pool;
+
+    std::unique_ptr<UploadBatch> upload_batch;
+    bool uploads_pending{};
+    /// Records pending uploads before another command, worker handoff, or submission tick.
+    void FlushUploads();
 
     vk::QueryPool trace_query_pool;
     static constexpr u32 TraceMaxSubmissions = 512;

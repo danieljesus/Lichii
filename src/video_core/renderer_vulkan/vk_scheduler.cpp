@@ -31,6 +31,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/gpu_wait_stats.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_gpu_cost.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -552,17 +553,19 @@ void Scheduler::RecordUpload(VkBuffer src, VkBuffer dst, std::span<const VkBuffe
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordUpload");
     }
-    if (copies.empty()) {
-        return;
+    // Each region on its own (as #1245 does), so a single upload larger than the batch stays
+    // bounded and overlapping regions within one upload never enter the same batch.
+    for (const VkBufferCopy& copy : copies) {
+        const std::span<const VkBufferCopy> region{&copy, 1};
+        if (uploads_pending && !upload_batch->CanAdd(src, dst, region)) {
+            FlushUploads();
+        }
+        if (!uploads_pending) {
+            upload_batch_site = location;
+        }
+        upload_batch->Add(src, dst, region);
+        uploads_pending = true;
     }
-    if (uploads_pending && !upload_batch->CanAdd(src, dst, copies)) {
-        FlushUploads();
-    }
-    if (!uploads_pending) {
-        upload_batch_site = location;
-    }
-    upload_batch->Add(src, dst, copies);
-    uploads_pending = true;
 }
 
 void Scheduler::FlushUploads() {
