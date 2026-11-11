@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string_view>
 #include <type_traits>
@@ -86,6 +87,27 @@ SWITCHABLE(ConfirmStop, true);
 #undef SETTING
 #undef SWITCHABLE
 #endif
+
+bool IsSteamDeck() {
+#ifdef __linux__
+    static const bool is_steam_deck = [] {
+        const auto read = [](const char* path) {
+            std::ifstream file{path};
+            std::string line;
+            std::getline(file, line);
+            return line;
+        };
+        if (read("/sys/class/dmi/id/board_vendor") != "Valve") {
+            return false;
+        }
+        const std::string product = read("/sys/class/dmi/id/product_name");
+        return product == "Jupiter" || product == "Galileo";
+    }();
+    return is_steam_deck;
+#else
+    return false;
+#endif
+}
 
 Values values;
 

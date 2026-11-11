@@ -135,6 +135,10 @@ private:
     Type custom{};         ///< The custom setting value
 };
 
+/// Whether this is a Steam Deck (LCD "Jupiter" or OLED "Galileo"), from the DMI board data.
+/// Read once. Some defaults differ there (see scaling_filter and anti_aliasing).
+bool IsSteamDeck();
+
 struct TouchFromButtonMap {
     std::string name;
     std::vector<std::string> buttons;
@@ -389,8 +393,12 @@ struct Values {
                                            true,
                                            true};
 
+    // Steam Deck: bilinear by default. Its GPU, capped by the APU's 15 W, limits Switch 2 titles
+    // (Ocarina of Time: busy ~43 ms of a ~50 ms frame); FSR 3 and FXAA cost ~1.9 ms a frame there,
+    // and dropping both measured +2.8% fps outdoors.
     SwitchableSetting<ScalingFilter> scaling_filter{linkage,
-                                                    ScalingFilter::ScaleForce,
+                                                    IsSteamDeck() ? ScalingFilter::Bilinear
+                                                                  : ScalingFilter::ScaleForce,
                                                     "scaling_filter",
                                                     Category::Renderer,
                                                     Specialization::Default,
@@ -452,8 +460,10 @@ struct Values {
                                                       true,
                                                       true};
 
+    // Steam Deck: none by default (see scaling_filter).
     SwitchableSetting<AntiAliasing> anti_aliasing{linkage,
-                                                  AntiAliasing::Fxaa,
+                                                  IsSteamDeck() ? AntiAliasing::None
+                                                                : AntiAliasing::Fxaa,
                                                   "anti_aliasing",
                                                   Category::Renderer,
                                                   Specialization::Default,
