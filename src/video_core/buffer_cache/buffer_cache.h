@@ -4719,6 +4719,10 @@ template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                              bool native_pointer, bool table_pointer,
                                              bool compute) const {
+    static constexpr u64 MarioKartWorldId = 0x0400C3F00006E000ULL;
+    // Read-only native compute pointers bound to the end of their mapping (see below).
+    const bool native_compute_reach = native_pointer && compute && !is_written &&
+                                      Settings::GetCurrentProgramID() == MarioKartWorldId;
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
 
     if (gpu_addr == 0) {
@@ -4741,7 +4745,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
     const u32 flags =
         (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U) |
-        (compute ? 8U : 0U);
+        (compute ? 8U : 0U) | (native_compute_reach ? 16U : 0U);
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
@@ -4766,10 +4770,12 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // 64 MiB cap left the far probes outside the binding, and the fog took one overbright
             // constant from them. A native (Switch 2) compute pointer has no size either, and
             // Mario Kart World's lighting passes read past 8 MiB from theirs: capped there, the
-            // reads came back zero and lit land and characters too dark. Written bindings keep
-            // a cap: a write marks the whole binding GPU-modified.
-            const bool native_compute = native_pointer && compute;
-            if ((table_pointer || native_compute) && !is_written) {
+            // reads came back zero and lit land and characters too dark. Only Mario Kart World's
+            // get the full reach: Ocarina of Time binds ~85,000 of them, a third past 8 MiB, and
+            // the wider buffers took GTT on a Steam Deck from ~1.6 to 3-4 GB (once to an OOM
+            // kill) and panning from ~18 to ~15 fps. Written bindings keep a cap: a write marks
+            // the whole binding GPU-modified.
+            if ((table_pointer && !is_written) || native_compute_reach) {
                 const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
                 const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
                 return (std::min)(memory_layout_size, limit);
@@ -4793,7 +4799,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // a written one isn't split into separate ranges without sparse sources.
             const u32 wanted = size;
             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
-            if (native_pointer && compute) {
+            if (native_compute_reach) {
                 static std::atomic<u64> computed{}, past_cap{}, at_gap{}, logged{};
                 static std::atomic<s64> next_log{};
                 const u64 total = computed.fetch_add(1, std::memory_order_relaxed) + 1;
