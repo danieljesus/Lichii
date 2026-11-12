@@ -46,6 +46,13 @@
 
 namespace Tegra::Engines {
 
+namespace {
+// TEST (EDEN_NX2_SEM_WATCH_DEVICE): the QMDs that released into the watched word, and the QMD the
+// scheduler ran last (the back's schedulers run on one thread).
+std::unordered_set<u64> g_watched_qmds;
+u64 g_last_run_qmd{};
+} // namespace
+
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     : memory_manager{memory_manager_}
     , upload_state{memory_manager, regs.upload}
@@ -55,6 +62,16 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
         native_qmd.trace = [this](std::string_view event, u64 address, s32 value) {
             LOG_INFO(HW_GPU, "QMD trace {} {:#x} {} (engine {} as {})", event, address, value,
                      fmt::ptr(this), memory_manager.GetID());
+        };
+    } else if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) {
+        native_qmd.trace = [this](std::string_view event, u64 address, s32 value) {
+            if (event == "run") {
+                g_last_run_qmd = address;
+            }
+            LOG_INFO(HW_GPU, "Semaphore watch: QMD {:#x} {} {} (engine {}){} on {}", address,
+                     event, value, fmt::ptr(this),
+                     g_watched_qmds.contains(address) ? " watched" : "",
+                     VideoCommon::GpuSplit::ThreadRole());
         };
     }
     native_qmd.skipped_release = [](u64 address, std::size_t slot, std::span<const u32, 4> words) {
@@ -124,8 +141,17 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
         rasterizer->SignalFence([this, address, payload, reduction] {
-            memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
-                                                               memory_manager.Read<u32>(address), payload));
+            const u32 guest = memory_manager.Read<u32>(address);
+            const u32 value = ReduceSemaphore(reduction, false, guest, payload);
+            memory_manager.Write<u32>(address, value);
+            if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+                // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+                if (VideoCommon::GpuSplit::WatchesSemaphore(
+                        memory_manager.GpuToCpuAddress(address).value_or(0))) {
+                    LOG_INFO(HW_GPU, "Semaphore watch: compute reduction {:#x} -> {:#x} on {}",
+                             guest, value, VideoCommon::GpuSplit::ThreadRole());
+                }
+            }
         });
         return;
     }
@@ -388,6 +414,18 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
+                if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+                    // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+                    if (const auto device = memory_manager.GpuToCpuAddress(address);
+                        device && VideoCommon::GpuSplit::WatchCovers(*device, 4)) {
+                        g_watched_qmds.insert(g_last_run_qmd);
+                        LOG_INFO(HW_GPU,
+                                 "Semaphore watch: QMD {:#x} releases {:#x} flags {:#x} (signal "
+                                 "{:#x} {:#x}) on {}",
+                                 g_last_run_qmd, payload, flags, qmd_address, argument,
+                                 VideoCommon::GpuSplit::ThreadRole());
+                    }
+                }
                 // TEST (EDEN_NX2_DRAIN_CHECK): what the front's QMD view compares its notes with.
                 const auto checked = [this, address](u32 offset, u32 value) {
                     if (VideoCommon::Nx2DrainCheck::g_enabled) [[unlikely]] {
@@ -465,6 +503,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         if (VideoCommon::Nx2DrainCheck::g_enabled) [[unlikely]] {
             // TEST: where this signal's reads end, for the front's QMD view check.
             VideoCommon::Nx2DrainCheck::NoteQmdSignalEnd(VideoCommon::GpuSplit::OnBackThread());
+        }
+        if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+            // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+            LOG_INFO(HW_GPU, "Semaphore watch: QMD signal {:#x} {:#x} (engine {}, as {}) '{}' at {} on {}",
+                     qmd_address, argument, fmt::ptr(this), memory_manager.GetID(), error,
+                     VideoCommon::GpuSplit::EntryStart(), VideoCommon::GpuSplit::ThreadRole());
         }
         if (error.empty()) {
             LOG_DEBUG(HW_GPU, "Native QMD control action={:#x}, QMD={:#x}", argument, qmd_address);
@@ -1673,6 +1717,7 @@ struct ListCallContext {
     std::array<u32, 0x1000>& front_registers;
     std::array<u32, 0x1000>& engine_registers; ///< Set directly once the split stopped
     const EmitFunc& emit;
+    bool* upload_unknown; ///< FrontState::upload_unknown
 
     [[nodiscard]] std::optional<u64> DeviceWord(u64 gpu_address) const {
         if (!split.Ran(split.LastMappingChange())) {
@@ -1687,6 +1732,10 @@ struct ListCallContext {
     }
     void Emit(u32 method, u32 value) const {
         emit(method, value);
+    }
+    /// The upload data word emitted next is a placeholder, not what the back writes.
+    void TaintUpload() const {
+        *upload_unknown = true;
     }
     void SendOwed(u64 device, u32 value) const {
         split.Defer([rasterizer_ = rasterizer, device,
@@ -1733,6 +1782,14 @@ struct KeplerCompute::FrontState {
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
     /// The inline upload the back runs, where a word of it lands (Nx2ListIndirect).
     Nx2ListIndirect::UploadState upload;
+    /// The words of the last inline upload sent, for the QMD view (FrontQmdView::NoteUpload):
+    /// its serial (from its exec_upload), whether the front can't tell what it writes (more
+    /// words than kept, list word placeholders), and whether its last data method sent writes
+    /// it (Upload::State writes at a last call).
+    std::vector<u32> upload_words;
+    u64 upload_serial{};
+    bool upload_unknown{};
+    bool upload_written{};
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1774,7 +1831,8 @@ void KeplerCompute::ReleaseFront() {
                                                    this,
                                                    front->registers,
                                                    native_registers,
-                                                   no_emit};
+                                                   no_emit,
+                                                   &front->upload_unknown};
         auto& channel = Nx2ListIndirect::GetChannel(native_data_ram);
         if (!channel.words.empty() || !list_front->Registers().empty()) {
             Nx2ListIndirect::Stats::NoteConcretized(Nx2ListIndirect::Reason::Stop); // TEST
@@ -1800,6 +1858,18 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
     }
     Nx2ListIndirect::NoteUploadMethod(fs.upload, method, argument,
                                       [&fs](u32 reg) { return fs.registers[reg]; });
+    if (method == Nx2ListIndirect::UploadExec) {
+        static u64 upload_serial{}; // Unique across the compute engines (front thread only)
+        fs.upload_words.clear();
+        fs.upload_serial = ++upload_serial;
+        fs.upload_unknown = false;
+    } else if (method == Nx2ListIndirect::UploadData) {
+        if (fs.upload_words.size() < VideoCommon::FrontQmdView::MaxUploadWords) {
+            fs.upload_words.push_back(argument);
+        } else {
+            fs.upload_unknown = true;
+        }
+    }
     fs.registers[method] = argument;
     switch (method) {
     case 0x45:
@@ -1867,6 +1937,7 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     if (IsQmdMethod(method)) {
         GetFrontQmd().MaybeTakeOver(split, native_qmd, QmdTakeOver::QmdMethod);
     }
+    fs.upload_written = is_last_call;
     {
         const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(method)};
         split.Method(this, method, argument, is_last_call, segment, FrontWrites(method));
@@ -1927,6 +1998,14 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontSta
                     sizeof(upload));
         const bool linear = (fs.registers[KEPLER_COMPUTE_REG_INDEX(exec_upload)] & 1) != 0;
         const auto range = Upload::UploadedRange(upload, linear);
+        // Before its write is placed: the QMD view reads a QMD it writes from its words.
+        if (range.size != 0) {
+            const bool known = linear && upload.line_count == 1 && !fs.upload_unknown &&
+                               fs.upload_written &&
+                               u64{upload.line_length_in} * upload.line_count == fs.upload.size;
+            GetFrontQmd().NoteUpload(split, FrontQmdMemory{memory_manager}, fs.upload_serial,
+                                     range.address, range.size, fs.upload_words, known);
+        }
         split.NoteWrite(memory_manager, range.address, range.size);
         break;
     }
@@ -1934,6 +2013,12 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontSta
     case 0xaf:
     case 0xb0:
         if (SignalsQmd(method, argument)) {
+            if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+                // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+                LOG_INFO(HW_GPU, "Semaphore watch: front QMD signal {:#x} {:#x} (engine {}) at {}",
+                         GPUVAddr{fs.registers[0xad]} << 8, argument, fmt::ptr(this),
+                         split.Position());
+            }
             GetFrontQmd().Signal(split, FrontQmdMemory{memory_manager},
                                  GPUVAddr{fs.registers[0xad]} << 8, argument, nullptr);
         }
@@ -2018,6 +2103,10 @@ void KeplerCompute::FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontStat
         GetFrontQmd().NoteInlineWrite(split, *device, qmd);
     }
     if ((fs.registers[0xa7] & (1U << 24)) != 0 || (fs.registers[0xcc] & (1U << 12)) == 0) {
+        if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+            LOG_INFO(HW_GPU, "Semaphore watch: front inline QMD signal {:#x} 0x3 (engine {}) at {}",
+                     address, fmt::ptr(this), split.Position());
+        }
         GetFrontQmd().Signal(split, FrontQmdMemory{memory_manager}, address, 3, &qmd);
     }
 }
@@ -2044,6 +2133,8 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     if (IsQmdMethod(method)) {
         GetFrontQmd().MaybeTakeOver(split, native_qmd, QmdTakeOver::QmdMethod);
     }
+    // The back calls the last word a last call when it ends the method (CallMultiMethod).
+    fs.upload_written = methods_pending <= amount;
     {
         const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(method)};
         split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
@@ -2089,7 +2180,8 @@ bool KeplerCompute::FrontTakeListWords(VideoCommon::GpuSplit& split, u32 method,
                                                this,
                                                fs.registers,
                                                native_registers,
-                                               no_emit};
+                                               no_emit,
+                                               &fs.upload_unknown};
     return list_front->PrepareCall(context, Nx2ListIndirect::GetChannel(native_data_ram), slot,
                                    count);
 }
@@ -2115,6 +2207,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         if (IsQmdMethod(address)) {
             GetFrontQmd().MaybeTakeOver(split, native_qmd, QmdTakeOver::QmdMethod);
         }
+        fs.upload_written = true; // A macro's writes are last calls
         {
             const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(address)};
             split.MacroWrite(this, address, value, FrontWrites(address));
@@ -2139,7 +2232,8 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                                                 this,
                                                 fs.registers,
                                                 native_registers,
-                                                emit};
+                                                emit,
+                                                &fs.upload_unknown};
         bool concretized{};
         Nx2ListIndirect::Reason reason{};
         if (list_front->Run(context, Nx2ListIndirect::GetChannel(native_data_ram), concretized,

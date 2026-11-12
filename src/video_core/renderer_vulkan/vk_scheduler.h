@@ -271,11 +271,11 @@ public:
     }
 
     /// Whether anything was recorded since the last Flush or Finish, or waits to be: batched
-    /// uploads, reordered uploads and a deferred clear reach the command buffers only at the next
+    /// and reordered uploads and a deferred clear reach the command buffer only at the next
     /// record or submit.
     [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
-        return record_serial != submitted_serial || uploads_pending ||
-               reordered_uploads_pending || deferred_clear.framebuffer != nullptr;
+        return record_serial != submitted_serial || uploads_pending || reordered_uploads_pending ||
+               deferred_clear.framebuffer != nullptr;
     }
     /// Counts a flush skipped because nothing was recorded (GPU profile).
     static void CountSkippedFlush();
@@ -503,7 +503,6 @@ private:
             // Uploads recorded before this command go before it.
             FlushUploads();
         }
-        // Every command is recorded here: RecordedSinceSubmit (#1329) counts them.
         ++record_serial;
         if (!chunk->Record(command)) {
             DispatchWork();
@@ -676,6 +675,8 @@ private:
     std::mutex queue_mutex;
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    /// work_queue's size, set under queue_mutex: the worker watches it before it sleeps.
+    std::atomic<size_t> queued_chunks{};
     std::jthread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};

@@ -167,8 +167,10 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     if (VideoCommon::ReadTrace::Enabled()) {
         CreateReadTrace();
     }
+    // The submission pool exists without EDEN_DKB_FRAME_TRACE (the overlay's GPU %), but only
+    // the trace samples a frame every second.
     gpu_cost = GpuCost::Create(device, trace_timestamp_bits, trace_timestamp_period,
-                               static_cast<bool>(trace_query_pool));
+                               trace_query_pool && Common::DkbFrameTrace::Enabled());
     record_sites = gpu_cost != nullptr;
 
     AcquireNewChunk();
@@ -561,7 +563,7 @@ void Scheduler::DispatchWork() {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
     if (uploads_pending) {
-        // What the worker gets is everything recorded so far.
+        // The worker must receive everything recorded so far.
         FlushUploads();
     }
     if (chunk && !chunk->Empty()) {
@@ -571,6 +573,7 @@ void Scheduler::DispatchWork() {
         {
             std::scoped_lock ql{queue_mutex};
             work_queue.push(std::move(chunk));
+            queued_chunks.store(work_queue.size(), std::memory_order_release);
             wake = worker_waiting;
         }
         if (wake) {
@@ -867,12 +870,27 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
 
         work = std::move(work_queue.front());
         work_queue.pop();
+        queued_chunks.store(work_queue.size(), std::memory_order_release);
         event_cv.notify_all();
         return true;
     }};
 
     while (!stop_token.stop_requested()) {
         std::unique_ptr<CommandChunk> work;
+
+        // The GPU thread dispatches a chunk every few tens of microseconds while it draws:
+        // waiting a moment for the next one before sleeping spares it waking this thread (a
+        // system call in DispatchWork, ~1% of the GPU thread at Ocarina of Time's water).
+        static constexpr int SpinCount = 2048;
+        if (queued_chunks.load(std::memory_order_acquire) == 0) {
+            const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::WorkerIdle};
+            for (int spin = 0; spin < SpinCount &&
+                               queued_chunks.load(std::memory_order_acquire) == 0 &&
+                               !stop_token.stop_requested();
+                 ++spin) {
+                Common::SpinPause();
+            }
+        }
 
         {
             std::unique_lock lk{queue_mutex};
@@ -1191,7 +1209,7 @@ void Scheduler::TraceGpuSubmission() {
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                 std::source_location cause) {
     if (uploads_pending) {
-        // In the tick they were recorded at.
+        // Keep the copies in the tick that protects their staging regions and buffer lifetimes.
         FlushUploads();
     }
     if (VideoCommon::Nx2Profile::Enabled()) {

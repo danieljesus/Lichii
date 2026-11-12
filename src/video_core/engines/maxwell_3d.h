@@ -3288,6 +3288,9 @@ public:
     /// A vertex attribute format, when vertex input is dynamic state.
     static bool IsFastDrawVertexFormat(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
+    /// Whether data written to [begin, end) reaches the texture or sampler headers, which ends
+    /// fast draw reuse (it breaks it then).
+    bool FastDrawHeaderWrite(GPUVAddr begin, GPUVAddr end);
 
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
@@ -3301,7 +3304,8 @@ private:
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
 
     /// The value a write leaves in the register, as the shadow RAM mode has it: the argument
-    /// (tracked in shadow_state when tracking), or the shadow copy when replaying.
+    /// (tracked in shadow_state when tracking), or the shadow copy when replaying. Defined here,
+    /// as the hot method paths call it for nearly every write.
     u32 ProcessShadowRam(u32 method, u32 argument) {
         const auto control = shadow_state.shadow_ram_control;
         if (control == Regs::ShadowRamControl::Track ||
@@ -3314,16 +3318,16 @@ private:
         return argument;
     }
 
-    /// Stores a register's value and sets its dirty flags. Defined here, as the hot method paths
-    /// call it for nearly every write.
+    /// Stores a register's value and sets its dirty flags. Defined here for the same reason.
     void ProcessDirtyRegisters(u32 method, u32 argument) {
-        // The instances after the first are drawn together once their loop ends, and they must
-        // see the state they were begun with: NVN's draw macros reset the base instance (and its
-        // copy in c[0][0x644]) right after the loop, before the macro returns.
+        // The instances after the first are drawn together once their loop ends, and they must see
+        // the state they were begun with: NVN's draw macros reset the base instance (and its copy
+        // in c[0][0x644]) right after the loop, before the macro returns.
         if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method))
             [[unlikely]] {
             draw_manager.DrawDeferred(*this, true);
         }
+        // A changed register that doesn't only parameterize the next draw ends fast draw reuse.
         if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
             !IsFastDrawParameter(method)) {
             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);

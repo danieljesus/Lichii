@@ -173,8 +173,8 @@ bool InModule(const Modules& modules, DWORD64 address) {
 // could be paused holding the heap lock. A wrong unwind step (code with missing or wrong unwind
 // data) leaves a garbage stack pointer: reading through it crashed the process, so the walk
 // stops once the stack pointer leaves the thread's stack.
-unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib,
-              const Modules& modules) {
+void Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib,
+          const Modules& modules, unsigned& depth) {
     if (tib == nullptr) {
         return 0;
     }
@@ -207,6 +207,26 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_T
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
                          &handler_data, &establisher_frame, nullptr);
     }
+}
+
+// RtlVirtualUnwind also reads through the frame register, which the stack check above doesn't
+// cover: a thread paused in a fiber switch with Rbp 0 made it read address 0, and the access
+// violation took the process down (EDEN_NX2_SAMPLE=CPUCore_*). Such a walk keeps the frames it
+// found.
+unsigned GuardedWalk(const CONTEXT& context, std::array<DWORD64, MaxDepth>& frames,
+                     const NT_TIB* tib, const Modules& modules, bool& faulted) {
+    unsigned depth = 0;
+    faulted = false;
+#ifdef _MSC_VER
+    __try {
+        Walk(context, frames, tib, modules, depth);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                 : EXCEPTION_CONTINUE_SEARCH) {
+        faulted = true;
+    }
+#else
+    Walk(context, frames, tib, modules, depth);
+#endif
     return depth;
 }
 
@@ -325,7 +345,7 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
         text += fmt::format("=== thread \"{}\": {} samples\n", targets[thread].name, total);
         print("self (where the thread is)", self, 60);
         // The hottest instructions as module offsets, for llvm-symbolizer --relative-address
-        // (which line of a function, inlined code included).
+        // (which line of a function, inlined code included). Enough to sum them per line.
         std::map<DWORD64, unsigned> addresses;
         for (const Sample& sample : samples) {
             if (sample.thread == thread && sample.depth != 0) {
@@ -338,7 +358,7 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
         }
         std::sort(hot.rbegin(), hot.rend());
         text += "-- self by instruction (module+offset)\n";
-        for (size_t i = 0; i < (std::min<size_t>)(hot.size(), 60); ++i) {
+        for (size_t i = 0; i < (std::min<size_t>)(hot.size(), 400); ++i) {
             const DWORD64 address = hot[i].second;
             HMODULE module{};
             char module_path[MAX_PATH] = "?";
@@ -405,7 +425,8 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
             if (GetThreadContext(handle, &context)) {
                 Sample& sample = samples.emplace_back();
                 sample.thread = i;
-                sample.depth = Walk(context, sample.frames, targets[i].tib, modules);
+                sample.depth = GuardedWalk(context, sample.frames, targets[i].tib, modules,
+                                           sample.faulted);
             }
             ResumeThread(handle);
         }
