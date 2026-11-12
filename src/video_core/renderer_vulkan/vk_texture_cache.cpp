@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <unordered_map>
+#include "common/cityhash.h"
 #include <limits>
 #include <array>
 #include <atomic>
@@ -2915,6 +2917,22 @@ void TextureCacheRuntime::LogMemoryTrace() {
              staging_buffer_pool.CachedBytes(MemoryUsage::Upload) >> 20,
              staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20,
              staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20);
+    {
+        const auto bytes_of = [](const PendingTranscode& t) {
+            u64 bytes{};
+            for (u32 level = 0; level < t.levels; ++level) {
+                bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
+            }
+            return bytes * t.layers;
+        };
+        u64 free_bytes{}, pending_bytes{};
+        for (const auto& t : free_transcodes) free_bytes += bytes_of(t);
+        for (const auto& t : pending_transcodes) pending_bytes += bytes_of(t);
+        LOG_INFO(Render_Vulkan,
+                 "Memory trace: transcode scratch free {} MiB ({}), pending {} MiB ({}), recycled images {} MiB, msaa scratch {}",
+                 free_bytes >> 20, free_transcodes.size(), pending_bytes >> 20,
+                 pending_transcodes.size(), GetRecycledImageMemory() >> 20, msaa_scratch_images.size());
+    }
     Vulkan::LogMemoryTrace(device);
 }
 
@@ -5158,6 +5176,27 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u32 height = info.size.height;
     const u32 levels = static_cast<u32>(HostMipCount(info));
     const u32 layers = static_cast<u32>(info.resources.layers);
+    // TEST (EDEN_NX2_ASTC_REPEATS): how many transcodes decode ASTC data seen before.
+    static const bool count_repeats = std::getenv("EDEN_NX2_ASTC_REPEATS") != nullptr;
+    if (count_repeats) {
+        static std::unordered_map<u64, u32> seen;
+        static u64 total{}, repeats{}, all_bytes{}, repeat_bytes{};
+        const auto source = map.mapped_span.first(
+            (std::min)(map.mapped_span.size(), static_cast<size_t>(image.guest_size_bytes)));
+        const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(source.data()), source.size()) ^ (u64{width} << 40) ^
+                         (u64{height} << 20) ^ (u64{levels} << 8) ^ layers;
+        ++total;
+        all_bytes += source.size();
+        if (seen[hash]++ != 0) {
+            ++repeats;
+            repeat_bytes += source.size();
+        }
+        if (total % 250 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "ASTC transcode repeats: {} of {} ({} of {} MiB source), {} distinct",
+                     repeats, total, repeat_bytes >> 20, all_bytes >> 20, seen.size());
+        }
+    }
     // The BC encoder declares layout(rgba8). Identical byte layout is not enough:
     // its storage image view must have the matching R8G8B8A8_UNORM format.
     constexpr VkFormat DecodeFormat = VK_FORMAT_R8G8B8A8_UNORM;

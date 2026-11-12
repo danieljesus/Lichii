@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -567,7 +568,11 @@ RecyclerState& Recycler() {
 }
 
 /// What the recycler keeps at most, and how long a kept image waits to be taken again.
-constexpr u64 RecyclerCap = u64{512} << 20;
+// TEST (EDEN_NX2_RECYCLER_MIB): the recycler's cap.
+const u64 RecyclerCap = [] {
+    const char* value = std::getenv("EDEN_NX2_RECYCLER_MIB");
+    return value != nullptr ? u64{std::strtoull(value, nullptr, 10)} << 20 : u64{512} << 20;
+}();
 constexpr std::chrono::seconds RecycleKeepTime{10};
 
 /// Images dropped from the recycler are destroyed on a thread of their own: freeing dedicated
