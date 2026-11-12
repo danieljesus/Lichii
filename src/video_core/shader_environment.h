@@ -216,7 +216,9 @@ public:
     [[nodiscard]] bool Detach(
         std::shared_ptr<const std::vector<Tegra::Texture::TICEntry>>& texture_pool);
 
-    static constexpr size_t MaxDetachedTexturePoolBytes = 1024 * 1024;
+    /// 4 MiB: Ocarina of Time with the built-in "Texture Pool x2" patch has a pool of 33068
+    /// descriptors (1 058 176 bytes), which a 1 MiB limit kept on the GPU thread every time.
+    static constexpr size_t MaxDetachedTexturePoolBytes = 4 * 1024 * 1024;
 
     /// Bytes of constant buffer contents copied by Detach (0 if not detached).
     [[nodiscard]] size_t SnapshotSizeBytes() const noexcept;

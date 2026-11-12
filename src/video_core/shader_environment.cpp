@@ -1119,8 +1119,10 @@ bool GraphicsEnvironment::Detach(
     }
     if (!texture_pool) {
         auto pool{std::make_shared<std::vector<Tegra::Texture::TICEntry>>(pool_entries)};
-        gpu_memory->ReadBlock(regs.tex_header.Address(), pool->data(),
-                              pool->size() * sizeof(Tegra::Texture::TICEntry));
+        // Unsafe, as ReadTextureInfo reads the descriptors of an attached environment. The safe
+        // read flushes each of the pool's ~260 pages through the caches, and could download.
+        gpu_memory->ReadBlockUnsafe(regs.tex_header.Address(), pool->data(),
+                                    pool->size() * sizeof(Tegra::Texture::TICEntry));
         texture_pool = std::move(pool);
     }
     EngineSnapshot copy;
