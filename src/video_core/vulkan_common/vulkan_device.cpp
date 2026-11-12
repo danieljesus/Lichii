@@ -913,6 +913,9 @@ Device::~Device() {
 #endif
     SaveStaticPipelineCache();
     ShutdownGPULogging();
+    // Before the pools go: recycled images can sit in the medium image pool, and freeing one
+    // after its pool was destroyed crashed on shutdown (VmaBlockVector::Free).
+    vk::ImageRecycler::Clear(allocator);
     for (auto& pools : separate_pools) {
         for (VmaPool pool : pools) {
             if (pool != VK_NULL_HANDLE) {
@@ -920,7 +923,6 @@ Device::~Device() {
             }
         }
     }
-    vk::ImageRecycler::Clear(allocator);
     vmaDestroyAllocator(allocator);
 }
 
