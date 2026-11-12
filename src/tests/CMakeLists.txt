@@ -21,6 +21,8 @@ add_executable(tests
     core/nx2_video_ready.cpp
     core/nx2_debug_server.cpp
     core/nx2_present_pacer.cpp
+    core/ldn_lan_protocol.cpp
+    core/perf_stats.cpp
     common/display_hdr.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
@@ -249,6 +251,7 @@ if (TARGET SDL3::SDL3)
 endif()
 
 if (WIN32 AND ARCHITECTURE_x86_64)
+    target_sources(tests PRIVATE common/nx2_sampler.cpp)
     add_executable(event_wait_probe ../../tools/nx2/event_wait_probe.cpp)
     target_link_libraries(event_wait_probe PRIVATE common)
 endif()
