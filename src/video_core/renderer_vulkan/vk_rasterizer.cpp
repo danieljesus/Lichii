@@ -2779,11 +2779,15 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
             return true;
         }
     }
-    {
+    // Most CPU writes land where no image or shader was ever registered, which page_filter tells
+    // without the caches' locks the guest cores otherwise contend on.
+    if (texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
-    pipeline_cache.InvalidateRegion(addr, size);
+    if (pipeline_cache.page_filter.Any(addr, size)) {
+        pipeline_cache.InvalidateRegion(addr, size);
+    }
     return false;
 }
 
