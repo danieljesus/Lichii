@@ -148,6 +148,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
+    bool skip_costly = false;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
     const auto Configure = [&](bool allow_aggressive) {
@@ -164,7 +165,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly, out_of_memory](ImageId image_id) {
+                          &evict_old_costly, &skip_costly, out_of_memory](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -174,7 +175,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return false;
         }
         const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
-        if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
+        if (((!aggressive_mode || skip_costly) && !evict_old_costly &&
+             True(image.flags & ImageFlagBits::CostlyLoad)) ||
             (!high_priority_mode && must_download)) {
             return false;
         }
@@ -269,9 +271,30 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         evict_old_costly = false;
     }
     Collect();
+    // Past the critical memory the other images go first, and costly ones (ASTC transcoded on
+    // the GPU) only once unused for CostlyMinAge frames. Collecting them after 10 frames like the
+    // rest re-transcoded the same textures over and over wherever the cache sits near its limit
+    // (Steam Deck in Ocarina's Hyrule Field: 360-670 of every 1000 transcodes were textures seen
+    // before, up to 27 ms of GPU a frame; with this, 1-4 of 500, and panning 15.8 -> 19.0 fps).
+    // EDEN_NX2_TC_COSTLY_AGE=<frames> sets it, 0 collects them like the rest.
+    static const u64 costly_age = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_COSTLY_AGE");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : CostlyMinAge;
+    }();
     if (out_of_memory || total_used_memory >= critical_memory) {
         Configure(true);
-        Collect();
+        if (costly_age != 0 && !out_of_memory) {
+            skip_costly = true;
+            Collect();
+            skip_costly = false;
+            if (total_used_memory >= critical_memory) {
+                Configure(true);
+                ticks_to_destroy = (std::max)(ticks_to_destroy, costly_age);
+                Collect();
+            }
+        } else {
+            Collect();
+        }
     }
 }
 
