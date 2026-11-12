@@ -476,7 +476,10 @@ GraphicsPipeline::GraphicsPipeline(
                 has_computed_handles = true;
                 // A table of computed handles (one shadow map per light) evaluates each element
                 // with its index; ComputedHandlesChanged keeps one value per descriptor.
-                if (desc.count > 1) {
+                // TEST: EDEN_NX2_TEST_NO_ARRAY_BLOCK=1 skips the block (stale shadow maps).
+                static const bool no_array_block{
+                    std::getenv("EDEN_NX2_TEST_NO_ARRAY_BLOCK") != nullptr};
+                if (desc.count > 1 && !no_array_block) {
                     block(DeltaBlocker::ComputedHandles);
                 }
                 return;
