@@ -291,6 +291,14 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 Configure(true);
                 ticks_to_destroy = (std::max)(ticks_to_destroy, costly_age);
                 Collect();
+                // Only recent costly images left: the driver may page past its budget.
+                static u32 still_over{};
+                if (total_used_memory >= critical_memory && (++still_over & (still_over - 1)) == 0) {
+                    LOG_WARNING(HW_GPU,
+                                "Texture cache still over its critical memory ({} of {} MiB) "
+                                "with only recently used costly images left ({} times)",
+                                total_used_memory >> 20, critical_memory >> 20, still_over);
+                }
             }
         } else {
             Collect();
