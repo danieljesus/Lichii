@@ -35,6 +35,7 @@ constexpr size_t MaxDepth = 40;
 struct Sample {
     unsigned thread;
     unsigned depth;
+    bool faulted; ///< the walk stopped at an access violation
     std::array<DWORD64, MaxDepth> frames;
 };
 
@@ -176,13 +177,12 @@ bool InModule(const Modules& modules, DWORD64 address) {
 void Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib,
           const Modules& modules, unsigned& depth) {
     if (tib == nullptr) {
-        return 0;
+        return;
     }
     const auto on_stack = [tib](DWORD64 rsp) {
         return rsp >= reinterpret_cast<DWORD64>(tib->StackLimit) &&
                rsp + 8 <= reinterpret_cast<DWORD64>(tib->StackBase) && (rsp & 7) == 0;
     };
-    unsigned depth = 0;
     while (depth < MaxDepth && context.Rip != 0 && on_stack(context.Rsp)) {
         frames[depth++] = context.Rip;
         // Generated code ends the walk. The JIT's unwind data describes its entry prologue only,
@@ -310,8 +310,15 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
         std::map<std::string, unsigned> inclusive;
         std::map<std::string, unsigned> self_caller;
         unsigned total = 0;
+        unsigned faulted = 0;
+        unsigned empty = 0;
         for (const Sample& sample : samples) {
-            if (sample.thread != thread || sample.depth == 0) {
+            if (sample.thread != thread) {
+                continue;
+            }
+            faulted += sample.faulted ? 1 : 0;
+            if (sample.depth == 0) {
+                ++empty;
                 continue;
             }
             ++total;
@@ -342,7 +349,9 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
                              sorted[i].second.c_str());
             }
         };
-        text += fmt::format("=== thread \"{}\": {} samples\n", targets[thread].name, total);
+        text += fmt::format("=== thread \"{}\": {} samples ({} without a stack, {} walks stopped "
+                            "by a fault)\n",
+                            targets[thread].name, total, empty, faulted);
         print("self (where the thread is)", self, 60);
         // The hottest instructions as module offsets, for llvm-symbolizer --relative-address
         // (which line of a function, inlined code included). Enough to sum them per line.
