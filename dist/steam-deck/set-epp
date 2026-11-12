@@ -1,0 +1,16 @@
+#!/bin/bash
+# set-epp <performance|balance_performance|balance_power|power|default|status>
+set -euo pipefail
+case "${1:-status}" in
+    performance|balance_performance|balance_power|power|default) value=$1 ;;
+    status)
+        for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference; do
+            printf '%s: %s\n' "${f%/cpufreq/*}" "$(cat "$f")"
+        done
+        exit 0 ;;
+    *) echo "usage: set-epp performance|balance_performance|balance_power|power|default|status" >&2; exit 2 ;;
+esac
+for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference; do
+    echo "$value" > "$f"
+done
+echo "energy_performance_preference = $value"

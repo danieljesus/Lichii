@@ -1,0 +1,16 @@
+#!/bin/bash
+# set-gpuclk <auto|MHz|status>: fixes the Steam Deck GPU clock (200-1600 MHz) or returns it to auto.
+set -euo pipefail
+D=/sys/class/drm/card0/device
+case "${1:-status}" in
+    status) cat "$D/power_dpm_force_performance_level"; cat "$D/pp_dpm_sclk"; exit 0 ;;
+    auto) echo auto > "$D/power_dpm_force_performance_level"; echo "gpu clock = auto"; exit 0 ;;
+    *[!0-9]*|'') echo "usage: set-gpuclk auto|<200-1600>|status" >&2; exit 2 ;;
+esac
+mhz=$1
+if [ "$mhz" -lt 200 ] || [ "$mhz" -gt 1600 ]; then echo "out of range: $mhz" >&2; exit 2; fi
+echo manual > "$D/power_dpm_force_performance_level"
+echo "s 0 $mhz" > "$D/pp_od_clk_voltage"
+echo "s 1 $mhz" > "$D/pp_od_clk_voltage"
+echo c > "$D/pp_od_clk_voltage"
+echo "gpu clock = $mhz MHz"
