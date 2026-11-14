@@ -128,7 +128,13 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // mid-game: hand the engines back to the front (and start again when they allow it).
     const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
                                                           : Settings::IsDMALevelSafe();
-    const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
+    // TEST (EDEN_NX2_SPLIT_HIGH=1): start the split under High GPU accuracy too, to measure what
+    // High costs apart from losing the split. Not safe in general: High's flushing reads and
+    // region flushes are not routed to the back.
+    static const bool split_under_high = std::getenv("EDEN_NX2_SPLIT_HIGH") != nullptr;
+    const bool high_blocks = Settings::IsGPULevelHigh() && !split_under_high;
+    const bool dma_blocks = Settings::IsDMALevelDefault() ? high_blocks : Settings::IsDMALevelSafe();
+    const bool allowed = !dma_blocks && !high_blocks &&
                          Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
     if (active && !allowed) {
         Drain();
