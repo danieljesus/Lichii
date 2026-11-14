@@ -39,6 +39,7 @@ def pipelines(path):
             continue
         vs, fs = info(r.envs[0], True), info(r.envs[-1], False)
         state = sf.canonical(r.key[48:160], vs['read_mask'])
+        state = state[:16] + bytes(8) + state[24:]  # without the driver, as build_precompiled.py
         out[(vs['hash'], fs['hash'], state)] = (vs, fs, state)
     return list(out.values())
 

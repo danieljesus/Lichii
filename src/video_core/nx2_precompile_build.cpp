@@ -33,6 +33,8 @@ constexpr size_t ComputeKeySize = 24;
 constexpr size_t GraphicsKeySize = 1056;
 constexpr size_t StateOffset = 48;
 constexpr size_t StateSize = 112;
+constexpr size_t DriverFieldsOffset = 16; ///< in the state: driver_id, driver_version
+constexpr size_t DriverFieldsSize = 8;
 constexpr size_t StateTail = GraphicsKeySize - StateOffset - StateSize;
 
 template <typename T>
@@ -468,8 +470,12 @@ std::vector<u8> CanonicalKey(const CachedPipeline& record) {
         mesh |= env.stage == StageTask || env.stage == StageMesh;
     }
     const u32 mask = mesh ? 0 : (vertex ? AttributeReadMask(vertex->sph) : 0xFFFFFFFFU);
-    const auto state =
-        Canonical(std::span<const u8>(key).subspan(StateOffset, StateSize), mask);
+    auto state = Canonical(std::span<const u8>(key).subspan(StateOffset, StateSize), mask);
+    // Keys leave the driver out, as the emulator reads them (ClearDriverFields) and as the shader
+    // cache v2 records them. A cache of the format before it holds the driver's id and version:
+    // with them kept, a pipeline recorded in both formats, or before and after a driver update,
+    // counts as two states of its pair, and the model's scene states split by driver.
+    std::fill_n(state.begin() + DriverFieldsOffset, DriverFieldsSize, u8{0});
     std::vector<u8> out(key.begin(), key.begin() + StateOffset);
     out.insert(out.end(), state.begin(), state.end());
     if (HashesPastPrefix(state)) {
