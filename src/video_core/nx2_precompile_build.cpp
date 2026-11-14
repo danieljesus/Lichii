@@ -276,14 +276,22 @@ std::vector<u8> Assemble(const std::string& t, u64 a, const std::string& f, cons
 }
 
 /// A shader as the model sees it: its hash, container and file, and the read mask (vertex) or the
-/// render targets it writes (pixel).
+/// structural class (pixel).
 struct ShaderInfo {
     std::string hash; ///< "%016x"
     std::string fine;
     std::string coarse;
     u32 read_mask{};
-    u32 omap{};
+    std::string pixel_class;
 };
+
+/// A pixel program's structural class, from its header: the render targets it writes and whether
+/// it discards pixels. Programs that discard are drawn with alpha test and blend states of their
+/// own, so a program never recorded takes its render target part from the ones like it.
+std::string PixelClass(std::span<const u8> sph) {
+    const u32 kills_pixels = (U32(sph, 0) >> 15) & 1;
+    return fmt::format("{}/{}", U32(sph, 0x48), kills_pixels);
+}
 
 enum class Level : u8 { Own, Fine, Coarse, Class, Global };
 constexpr std::array<double, 5> LevelWeights{1.0, 0.6, 0.25, 0.25, 0.04};
@@ -304,7 +312,7 @@ public:
         }
         for (const auto& key :
              {LevelKey(Level::Own, fs.hash), LevelKey(Level::Fine, fs.fine),
-              LevelKey(Level::Coarse, fs.coarse), LevelKey(Level::Class, std::to_string(fs.omap)),
+              LevelKey(Level::Coarse, fs.coarse), LevelKey(Level::Class, fs.pixel_class),
               LevelKey(Level::Global, "")}) {
             ++F[key][parts.f];
         }
@@ -333,7 +341,7 @@ public:
                               {{Level::Own, fs.hash},
                                {Level::Fine, fs.fine},
                                {Level::Coarse, fs.coarse},
-                               {Level::Class, std::to_string(fs.omap)},
+                               {Level::Class, fs.pixel_class},
                                {Level::Global, ""}},
                               10);
         const u64 total = S.Sum();
@@ -1380,7 +1388,7 @@ PrecompiledCounts WritePrecompiled(const std::filesystem::path& out, const GameT
         if (vertex) {
             info.read_mask = AttributeReadMask(env.sph);
         } else {
-            info.omap = U32(env.sph, 0x48);
+            info.pixel_class = PixelClass(env.sph);
         }
         return info;
     };
@@ -1462,7 +1470,7 @@ PrecompiledCounts WritePrecompiled(const std::filesystem::path& out, const GameT
         if (vertex) {
             info.read_mask = AttributeReadMask(sph);
         } else {
-            info.omap = U32(sph, 0x48);
+            info.pixel_class = PixelClass(sph);
         }
         return info;
     };

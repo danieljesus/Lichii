@@ -27,7 +27,7 @@ def info(env, vertex):
     if vertex:
         d['read_mask'] = sf.attribute_read_mask(env.sph)
     else:
-        d['omap'] = sm.omap(env.sph)
+        d['pclass'] = sm.pixel_class(env.sph)
     return d
 
 

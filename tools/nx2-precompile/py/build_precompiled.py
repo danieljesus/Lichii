@@ -160,7 +160,7 @@ def shader_info(env, vertex):
     if vertex:
         d['read_mask'] = sf.attribute_read_mask(env.sph)
     else:
-        d['omap'] = sm.omap(env.sph)
+        d['pclass'] = sm.pixel_class(env.sph)
     return d
 
 
@@ -212,7 +212,7 @@ def oracle_info(h, vertex):
     if vertex:
         d['read_mask'] = sf.attribute_read_mask(sph)
     else:
-        d['omap'] = sm.omap(sph)
+        d['pclass'] = sm.pixel_class(sph)
     return d
 
 

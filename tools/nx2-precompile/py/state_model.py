@@ -25,9 +25,11 @@ def assemble(t, a, f, s):
     return sf.join((t[0], t[1], a.to_bytes(8, 'little')), f, s)
 
 
-def omap(sph):
-    """Render targets a pixel program writes (4 bits each), from its header."""
-    return u32(sph, 0x48)
+def pixel_class(sph):
+    """A pixel program's structural class, from its header: the render targets it writes (4 bits
+    each) and whether it discards pixels. Programs that discard are drawn with alpha test and
+    blend states of their own."""
+    return u32(sph, 0x48), u32(sph, 0) >> 15 & 1
 
 
 class Model:
@@ -41,13 +43,13 @@ class Model:
         self.slot = collections.defaultdict(collections.Counter)  # (container, slot) -> type
 
     def add(self, vs, fs, state):
-        """vs/fs: dicts with hash, fine, coarse and read_mask (vertex) or omap (pixel)."""
+        """vs/fs: dicts with hash, fine, coarse and read_mask (vertex) or pclass (pixel)."""
         t, a, f, s = parts(state)
         for lvl, key in (('own', vs['hash']), ('fine', vs['fine']), ('coarse', vs['coarse']),
                          ('global', '')):
             self.T[(lvl, key)][t] += 1
         for lvl, key in (('own', fs['hash']), ('fine', fs['fine']), ('coarse', fs['coarse']),
-                         ('class', fs['omap']), ('global', '')):
+                         ('class', fs['pclass']), ('global', '')):
             self.F[(lvl, key)][f] += 1
         self.S[s] += 1
         self.A_own[vs['hash']][a] += 1
@@ -96,7 +98,7 @@ class Model:
                                   ('coarse', vs['coarse']), ('global', '')], 4)
         da = self.attribute_candidates(vs)
         df = self._blend(self.F, [('own', fs['hash']), ('fine', fs['fine']), ('coarse', fs['coarse']),
-                                  ('class', fs['omap']), ('global', '')], 10)
+                                  ('class', fs['pclass']), ('global', '')], 10)
         tot = sum(self.S.values())
         ds = [(x, n / tot) for x, n in self.S.most_common(2)]
         scored = []
