@@ -1755,7 +1755,7 @@ int CacheExport(const std::filesystem::path& cache, const std::filesystem::path&
 bool BuildImpl(const FileSys::Nx2ShaderExtract::Result& extracted,
                std::span<const std::filesystem::path> caches, const std::filesystem::path& out,
                u32 cache_version, unsigned threads, BuildProgress* progress, std::stop_token stop,
-               BuildReport& report) {
+               BuildReport& report, u32 states = DefaultStatesPerPair) {
     BuildProgress unused;
     BuildProgress& at = progress ? *progress : unused;
     const auto step = [&at](BuildStep next, u64 total) {
@@ -1854,7 +1854,7 @@ bool BuildImpl(const FileSys::Nx2ShaderExtract::Result& extracted,
     scan = {};
     step(BuildStep::Writing, 1);
     const auto counts = WritePrecompiled(out, tables, oracle, records, mesh_envs,
-                                         {.k = 4, .mesh_k = 2, .cache_version = cache_version});
+                                         {.k = states, .mesh_k = 2, .cache_version = cache_version});
     std::string summary;
     for (const auto& [what, n] : counts) {
         summary += fmt::format("{}{} {}", summary.empty() ? "" : ", ", n, what);
@@ -1872,7 +1872,7 @@ bool BuildImpl(const FileSys::Nx2ShaderExtract::Result& extracted,
 /// nx2-precompile build: extract and the whole pipeline, in this process.
 int BuildCommand(const std::filesystem::path& game_path, const std::filesystem::path& out,
                  std::span<const std::filesystem::path> caches, const std::string& packages,
-                 unsigned threads) {
+                 unsigned threads, u32 states) {
     Game game;
     auto spill = out;
     spill += ".spill";
@@ -1884,7 +1884,7 @@ int BuildCommand(const std::filesystem::path& game_path, const std::filesystem::
                std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     BuildReport report;
     BuildImpl(extracted, caches, out, VideoCommon::VulkanPipelineCacheVersion, threads, nullptr,
-              {}, report);
+              {}, report, states);
     for (const auto& line : report.lines) {
         fmt::print("{}\n", line);
     }
@@ -1936,6 +1936,7 @@ int RunTool(int argc, char** argv) {
         std::vector<std::filesystem::path> caches;
         const unsigned hardware_threads = std::thread::hardware_concurrency();
         unsigned threads = hardware_threads > 2 ? hardware_threads - 2 : 1;
+        u32 states = DefaultStatesPerPair;
         for (int i = 2; i + 1 < argc; i += 2) {
             const std::string arg = argv[i];
             const std::string value = argv[i + 1];
@@ -1947,13 +1948,17 @@ int RunTool(int argc, char** argv) {
             else if (arg == "--file") check_file = value;
             else if (arg == "--game") game = value;
             else if (arg == "--packages") packages = value;
+            else if (arg == "--states") states = static_cast<u32>(std::stoul(value));
             else throw std::runtime_error("Unknown option " + arg);
         }
         if (command == "build") {
             if (game.empty() || out.empty() || caches.empty())
                 throw std::runtime_error(
                     "build needs --game GAME --out PRECOMPILED --cache CACHE [--cache CACHE ...]");
-            return BuildCommand(game, out, caches, packages, threads);
+            if (states < 1 || states > MaxStatesPerPair)
+                throw std::runtime_error(
+                    fmt::format("--states takes 1 to {}", MaxStatesPerPair));
+            return BuildCommand(game, out, caches, packages, threads, states);
         }
         if (command == "cache-export") {
             if (cache.empty() || out.empty())

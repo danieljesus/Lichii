@@ -150,8 +150,13 @@ struct MeshEnvironments {
     std::vector<u8> mesh_env;
 };
 
+/// Predicted render states per vertex/pixel pair: what a build writes unless told otherwise, and
+/// the most it takes (nx2-precompile build --states).
+constexpr u32 DefaultStatesPerPair = 4;
+constexpr u32 MaxStatesPerPair = 16;
+
 struct PrecompiledOptions {
-    u32 k = 4;      ///< predicted render states per vertex/pixel pair
+    u32 k = DefaultStatesPerPair; ///< predicted render states per vertex/pixel pair
     u32 mesh_k = 2; ///< per mesh draw
     u32 cache_version{};
 };

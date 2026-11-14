@@ -90,7 +90,7 @@ log shows it as prepared pipelines that still take hundreds of milliseconds to b
 ## Commands
 
 ```
-nx2-precompile build    --game GAME.nup|ROMFS_DIR --out precompiled.fork-v<N>.nx2prep --cache CACHE [--cache CACHE ...]
+nx2-precompile build    --game GAME.nup|ROMFS_DIR --out precompiled.fork-v<N>.nx2prep --cache CACHE [--cache CACHE ...] [--states N]
 nx2-precompile extract  --game GAME.nup|ROMFS_DIR --out PREFIX [--packages merged|union] [--threads N]
 nx2-precompile scan     --pkg PREFIX.programs --out PREFIX [--priors FILE] [--threads N]
 nx2-precompile validate --pkg PREFIX.programs --cache CACHE.bin --out PREFIX [--priors FILE]
@@ -106,7 +106,9 @@ Python: the Python steps are ported to C++ in `video_core/nx2_precompile_build.c
 is the scripts' byte for byte (checked on Ocarina of Time with one cache and with two, one of them
 of the format before the shader cache v2). It leaves out the checks (`validate`, the held-out
 check, `check`, the SPIR-V emit check). Ocarina of Time: 37 s on 16 threads, against
-about 50 s for the script.
+about 50 s for the script. `--states N` (1 to 16, default 4) is the script's `--k`: the predicted
+render states written per vertex/pixel pair, from the most likely on. The file's records, and the
+time the emulator takes to prepare them, grow with it.
 
 ## In the emulator
 
