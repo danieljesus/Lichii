@@ -136,6 +136,10 @@ def canonical_key(rec):
     mesh = any(e.stage in (7, 8) for e in rec.envs)
     mask = 0 if mesh else (sf.attribute_read_mask(vertex.sph) if vertex else 0xFFFFFFFF)
     state = sf.canonical(key[48:48 + sf.STATE_LEN], mask)
+    # Keys leave the driver out, as the emulator reads them and as the shader cache v2 records
+    # them: a cache of the format before it holds the driver's id and version, and with them kept
+    # a pipeline recorded in both formats, or before and after a driver update, counts twice.
+    state = state[:16] + bytes(8) + state[24:]
     # Bytes past the prefix are kept where the key's hash covers them (static vertex input, or
     # transform feedback); otherwise they are cleared, as they are not the pipeline's.
     tail = key[48 + sf.STATE_LEN:] if sf.hashes_past_prefix(state) else bytes(STATE_TAIL)
