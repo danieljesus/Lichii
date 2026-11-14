@@ -7,7 +7,9 @@
 
 namespace VideoCommon {
 
-enum class OcarinaUpscaleBackend { Native, Fsr, Dlss };
+/// Passthrough: the scene colour is filtered straight into the game's target, with no temporal
+/// pass at all. For GPUs where the game's network or FSR costs more than the display can show.
+enum class OcarinaUpscaleBackend { Native, Fsr, Dlss, Passthrough };
 
 constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dlss_enabled,
                                                     bool dlss_available,
@@ -17,6 +19,9 @@ constexpr OcarinaUpscaleBackend SelectOcarinaUpscaler(bool fsr_enabled, bool dls
     }
     if (override == "fsr") {
         return OcarinaUpscaleBackend::Fsr;
+    }
+    if (override == "passthrough") {
+        return OcarinaUpscaleBackend::Passthrough;
     }
     if ((dlss_enabled || override == "dlss") && dlss_available) {
         return OcarinaUpscaleBackend::Dlss;

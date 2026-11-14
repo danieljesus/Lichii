@@ -459,6 +459,30 @@ public:
             cmd.Dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
         });
     }
+    /// The output shader over an image the guest drew (no evaluation before it).
+    void RecordPassthrough(Scheduler& scheduler, const void* descriptors, VkExtent2D extent) {
+        scheduler.Record([this, descriptors, extent](vk::CommandBuffer cmd) {
+            const VkMemoryBarrier before{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, before);
+            const VkDescriptorSet set = descriptor_allocator.Commit();
+            device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptors);
+            cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+            cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+            cmd.Dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+            const VkMemoryBarrier after{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, after);
+        });
+    }
     void RecordOutput(Scheduler& scheduler, const void* descriptors,
                       const OcarinaUpscaler& upscaler, VkExtent2D extent, u64 frame,
                       bool reset) {
@@ -707,6 +731,19 @@ struct OcarinaUpscaler::Impl {
           motion_pass{device, scheduler, pool_},
           color_pass{device, scheduler, pool_},
           output_pass{device, scheduler, pool_, OCARINA_DLSS_OUTPUT_COMP_SPV} {
+        if (backend == VideoCommon::OcarinaUpscaleBackend::Passthrough) {
+            passthrough = true;
+            point_sampler = device.GetLogical().CreateSampler(VkSamplerCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                .magFilter = VK_FILTER_NEAREST,
+                .minFilter = VK_FILTER_NEAREST,
+                .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            });
+            return;
+        }
 #ifdef EGLANTINE_STREAMLINE
         if (backend == VideoCommon::OcarinaUpscaleBackend::Dlss) {
             dlss = std::make_unique<StreamlineDlssUpscaler>(device, scheduler, allocator);
@@ -745,12 +782,18 @@ struct OcarinaUpscaler::Impl {
     /// which didn't evaluate it.
     bool output_fsr4{};
     std::optional<std::chrono::steady_clock::time_point> last_evaluation;
+    /// No temporal backend: RecordPassthrough is the only pass.
+    bool passthrough{};
+    vk::Sampler point_sampler;
 
     bool UsesFsr4() const {
         return fsr4 && !fsr4->Failed();
     }
 
     bool Failed() const {
+        if (passthrough) {
+            return false;
+        }
 #ifdef EGLANTINE_STREAMLINE
         return dlss ? dlss->Failed() : !fsr;
 #else
@@ -917,13 +960,31 @@ VkImageView OcarinaUpscaler::CompositedView() const {
     return *impl->composite_view;
 }
 
+bool OcarinaUpscaler::RecordPassthrough(VkImageView color, VkImageView target, VkExtent2D extent,
+                                        VkExtent2D target_extent, u64 frame) {
+    auto& state = *impl;
+    if (!state.passthrough || state.last_frame == frame) {
+        return false;
+    }
+    const bool same_size =
+        extent.width == target_extent.width && extent.height == target_extent.height;
+    state.scheduler.RequestOutsideRenderPassOperationContext();
+    state.queue.Acquire(state.scheduler, 2);
+    state.queue.AddSampledImage(color, same_size ? *state.point_sampler : state.LinearSampler());
+    state.queue.AddImage(target);
+    state.output_pass.RecordPassthrough(state.scheduler, state.queue.UpdateData(), target_extent);
+    state.scheduler.InvalidateState();
+    state.last_frame = frame;
+    return true;
+}
+
 bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView target, VkExtent2D extent,
                             VkExtent2D output_extent, VkExtent2D target_extent,
                             const Matrix& current, const Matrix& previous,
                             const OcarinaActorMesh& mesh, VkImage depth_image, u64 frame,
                             std::array<f32, 2> jitter) {
     auto& state = *impl;
-    if (state.last_frame == frame || state.Failed()) {
+    if (state.last_frame == frame || state.Failed() || state.passthrough) {
         return false;
     }
     const auto transform = ClipToPreviousClip(current, previous);

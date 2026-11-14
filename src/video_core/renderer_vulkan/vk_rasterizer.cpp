@@ -2534,7 +2534,8 @@ void RasterizerVulkan::DispatchCompute() {
     // The full-size 1080p pass is replaced only by FSR (native AA); DLAA through it is untested.
     const bool can_replace = OcarinaTemporalEnabled() && pipeline->CanReplaceOcarinaUpscale() &&
                              (pipeline->ShaderHash() != ComputePipeline::OcarinaFullSizeShader ||
-                              oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr) &&
+                              oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr ||
+                              oot_backend == VideoCommon::OcarinaUpscaleBackend::Passthrough) &&
                              !indirect_address && !list_slot && !frame_dump.Capturing();
     // Until a dispatch overwrites the scene, each direct one binds only after the effects are
     // marked. The indirect paths record their bind at once.
@@ -3405,7 +3406,8 @@ bool RasterizerVulkan::OcarinaTemporalEnabled() const {
 /// materials draw with several vertex shaders, so any draw into a scene-sized target qualifies;
 /// the camera buffer's contents are checked below.
 void RasterizerVulkan::TrackOcarinaCamera() {
-    if (!OcarinaTemporalEnabled()) {
+    if (!OcarinaTemporalEnabled() ||
+        oot_backend == VideoCommon::OcarinaUpscaleBackend::Passthrough) {
         return;
     }
 
@@ -3496,7 +3498,8 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
 /// Capture the skinning pose of the recognized Link draw for frame-to-frame motion.
 void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect) {
     if (shader_hash != 0x28c6e527634f814aULL || !is_indexed || is_indirect ||
-        !OcarinaTemporalEnabled() || oot_actor.frame == render_trace_frame) {
+        !OcarinaTemporalEnabled() || oot_actor.frame == render_trace_frame ||
+        oot_backend == VideoCommon::OcarinaUpscaleBackend::Passthrough) {
         return;
     }
     const auto& draw = maxwell3d->draw_manager.draw_state;
@@ -3646,6 +3649,65 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
         }
         return false;
     };
+    if (oot_backend == VideoCommon::OcarinaUpscaleBackend::Passthrough) {
+        // No camera, depth or history: the scene colour is filtered into the target at whatever
+        // sizes the game uses (1440x810 -> 1080p handheld, 1080p -> 1080p with Max Resolution).
+        // The frame is not marked anti-aliased, so the presentation's own filter still runs.
+        const auto sampled = pipeline.SampledImages();
+        const auto written = pipeline.WrittenImages();
+        if (sampled.size() != 1 || written.size() != 1 || !sampled[0].id || !written[0]) {
+            return fail("unexpected upscale bindings");
+        }
+        const auto& color = texture_cache.GetImageView(sampled[0].id);
+        auto& target = texture_cache.GetImageView(written[0]);
+        using VideoCore::Surface::PixelFormat;
+        if (!color.BackingImage() || !target.BackingImage() || color.IsRescaled() ||
+            target.IsRescaled() || color.Samples() != VK_SAMPLE_COUNT_1_BIT ||
+            target.Samples() != VK_SAMPLE_COUNT_1_BIT ||
+            color.range != VideoCommon::SubresourceRange{} ||
+            target.range != VideoCommon::SubresourceRange{} ||
+            color.format != PixelFormat::E5B9G9R9_FLOAT ||
+            target.format != PixelFormat::B10G11R11_FLOAT || color.size.width == 0 ||
+            color.size.height == 0 || target.size.width == 0 || target.size.height == 0 ||
+            color.ImageHandle() == target.ImageHandle()) {
+            return fail("unexpected upscale images");
+        }
+        constexpr VkFormat passthrough_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        const auto color_view = color.Handle(Shader::TextureType::Color2D);
+        if (!color_view || !device.IsStorageImageExtendedFormatsSupported() ||
+            !device.IsFormatSupported(passthrough_format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+                                      FormatType::Optimal) ||
+            (target.BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) == 0 ||
+            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, target.format).format !=
+                passthrough_format) {
+            return fail("unsupported storage format");
+        }
+        try {
+            const auto target_view = target.StorageView(Shader::TextureType::Color2D,
+                                                        Shader::ImageFormat::Typeless, false);
+            if (!target_view) {
+                return fail("no upscale target view");
+            }
+            if (!oot_live_dlss) {
+                oot_live_dlss = std::make_unique<OcarinaUpscaler>(
+                    device, scheduler, descriptor_pool, compute_pass_descriptor_queue,
+                    memory_allocator, staging_pool, *oot_backend);
+                LOG_INFO(Render_Vulkan, "Ocarina passthrough: {}x{} -> {}x{}", color.size.width,
+                         color.size.height, target.size.width, target.size.height);
+            }
+            if (!oot_live_dlss->RecordPassthrough(
+                    color_view, target_view, VkExtent2D{color.size.width, color.size.height},
+                    VkExtent2D{target.size.width, target.size.height}, render_trace_frame)) {
+                return fail("passthrough declined the frame");
+            }
+            oot_fallback_reason = nullptr;
+            return true;
+        } catch (const vk::Exception& error) {
+            LOG_WARNING(Render_Vulkan, "Ocarina passthrough unavailable: {}", error.what());
+            oot_live_failed = true;
+            return false;
+        }
+    }
     if (oot_camera_sample_frame != render_trace_frame) {
         return fail("no scene camera this frame");
     }
