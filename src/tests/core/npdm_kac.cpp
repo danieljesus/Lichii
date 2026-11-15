@@ -19,9 +19,11 @@ void Put32(std::vector<u8>& out, std::size_t offset, u32 value) {
     std::memcpy(out.data() + offset, &value, sizeof(value));
 }
 
-// A 0x480-byte NPDM: ACID at 0x100, ACI0 at 0x400, and the kernel capability descriptors at
+// A 0x480-byte NPDM: ACID at 0x100, ACI0 at 0x400, the file access control and header at the
+// given offsets into them, and the kernel capability descriptors at
 // ACI0 + kac_offset, the bytes from 0x460 on being 0x41.
-VirtualFile MakeNpdm(u32 kac_size, u32 kac_offset = 0x60) {
+VirtualFile MakeNpdm(u32 kac_size, u32 kac_offset = 0x60, u32 fac_offset = 0x240,
+                     u32 fah_offset = 0x40) {
     std::vector<u8> bytes(0x480);
     std::memcpy(bytes.data(), "META", 4);
     Put32(bytes, 0x70, 0x400); // aci_offset
@@ -29,10 +31,10 @@ VirtualFile MakeNpdm(u32 kac_size, u32 kac_offset = 0x60) {
     Put32(bytes, 0x78, 0x100); // acid_offset
     Put32(bytes, 0x7C, 0x240);
     std::memcpy(bytes.data() + 0x300, "ACID", 4);
-    Put32(bytes, 0x320, 0x240); // fac_offset
+    Put32(bytes, 0x320, fac_offset);
     Put32(bytes, 0x324, 0x2C);
     std::memcpy(bytes.data() + 0x400, "ACI0", 4);
-    Put32(bytes, 0x420, 0x40); // fah_offset
+    Put32(bytes, 0x420, fah_offset);
     Put32(bytes, 0x424, 0x1C);
     Put32(bytes, 0x430, kac_offset);
     Put32(bytes, 0x434, kac_size);
@@ -67,4 +69,25 @@ TEST_CASE("NPDM rejects a kernel capability offset that wraps past 4 GiB", "[cor
     ProgramMetadata npdm;
     REQUIRE(npdm.Load(MakeNpdm(8, 0xFFFFFC60)) ==
             Loader::ResultStatus::ErrorBadKernelCapabilityDescriptors);
+}
+
+TEST_CASE("NPDM rejects a file access control offset that wraps past 4 GiB", "[core][file_sys]") {
+    // 0x100 + 0xFFFFFF40 wrapped to 0x40 in 32 bits, which read the NPDM header as the ACID's
+    // file access control and loaded.
+    ProgramMetadata npdm;
+    REQUIRE(npdm.Load(MakeNpdm(8, 0x60, 0xFFFFFF40)) ==
+            Loader::ResultStatus::ErrorBadFileAccessControl);
+}
+
+TEST_CASE("NPDM rejects a file access header offset that wraps past 4 GiB", "[core][file_sys]") {
+    // 0x400 + 0xFFFFFC40 wrapped to 0x40 in 32 bits, the same for the ACI0's file access header.
+    ProgramMetadata npdm;
+    REQUIRE(npdm.Load(MakeNpdm(8, 0x60, 0x240, 0xFFFFFC40)) ==
+            Loader::ResultStatus::ErrorBadFileAccessHeader);
+}
+
+TEST_CASE("NPDM rejects a file access control that runs past the file", "[core][file_sys]") {
+    ProgramMetadata npdm;
+    REQUIRE(npdm.Load(MakeNpdm(8, 0x60, 0x480 - 0x100 - 0x10)) ==
+            Loader::ResultStatus::ErrorBadFileAccessControl);
 }
