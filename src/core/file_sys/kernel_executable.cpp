@@ -28,6 +28,11 @@ bool DecompressBLZ(std::vector<u8>& data) {
     std::memcpy(&init_index, data.data() + data_size + 0x4, sizeof(u32));
     std::memcpy(&additional_size, data.data() + data_size + 0x8, sizeof(u32));
 
+    // The footer's sizes come from the file: keep every index inside the section.
+    if (compressed_size > data.size() || init_index > compressed_size) {
+        return false;
+    }
+
     const auto start_offset = data.size() - compressed_size;
     data.resize(compressed_size + additional_size + start_offset);
 
@@ -35,6 +40,9 @@ bool DecompressBLZ(std::vector<u8>& data) {
     std::size_t out_index = compressed_size + additional_size;
 
     while (out_index > 0) {
+        if (index < 1) {
+            return false;
+        }
         --index;
         auto control = data[index + start_offset];
         for (size_t i = 0; i < 8; ++i) {
@@ -66,7 +74,7 @@ bool DecompressBLZ(std::vector<u8>& data) {
                         data[out_index + j + segment_offset + start_offset];
                 }
             } else {
-                if (out_index < 1) {
+                if (out_index < 1 || index < 1) {
                     return false;
                 }
                 --out_index;
