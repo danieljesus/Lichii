@@ -51,6 +51,7 @@ add_executable(tests
     core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
     core/memory_span.cpp
+    core/kip_blz.cpp
     core/builtin_patches.cpp
     core/cheat_parser.cpp
     core/builtin_font_glyphs.cpp
