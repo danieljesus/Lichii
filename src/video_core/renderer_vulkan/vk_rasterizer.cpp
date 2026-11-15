@@ -2726,6 +2726,10 @@ bool RasterizerVulkan::HoldsQueries(DAddr addr, u64 size) {
     return query_cache.HoldsQueries(addr, size);
 }
 
+bool RasterizerVulkan::MayHoldImagesOrReports(DAddr addr, u64 size) {
+    return texture_cache.page_filter.Any(addr, size) || query_cache.HoldsQueries(addr, size);
+}
+
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
     // Guest cores ask this on reads of cached pages, and the back holds both caches' locks through
     // each draw. Pages no image was ever registered on, and Switch 2 pages the GPU never wrote,
@@ -2890,7 +2894,10 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
             return true;
         }
     }
-    {
+    // Pages no image was ever registered on hold no image or stale page to update, as in
+    // GetFlushArea, so the texture cache's lock (held by the back through each draw) is not
+    // waited for there.
+    if (texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
@@ -3274,20 +3281,6 @@ void RasterizerVulkan::TrackOcarinaCamera() {
     oot_motion.previous = camera.previous;
 }
 
-namespace {
-f32 Halton(u32 index, u32 base) {
-    f32 fraction = 1.0f;
-    f32 result = 0.0f;
-    while (index > 0) {
-        fraction /= static_cast<f32>(base);
-        result += fraction * static_cast<f32>(index % base);
-        index /= base;
-    }
-    return result;
-}
-
-} // Anonymous namespace
-
 void RasterizerVulkan::UpdateOcarinaJitter() {
     std::array<f32, 2> want{};
     // Only while FSR replaced the previous frame's upscale: a frame the game upscales itself
@@ -3303,9 +3296,11 @@ void RasterizerVulkan::UpdateOcarinaJitter() {
             const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
             if (depth.size.width == oot_motion.extent.width &&
                 depth.size.height == oot_motion.extent.height && !depth.IsRescaled()) {
-                // Halton (2, 3) with AMD's phase count for the last FSR frame's scale.
+                // AMD's phase count for the last FSR frame's scale.
                 const u32 index = static_cast<u32>(render_trace_frame % oot_jitter_phases) + 1;
-                want = {Halton(index, 2) - 0.5f, Halton(index, 3) - 0.5f};
+                const auto driver = device.GetDriverID();
+                want = VideoCommon::OcarinaJitter(index, driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                                                             driver == VK_DRIVER_ID_AMD_OPEN_SOURCE);
                 oot_jitter_frame = render_trace_frame;
                 oot_jitter_offset = want;
             }
@@ -3950,6 +3945,12 @@ void RasterizerVulkan::FlushWork() {
     static constexpr bool android = false;
 #endif // __ANDROID__
     const bool native = gpu_memory->UsesNativeTiling();
+    if (descriptor_buffer_ring.NeedsSubmit(scheduler)) {
+        draw_counter = 0;
+        scheduler.Flush();
+        pending_native_work = native && !android;
+        return;
+    }
     u32 budget = SubmissionPolicy::DefaultNativeBudget;
     if (native && !android) {
         static const std::optional<u32> configured_budget = []() -> std::optional<u32> {
