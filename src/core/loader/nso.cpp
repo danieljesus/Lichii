@@ -97,10 +97,24 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         return 0;
     }();
 
-    auto const last_segment_it = &nso_header.segments[nso_header.segments.size() - 1];
+    // The image ends where the furthest segment ends. The header gives the segments in order, but
+    // it comes from the file: sizing the image by the last one let an earlier segment be copied
+    // past its end.
+    u64 segments_end = 0;
+    for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
+        const auto& segment = nso_header.segments[i];
+        segments_end = std::max<u64>(segments_end, u64{segment.location} + segment.size);
+        // A stored segment is copied from the bytes read for it.
+        if (!nso_header.IsSegmentCompressed(i) &&
+            segment.size > nso_header.segments_compressed_size[i]) {
+            LOG_ERROR(Loader, "{}: stored segment {} is larger than its data", nso_file.GetName(),
+                      i);
+            return std::nullopt;
+        }
+    }
     // Build program image directly in codeset memory :)
     Kernel::CodeSet codeset;
-    codeset.memory.resize(module_start + last_segment_it->location + last_segment_it->size);
+    codeset.memory.resize(module_start + segments_end);
     {
         std::vector<u8> compressed_data(*std::ranges::max_element(nso_header.segments_compressed_size));
         std::vector<u8> decompressed_size(std::ranges::max_element(nso_header.segments, [](auto const& a, auto const& b) {
