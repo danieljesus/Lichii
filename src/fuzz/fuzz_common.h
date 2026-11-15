@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -71,6 +72,24 @@ inline void ReadRomFS(const FileSys::VirtualFile& romfs, Budget& budget) {
         return;
     }
     Walk(FileSys::ExtractRomFS(romfs), budget);
+}
+
+// Points HOME, the XDG base directories and TMPDIR at a fresh directory under the system temp
+// directory, and returns it, so a harness that touches the user data, cache or keys directories
+// never reads or writes the user's own files. Call it first in LLVMFuzzerInitialize, before
+// anything asks for a Lichii path.
+inline std::filesystem::path UseScratchHome(const char* harness) {
+    const auto home =
+        std::filesystem::temp_directory_path() / fmt::format("lichii-{}-{}", harness, getpid());
+    for (const char* sub : {"", "/.local/share", "/.config", "/.cache", "/tmp"}) {
+        std::filesystem::create_directories(home.string() + sub);
+    }
+    setenv("HOME", home.c_str(), 1);
+    setenv("XDG_DATA_HOME", (home / ".local/share").c_str(), 1);
+    setenv("XDG_CONFIG_HOME", (home / ".config").c_str(), 1);
+    setenv("XDG_CACHE_HOME", (home / ".cache").c_str(), 1);
+    setenv("TMPDIR", (home / "tmp").c_str(), 1);
+    return home;
 }
 
 // Points the key manager at a scratch keys directory holding made-up key area keys for every
