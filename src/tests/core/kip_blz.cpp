@@ -80,3 +80,14 @@ TEST_CASE("KIP rejects a BLZ stream that runs out of input", "[core][file_sys]")
     const KIP kip{MakeKip(blz)};
     REQUIRE(kip.GetStatus() == Loader::ResultStatus::ErrorBLZDecompressionFailed);
 }
+
+TEST_CASE("KIP rejects a BLZ output size that wraps in 32 bits", "[core][file_sys]") {
+    // compressed_size + additional_size wrapped: to 12, which shrank the section and read past
+    // it, and to 0, which returned an empty section as a success.
+    for (const u32 additional : {0xFFFFFFF0U, 0xFFFFFFE4U}) {
+        auto blz = MakeBlz();
+        Put32(blz, 24, additional);
+        const KIP kip{MakeKip(blz)};
+        REQUIRE(kip.GetStatus() == Loader::ResultStatus::ErrorBLZDecompressionFailed);
+    }
+}

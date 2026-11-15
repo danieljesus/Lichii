@@ -33,11 +33,18 @@ bool DecompressBLZ(std::vector<u8>& data) {
         return false;
     }
 
+    // Added in 64 bits: two u32s from the file can wrap. BLZ turns at most 17 input bytes into
+    // 144 output bytes, so a valid stream never asks for more than nine times its size.
+    const u64 out_size = u64{compressed_size} + additional_size;
+    if (out_size > u64{compressed_size} * 9 + 144) {
+        return false;
+    }
+
     const auto start_offset = data.size() - compressed_size;
-    data.resize(compressed_size + additional_size + start_offset);
+    data.resize(out_size + start_offset);
 
     std::size_t index = compressed_size - init_index;
-    std::size_t out_index = compressed_size + additional_size;
+    std::size_t out_index = out_size;
 
     while (out_index > 0) {
         if (index < 1) {
