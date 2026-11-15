@@ -1969,7 +1969,10 @@ void Device::RemoveUnsuitableExtensions() {
     const bool radv_rdna2_mesh =
         extensions.mesh_shader && properties.driver.driverID == VK_DRIVER_ID_MESA_RADV &&
         properties.integer_dot_product.integerDotProduct16BitUnsignedAccelerated;
-    if (radv_rdna2_mesh) {
+    // EDEN_NX2_NATIVE_MESH=1 (local test switch): keep native task/mesh draws there.
+    if (radv_rdna2_mesh && std::getenv("EDEN_NX2_NATIVE_MESH") != nullptr) {
+        LOG_WARNING(Render_Vulkan, "EDEN_NX2_NATIVE_MESH: native task/mesh draws kept on RADV RDNA2");
+    } else if (radv_rdna2_mesh) {
         LOG_INFO(Render_Vulkan, "RADV on RDNA2: task/mesh draws use the compute fallback, because "
                                 "native mesh draws fault the GPU there");
         extensions.mesh_shader = false;
