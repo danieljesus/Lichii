@@ -1479,11 +1479,11 @@ PrecompiledCounts WritePrecompiled(const std::filesystem::path& out, const GameT
         return info;
     };
     const auto unique_hashes = [](std::array<u64, 6> hashes) {
-        std::vector<u8> out;
+        std::vector<u8> packed;
         for (const u64 hash : hashes) {
-            Put(out, hash);
+            Put(packed, hash);
         }
-        return out;
+        return packed;
     };
     for (const auto& [vh, fh] : pairs) {
         if (!oracle.contains(vh) || !oracle.contains(fh)) {
