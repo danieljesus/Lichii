@@ -53,6 +53,7 @@ add_executable(tests
     core/kip_sections.cpp
     core/memory_span.cpp
     core/builtin_patches.cpp
+    core/cheat_parser.cpp
     core/builtin_font_glyphs.cpp
     core/system_test_context.h
     video_core/ampere_branch_modifiers.cpp
@@ -67,6 +68,7 @@ add_executable(tests
     video_core/conditional_barrier.cpp
     video_core/storage_buffer_shared_tracking.cpp
     core/nup_validation.cpp
+    core/npdm_kac.cpp
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
     core/vfs_vector.cpp
