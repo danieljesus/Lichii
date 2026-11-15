@@ -157,16 +157,34 @@ void GpuSplit::MaybeStart(Core::System& system_) {
         return;
     }
     // The front reads command lists straight from guest memory; a read that flushes the caches
-    // first (safe DMA, accurate GPU) would touch back-owned state. The settings can change
-    // mid-game: hand the engines back to the front (and start again when they allow it).
-    const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
-                                                          : Settings::IsDMALevelSafe();
-    const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
-                         Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
+    // first (safe DMA) would touch back-owned state. The settings can change mid-game: hand the
+    // engines back to the front (and start again when they allow it).
+    // High GPU accuracy asks for safe reads only through the default DMA level, and DmaPusher
+    // reads lists unsafely while the split is active whatever the level: lists on GPU-written
+    // pages go through ReadGpuWrittenCommands. What else High changes runs on the back (delayed
+    // fences, precise queries, the flush before a CPU write through TickWork) or drains to it
+    // first (acquires, MustFlushRegion), so the split stays on under it.
+    // EDEN_NX2_SPLIT_HIGH=0: stop the split under High, as before (for comparisons).
+    static const bool split_under_high = [] {
+        const char* value = std::getenv("EDEN_NX2_SPLIT_HIGH");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool high = Settings::IsGPULevelHigh();
+    const bool allowed =
+        !Settings::IsDMALevelSafe() && (!high || split_under_high) &&
+        Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
     if (active && !allowed) {
         Drain();
         Stop();
         LOG_INFO(HW_GPU, "GPU thread split: stopped, the accuracy settings need the caches on the front");
+        return;
+    }
+    if (active && high != started_high) {
+        // The same handover as when High stopped the split: everything sent under the old
+        // accuracy runs before anything is parsed under the new one. The next call starts again.
+        Drain();
+        Stop();
+        LOG_INFO(HW_GPU, "GPU thread split: restarting, the GPU accuracy changed");
         return;
     }
     if (active || !allowed) {
@@ -182,6 +200,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
+    started_high = high;
     ++starts;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');

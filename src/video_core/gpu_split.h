@@ -500,6 +500,7 @@ private:
 
     Core::System* system{};
     bool active{};
+    bool started_high{}; ///< GPU accuracy was High when the split last started (MaybeStart)
     u32 starts{};
     bool front_macros{};
     std::unique_ptr<u64[]> ring;

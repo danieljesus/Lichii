@@ -14,6 +14,9 @@
 # Offload GPU method/macro execution to the back thread (SPLIT=2 delivers up to +54% FPS alone).
 EDEN_NX2_SPLIT=2
 
+# The split also runs under High GPU accuracy (default). =0 stops it there, as it did before.
+#EDEN_NX2_SPLIT_HIGH=0
+
 # Batch GPU fence syncpoints to reduce host driver overhead and smooth frametimes.
 EDEN_NX2_FENCE_BATCH=1
 
