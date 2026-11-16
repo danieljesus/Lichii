@@ -863,7 +863,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             const auto spin_start = g_acquire_counting ? std::chrono::steady_clock::now()
                                                        : std::chrono::steady_clock::time_point{};
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position &&
+            static const u32 spin_budget = [] {
+                const char* value = std::getenv("EDEN_NX2_BACK_SPIN");
+                return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10))
+                                        : 8192U;
+            }();
+            for (u32 spins = 0; spins < spin_budget && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
                  ++spins) {
                 Pause();
