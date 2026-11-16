@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
+#include <optional>
 #include <system_error>
 
 #include "common/logging.h"
@@ -31,13 +32,22 @@ T Get(const std::vector<char>& bytes, size_t offset) {
     return value;
 }
 
-/// The bytes of `path`, empty when it cannot be read.
-std::vector<char> ReadAll(const std::filesystem::path& path) {
+/// The bytes of `path` (none when it is missing), or nothing when it is there but cannot be read:
+/// a store that can't be read is kept, not started again.
+std::optional<std::vector<char>> ReadAll(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
-        return {};
+        std::error_code error;
+        if (!std::filesystem::exists(path, error) && !error) {
+            return std::vector<char>{};
+        }
+        return std::nullopt;
     }
-    return std::vector<char>(std::istreambuf_iterator<char>(file), {});
+    std::vector<char> bytes(std::istreambuf_iterator<char>(file), {});
+    if (file.bad()) {
+        return std::nullopt;
+    }
+    return bytes;
 }
 
 } // Anonymous namespace
@@ -57,7 +67,7 @@ bool PrecompiledStore::Open(const std::filesystem::path& data_path,
     case ResumeResult::Resumed:
         return true;
     case ResumeResult::Failed:
-        LOG_ERROR(Render, "Precompiled pipelines: cannot write {} or {}; kept as they are",
+        LOG_ERROR(Render, "Precompiled pipelines: cannot read or write {} or {}; kept as they are",
                   data_path.string(), index_path.string());
         loaded = {};
         return false;
@@ -116,6 +126,9 @@ PrecompiledStore::ResumeResult PrecompiledStore::Resume(const std::filesystem::p
     // The data file's header: its stamp must be this one too.
     {
         std::ifstream file(data_path, std::ios::binary);
+        if (!file) {
+            return ResumeResult::Failed; // it is there (its size was read), but can't be read
+        }
         std::array<char, 8> magic{};
         u32 stamp_size{};
         file.read(magic.data(), magic.size());
@@ -131,7 +144,11 @@ PrecompiledStore::ResumeResult PrecompiledStore::Resume(const std::filesystem::p
         }
     }
     const u64 data_begin = DataMagic.size() + sizeof(u32) + stamp.size();
-    const std::vector<char> bytes = ReadAll(index_path);
+    const std::optional<std::vector<char>> read = ReadAll(index_path);
+    if (!read) {
+        return ResumeResult::Failed;
+    }
+    const std::vector<char>& bytes = *read;
     const size_t header_size = IndexMagic.size() + 3 * sizeof(u32) + stamp.size();
     if (bytes.size() < header_size ||
         std::string_view{bytes.data(), IndexMagic.size()} != IndexMagic ||
@@ -289,6 +306,10 @@ void PrecompiledStore::WriteMarker(EntryType type, u32 record_index) {
     Put(index, record_index);
     // On disk before the build starts: a driver crash ends the process without unwinding.
     index.flush();
+    if (!index) {
+        // Failed() stops the preparation: a build without its marker could crash unnoted.
+        FailLocked();
+    }
 }
 
 void PrecompiledStore::MarkStarted(u32 record_index) {

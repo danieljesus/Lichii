@@ -2715,11 +2715,6 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         resolution.up_scale, resolution.down_shift, Settings::values.fix_bloom_effects.GetValue(),
         Settings::values.disable_shader_loop_safety_checks.GetValue(),
         Settings::values.renderer_debug.GetValue(), PrecompiledInfosMagic);
-    const char* force = std::getenv("EDEN_NX2_PRECOMPILED_FORCE");
-    if (force && force[0] == '1') {
-        std::filesystem::remove(data_path, error);
-        std::filesystem::remove(index_path, error);
-    }
 
     auto prep_owner = std::make_unique<PrecompiledPrep>();
     auto& prep = *prep_owner;
@@ -2792,10 +2787,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     auto store_lock_path = index_path;
     store_lock_path += ".lock";
     prep.store_lock.emplace(store_lock_path);
-    if (prep.store_lock->Busy()) {
-        LOG_WARNING(Render_Vulkan, "Precompiled pipelines: another emulator is preparing this "
-                                   "title's pipelines; none prepared or kept for draws this time");
+    if (!prep.store_lock->Held()) {
+        if (prep.store_lock->Busy()) {
+            LOG_WARNING(Render_Vulkan,
+                        "Precompiled pipelines: another emulator is preparing this title's "
+                        "pipelines; none prepared or kept for draws this time");
+        } else {
+            LOG_ERROR(Render_Vulkan, "Precompiled pipelines: cannot lock {}; none prepared",
+                      Common::FS::PathToUTF8String(store_lock_path));
+        }
         return;
+    }
+    // Only with the lock held: another emulator may have these files open.
+    const char* force = std::getenv("EDEN_NX2_PRECOMPILED_FORCE");
+    if (force && force[0] == '1') {
+        std::filesystem::remove(data_path, error);
+        std::filesystem::remove(index_path, error);
     }
     Store::Loaded loaded;
     if (!prep.store.Open(data_path, index_path, stamp, static_cast<u32>(total), loaded)) {

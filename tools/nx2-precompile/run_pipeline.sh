@@ -23,6 +23,7 @@ OUT=${NX2_OUT:-$PWD/nx2-precompile-out}
 TOOL=${NX2_TOOL:-nx2-precompile}
 K=${NX2_K:-4}
 VERSION=$("$TOOL" cache-version) # the file name's v<N>; the Lichii build reading it must match
+VERSION=${VERSION%$'\r'} # the .exe's text-mode line end, under Git Bash
 PREP=$OUT/precompiled.fork-v$VERSION.nx2prep
 PYTHON=${PYTHON:-python}
 PY=$(cd "$(dirname "$0")" && pwd)/py

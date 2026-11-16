@@ -1288,18 +1288,20 @@ GameTables MakeGameTables(std::span<const ExtractedProgram> extracted,
             left_out.insert(file);
         }
     }
-    std::unordered_set<u32> kept;
+    // By fingerprint, as game_tables.py: every row with a left-out program's fingerprint is left
+    // out, not only the one `files` names (the last row of it).
+    std::unordered_set<u64> kept_fingerprints;
+    std::unordered_set<u64> left_out_fingerprints;
     for (const auto& file : file_order) {
-        if (!left_out.contains(file)) {
-            kept.insert(files[file].begin(), files[file].end());
+        auto& into = left_out.contains(file) ? left_out_fingerprints : kept_fingerprints;
+        for (const u32 member : files[file]) {
+            into.insert(extracted[member].fingerprint);
         }
     }
     for (u32 i = 0; i < tables.rows.size(); ++i) {
-        bool in_left_out = false;
-        for (const auto& file : left_out) {
-            in_left_out |= files[file].contains(i);
-        }
-        tables.rows[i].left_out = !kept.contains(i) && in_left_out;
+        const u64 fingerprint = extracted[i].fingerprint;
+        tables.rows[i].left_out =
+            !kept_fingerprints.contains(fingerprint) && left_out_fingerprints.contains(fingerprint);
     }
     std::set<std::pair<u64, u64>> pairs;
     std::set<std::tuple<bool, u64, u64, u64>> combos;

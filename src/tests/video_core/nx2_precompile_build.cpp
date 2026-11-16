@@ -140,6 +140,30 @@ TEST_CASE("Nx2Precompile: older shader archive versions nobody drew are left out
     REQUIRE_FALSE(unplayed.rows[3].left_out);
 }
 
+TEST_CASE("Nx2Precompile: every copy of a left-out program is left out", "[video_core]") {
+    // The older version holds one program twice (rows 0 and 1, one fingerprint); without recorded
+    // play it is left out, both copies with it, as game_tables.py marks them.
+    const std::vector<ExtractedProgram> programs{
+        {.fingerprint = 10, .origin = "/Shader/Model.Product.100.bfsha.zs#BNSH@0x0#var0"},
+        {.fingerprint = 10, .origin = "/Shader/Model.Product.100.bfsha.zs#BNSH@0x100#var0"},
+        {.fingerprint = 20, .origin = "/Shader/Model.Product.110.bfsha.zs#BNSH@0x0#var0"},
+    };
+    const std::vector<ExtractedVariation> variations{
+        {.label = "/Shader/Model.Product.100.bfsha.zs#var0", .programs = {0}},
+        {.label = "/Shader/Model.Product.110.bfsha.zs#var0", .programs = {2}},
+    };
+    const std::vector<ScannedProgram> scanned{
+        {.stage = "VertexB", .status = "ok", .code_hash = 0xA0},
+        {.stage = "VertexB", .status = "ok", .code_hash = 0xA0},
+        {.stage = "VertexB", .status = "ok", .code_hash = 0xB0},
+    };
+    const auto tables = MakeGameTables(programs, variations, scanned, {});
+    REQUIRE(tables.left_out_files.size() == 1);
+    REQUIRE(tables.rows[0].left_out);
+    REQUIRE(tables.rows[1].left_out);
+    REQUIRE_FALSE(tables.rows[2].left_out);
+}
+
 TEST_CASE("Nx2Precompile: numbered archives that are not versions are all kept", "[video_core]") {
     // Effect_01 and Effect_02 are two archives, not two versions of one: neither is left out,
     // drawn or not.

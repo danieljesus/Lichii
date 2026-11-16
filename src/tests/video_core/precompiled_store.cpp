@@ -259,3 +259,39 @@ TEST_CASE("PrecompiledStore: files it cannot reopen for writing are kept, not st
     REQUIRE(loaded.resumed);
     REQUIRE(loaded.records.size() == 1);
 }
+
+TEST_CASE("PrecompiledStore: files it cannot read are kept, not started over", "[video_core]") {
+    TempDir dir;
+    {
+        PrecompiledStore store;
+        PrecompiledStore::Loaded loaded;
+        REQUIRE(store.Open(dir.Data(), dir.Index(), "stamp", 4, loaded));
+        REQUIRE(store.AddRecord(PreparedRecord(1, store.AddBlob(Kind::Info, 1, Bytes("info")),
+                                               PrecompiledStore::NoBlob)));
+    }
+    const auto data_size = std::filesystem::file_size(dir.Data());
+    const auto index_size = std::filesystem::file_size(dir.Index());
+    for (const auto& file : {dir.Index(), dir.Data()}) {
+        INFO(file.filename().string());
+        std::filesystem::permissions(file, std::filesystem::perms::owner_write);
+        if (std::ifstream{file, std::ios::binary}) {
+            std::filesystem::permissions(file, std::filesystem::perms::owner_all);
+            SKIP("the file stays readable (running as root?)");
+        }
+        {
+            PrecompiledStore store;
+            PrecompiledStore::Loaded loaded;
+            REQUIRE_FALSE(store.Open(dir.Data(), dir.Index(), "stamp", 4, loaded));
+            REQUIRE(loaded.records.empty());
+        }
+        std::filesystem::permissions(file, std::filesystem::perms::owner_read |
+                                               std::filesystem::perms::owner_write);
+        REQUIRE(std::filesystem::file_size(dir.Data()) == data_size);
+        REQUIRE(std::filesystem::file_size(dir.Index()) == index_size);
+    }
+    PrecompiledStore store;
+    PrecompiledStore::Loaded loaded;
+    REQUIRE(store.Open(dir.Data(), dir.Index(), "stamp", 4, loaded));
+    REQUIRE(loaded.resumed);
+    REQUIRE(loaded.records.size() == 1);
+}

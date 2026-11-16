@@ -3469,8 +3469,32 @@ GameShaderRoots OpenGameShaderRoots(const std::string& game_path) {
         }
     } else if (game_file) {
         if (const auto loader = Loader::GetLoader(*QtCommon::system, game_file)) {
+            // The RomFS the game boots with: its enabled update (installed, or packed in the
+            // file) over the base, as RomFSFactory::OpenCurrentProcess gives it, without mods.
             FileSys::VirtualFile romfs;
-            if (loader->ReadRomFS(romfs) == Loader::ResultStatus::Success && romfs) {
+            Loader::ResultStatus status{};
+            if (loader->GetFileType() == Loader::FileType::NX) {
+                // GetLoader makes an AppLoader_NX for this type (loader.cpp).
+                status = static_cast<Loader::AppLoader_NX&>(*loader).ReadPatchedRomFS(romfs);
+            } else {
+                status = loader->ReadRomFS(romfs);
+                u64 program_id{};
+                if (status == Loader::ResultStatus::Success && romfs &&
+                    loader->IsRomFSUpdatable() &&
+                    loader->ReadProgramId(program_id) == Loader::ResultStatus::Success) {
+                    FileSys::VirtualFile packed_update_raw;
+                    loader->ReadUpdateRaw(packed_update_raw);
+                    const auto& provider = QtCommon::system->GetContentProvider();
+                    const auto base_nca =
+                        provider.GetEntry(program_id, FileSys::ContentRecordType::Program);
+                    const FileSys::PatchManager pm{
+                        program_id, QtCommon::system->GetFileSystemController(), provider};
+                    romfs =
+                        pm.PatchRomFS(base_nca.get(), romfs, FileSys::ContentRecordType::Program,
+                                      packed_update_raw, false);
+                }
+            }
+            if (status == Loader::ResultStatus::Success && romfs) {
                 if (auto dir = FileSys::ExtractRomFS(romfs)) {
                     roots.push_back(std::move(dir));
                 }
@@ -3650,7 +3674,10 @@ bool MainWindow::BuildPrecompiledFromPlay(u64 program_id, const std::string& gam
     }
     const auto [report, failure] = job.get();
     progress.close();
-    if (stop.stop_requested()) {
+    // A stop during the last step comes too late: the file is written by then (records are
+    // counted only once it is), and it is what the next launch prepares.
+    const bool written = failure.empty() && report.records != 0;
+    if (stop.stop_requested() && !written) {
         return false;
     }
     if (!failure.empty() || report.records == 0) {
