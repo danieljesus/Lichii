@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -48,7 +49,9 @@ TEST_CASE("A console keyblob with a valid MAC is decrypted", "[core][crypto]") {
         SKIP("Keys are installed");
     }
 
-    const auto directory = std::filesystem::temp_directory_path() / "lichii-keyblob-mac-test";
+    // Unique per run: another tests process can't remove this one's fixture before it loads.
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("lichii-keyblob-mac-test-" + std::to_string(std::random_device{}()));
     std::filesystem::remove_all(directory);
     std::filesystem::create_directories(directory);
     {
@@ -60,6 +63,9 @@ TEST_CASE("A console keyblob with a valid MAC is decrypted", "[core][crypto]") {
         line("tsec_key", '2');
         line("keyblob_key_source_00", '3');
         line("keyblob_mac_key_source", '4');
+        // Clears a keyblob_00 the installed keys may have left loaded: DeriveBase decrypts only
+        // into an empty keyblob, so the one below must be the one used.
+        file << "keyblob_00 = " << std::string(0x120, '0') << '\n';
         file << "encrypted_keyblob_00 = " << EncryptedKeyblob << '\n';
     }
 
