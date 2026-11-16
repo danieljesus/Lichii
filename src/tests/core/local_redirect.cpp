@@ -12,6 +12,7 @@
 #include "common/settings.h"
 #include "core/internal_network/local_redirect.h"
 #include "core/internal_network/network.h"
+#include "tests/common/temp_dir.h"
 
 namespace LocalRedirect = Network::LocalRedirect;
 
@@ -151,7 +152,8 @@ TEST_CASE("LocalRedirect: malformed server and CA certificates are ignored", "[c
     Settings::values.online_service_redirect = true;
     Settings::values.online_redirect_hosts = "a.example";
     Settings::values.online_redirect_server = "192.0.2.1";
-    const auto ca_path = std::filesystem::temp_directory_path() / "lichii_redirect_test_ca.der";
+    const Tests::TempDir directory{"lichii-redirect-test"};
+    const auto ca_path = directory.path / "ca.der";
     constexpr char Pem[] = "-----BEGIN CERTIFICATE-----";
     WriteFile(ca_path, Pem, sizeof(Pem) - 1);
     Settings::values.online_redirect_ca = ca_path.string();

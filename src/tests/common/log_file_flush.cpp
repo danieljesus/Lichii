@@ -12,6 +12,8 @@
 
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
+#include "tests/common/restore_eden_path.h"
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -20,7 +22,14 @@ TEST_CASE("Info lines reach the log file without an Error line or an explicit fl
     const auto stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     const fs::path dir = fs::temp_directory_path() / ("lichii-log-flush-test-" + stamp);
     REQUIRE(fs::create_directories(dir));
+    const auto previous = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir);
     Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, dir);
+    // The log keeps the file open in dir; on Windows it stays until the process ends.
+    SCOPE_EXIT {
+        Tests::RestoreEdenPath(Common::FS::EdenPath::LogDir, previous);
+        std::error_code error;
+        fs::remove_all(dir, error);
+    };
     Common::Log::Initialize();
     Common::Log::Start();
 

@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "tests/common/temp_dir.h"
 
 namespace {
 using Vulkan::FrameDumpSchedule;
@@ -91,8 +92,7 @@ TEST_CASE("Frame dump schedule follows EDEN_NX2_FRAME_DUMP_AT", "[frame_dump_sch
     REQUIRE_FALSE(Vulkan::RecordingSampledTextures());
     REQUIRE(by_seconds.Tick(0.7) == Step::Finish);
 
-    const auto directory = std::filesystem::temp_directory_path() / "frame_dump_schedule_test";
-    std::filesystem::create_directories(directory);
+    const auto directory = Tests::MakeTempDir("frame_dump_schedule_test");
     const auto trigger = directory / "capture.now";
     std::filesystem::remove(trigger);
     FrameDumpSchedule by_file;

@@ -14,6 +14,7 @@
 #include "common/scope_exit.h"
 #include "core/crypto/key_manager.h"
 #include "tests/common/restore_eden_path.h"
+#include "tests/common/temp_dir.h"
 
 namespace {
 
@@ -52,9 +53,7 @@ TEST_CASE("A personalized ticket's title key is decrypted with the eticket RSA k
     // zero byte of the decrypted block, so no personalized ticket gave its title key. The key
     // pair and the title key for this made-up rights ID stay loaded for later tests.
     auto& keys = KeyManager::Instance();
-    const auto directory = std::filesystem::temp_directory_path() / "lichii-eticket-rsa-test";
-    std::filesystem::remove_all(directory);
-    std::filesystem::create_directories(directory);
+    const auto directory = Tests::MakeTempDir("lichii-eticket-rsa-test");
     {
         // eticket_rsa_keypair: private exponent, modulus, public exponent, padding (0x210).
         std::ofstream file{directory / "prod.keys"};
@@ -101,9 +100,7 @@ TEST_CASE("A personalized ticket whose block holds no title key gives none", "[c
     // The scan for the 0x01 ended 16 bytes before the block's end and returned offset 0 when it
     // found none, so a block like this one gave the first 16 bytes of the label hash as a key.
     auto& keys = KeyManager::Instance();
-    const auto directory = std::filesystem::temp_directory_path() / "lichii-eticket-empty-test";
-    std::filesystem::remove_all(directory);
-    std::filesystem::create_directories(directory);
+    const auto directory = Tests::MakeTempDir("lichii-eticket-empty-test");
     {
         std::ofstream file{directory / "prod.keys"};
         file << "eticket_rsa_keypair = " << PrivateExponent << Modulus << "00010001"
