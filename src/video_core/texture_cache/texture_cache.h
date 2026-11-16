@@ -152,6 +152,13 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
+    if constexpr (requires { runtime.PooledImageBytes(); }) {
+        // Host images kept for reuse (EDEN_NX2_IMAGE_POOL) go first when memory runs short.
+        const u64 pooled = runtime.PooledImageBytes();
+        if (pooled != 0 && (out_of_memory || total_used_memory + pooled >= expected_memory)) {
+            runtime.TrimImagePool();
+        }
+    }
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -4430,6 +4437,10 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         LOG_INFO(Render_Vulkan, "Retained image for queued download: id={}", image_id.Value());
     } else if (!immediate_delete) {
         if constexpr (requires { runtime.CurrentTick(); }) {
+            if constexpr (requires { slot_images[image_id].AllowPooling(); }) {
+                // Destroyed once the host GPU is past its last use: its host image may be reused.
+                slot_images[image_id].AllowPooling();
+            }
             gpu_sentenced_images.push_back(
                 {runtime.CurrentTick(), freed_bytes, std::move(slot_images[image_id])});
             gpu_sentenced_bytes += freed_bytes;

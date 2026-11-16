@@ -7,7 +7,10 @@
 #include <limits>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <deque>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -537,11 +540,113 @@ constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
     return image_ci;
 }
 
+// EDEN_NX2_IMAGE_POOL=1: the host images of destroyed cache images (the texture cache sentenced
+// them until the host GPU was done) are kept for a few seconds, and a new image with the same
+// create info takes one instead of a new VkImage and allocation. Ocarina of Time puts each frame's
+// render targets at shifting offsets of a transient heap: while the camera moves, about 80 a second
+// are made and collected again, with a handful of shapes. A taken image starts as a new one does:
+// undefined layout and contents. EDEN_NX2_IMAGE_POOL_MIB caps the bytes kept (default 256).
+[[nodiscard]] bool ImagePoolEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_IMAGE_POOL");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+struct ImagePool {
+    struct Entry {
+        ImagePoolKey key;
+        vk::Image image;
+        u64 bytes;
+        std::chrono::steady_clock::time_point at;
+    };
+    static constexpr auto MaxAge = std::chrono::seconds{5};
+
+    std::mutex mutex;
+    std::deque<Entry> entries;
+    u64 bytes = 0;
+    u64 cap = [] {
+        const char* value = std::getenv("EDEN_NX2_IMAGE_POOL_MIB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ULL) << 20;
+    }();
+    // Per window, for the log.
+    u64 hits = 0, misses = 0, puts = 0, expired = 0, trimmed = 0;
+    std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+
+    /// `mutex` held.
+    void DropOld(std::chrono::steady_clock::time_point now) {
+        while (!entries.empty() && (bytes > cap || now - entries.front().at > MaxAge)) {
+            bytes -= entries.front().bytes;
+            ++expired;
+            entries.pop_front();
+        }
+    }
+
+    /// `mutex` held.
+    void MaybeLog(std::chrono::steady_clock::time_point now) {
+        if (now - last_log < std::chrono::seconds{10}) {
+            return;
+        }
+        const double s = std::chrono::duration<double>(now - last_log).count();
+        LOG_INFO(Render_Vulkan,
+                 "image pool {:.1f}s (per s): taken {:.1f}, made new {:.1f}, kept {:.1f}, expired "
+                 "{:.1f}, trimmed {} | now {} images {} MiB",
+                 s, hits / s, misses / s, puts / s, expired / s, trimmed, entries.size(),
+                 bytes >> 20);
+        hits = misses = puts = expired = trimmed = 0;
+        last_log = now;
+    }
+
+    vk::Image Take(const ImagePoolKey& key) {
+        std::scoped_lock lock{mutex};
+        const auto now = std::chrono::steady_clock::now();
+        DropOld(now);
+        MaybeLog(now);
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            if (it->key == key) {
+                vk::Image image = std::move(it->image);
+                bytes -= it->bytes;
+                entries.erase(std::next(it).base());
+                ++hits;
+                return image;
+            }
+        }
+        ++misses;
+        return vk::Image{};
+    }
+
+    void Put(const ImagePoolKey& key, vk::Image&& image) {
+        const u64 size = image.GetMemoryBlock().size;
+        std::scoped_lock lock{mutex};
+        if (size == 0 || size > cap) {
+            return; // Destroyed here, as without the pool
+        }
+        const auto now = std::chrono::steady_clock::now();
+        entries.push_back(Entry{key, std::move(image), size, now});
+        bytes += size;
+        ++puts;
+        DropOld(now);
+    }
+
+    void Trim() {
+        std::scoped_lock lock{mutex};
+        trimmed += entries.size();
+        entries.clear();
+        bytes = 0;
+    }
+};
+
+[[nodiscard]] ImagePool& GetImagePool() {
+    static ImagePool pool;
+    return pool;
+}
+
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
                                   bool unbacked = false, bool aliased = false,
-                                  bool may_fail = false) {
+                                  bool may_fail = false, ImagePoolKey* pool_key = nullptr) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -584,6 +689,31 @@ constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
     }
     if (unbacked) {
         if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
+            return image;
+        }
+    }
+    if (pool_key != nullptr && ImagePoolEnabled()) {
+        u64 formats = view_formats.size();
+        for (const VkFormat format : view_formats) {
+            formats = formats * 1000003ULL ^ static_cast<u64>(format);
+        }
+        *pool_key = ImagePoolKey{
+            .valid = true,
+            .compression_disabled = image_ci.pNext == &compression_control,
+            .flags = image_ci.flags,
+            .type = image_ci.imageType,
+            .format = image_ci.format,
+            .width = image_ci.extent.width,
+            .height = image_ci.extent.height,
+            .depth = image_ci.extent.depth,
+            .levels = image_ci.mipLevels,
+            .layers = image_ci.arrayLayers,
+            .samples = image_ci.samples,
+            .tiling = image_ci.tiling,
+            .usage = image_ci.usage,
+            .view_formats = formats,
+        };
+        if (vk::Image image = GetImagePool().Take(*pool_key)) {
             return image;
         }
     }
@@ -2875,6 +3005,26 @@ u64 TextureCacheRuntime::GetDeviceLocalMemory() const {
     return device.GetDeviceLocalMemory();
 }
 
+TextureCacheRuntime::~TextureCacheRuntime() {
+    // The pool's images belong to this device: destroyed before it is.
+    TrimImagePool();
+}
+
+u64 TextureCacheRuntime::PooledImageBytes() const {
+    if (!ImagePoolEnabled()) {
+        return 0;
+    }
+    auto& pool = GetImagePool();
+    std::scoped_lock lock{pool.mutex};
+    return pool.bytes;
+}
+
+void TextureCacheRuntime::TrimImagePool() {
+    if (ImagePoolEnabled()) {
+        GetImagePool().Trim();
+    }
+}
+
 u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
     return device.GetDeviceMemoryUsage();
 }
@@ -3043,7 +3193,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
-                               true)),
+                               true, &pool_key)),
       aspect_mask(ImageAspectMask(info.format)) {
     if (OutOfMemory()) {
         return;
@@ -3131,6 +3281,10 @@ Image::~Image() {
         if (scaled_image) {
             runtime->EraseResolveShadow(*scaled_image);
         }
+    }
+    if (pool_allowed && pool_key.valid && original_image && !original_image.IsUnbacked() &&
+        ImagePoolEnabled()) {
+        GetImagePool().Put(pool_key, std::move(original_image));
     }
 }
 
