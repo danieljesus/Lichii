@@ -34,6 +34,12 @@ int WriteSeed(const char* path) {
     put(root / "exefs" / "main.npdm", 0x80, 'N');
     put(root / "romfs" / "a.bin", 0x200, 'A');
     put(root / "romfs" / "sub" / "b.txt", 0x30, 'b');
+    // The packer does not create the seed's directory (FUZZ_NUP_SEED=corpus/nup/seed.nup on a fresh
+    // checkout).
+    std::error_code ec;
+    if (const auto parent = std::filesystem::path{path}.parent_path(); !parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+    }
     std::string error;
     const auto result = FileSys::Nup::PackDump(root, path, {}, {}, nullptr, &error);
     fmt::print(stderr, "PackDump: {} {}\n", static_cast<int>(result), error);

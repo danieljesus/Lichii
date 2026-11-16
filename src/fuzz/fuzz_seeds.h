@@ -286,8 +286,15 @@ inline void WriteIfAsked(const char* variable, const Files& seeds) {
     }
     std::filesystem::create_directories(dir);
     for (const auto& [name, data] : seeds) {
-        std::ofstream{std::filesystem::path{dir} / name, std::ios::binary}.write(
-            reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        const auto path = std::filesystem::path{dir} / name;
+        std::ofstream file{path, std::ios::binary};
+        file.write(reinterpret_cast<const char*>(data.data()),
+                   static_cast<std::streamsize>(data.size()));
+        file.close();
+        if (!file) {
+            fmt::print(stderr, "could not write the seed {}\n", path.string());
+            std::exit(1);
+        }
     }
     std::exit(0);
 }

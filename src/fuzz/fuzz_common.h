@@ -78,9 +78,21 @@ inline void ReadRomFS(const FileSys::VirtualFile& romfs, Budget& budget) {
 // directory, and returns it, so a harness that touches the user data, cache or keys directories
 // never reads or writes the user's own files. Call it first in LLVMFuzzerInitialize, before
 // anything asks for a Lichii path.
+// A new private directory under the temporary directory (mode 0700, random name). mkdtemp fails
+// rather than reuse a path, so nobody can plant a directory, or a symlink inside it, ahead of the
+// harness.
+inline std::filesystem::path MakePrivateTempDir(const char* prefix) {
+    auto pattern =
+        (std::filesystem::temp_directory_path() / fmt::format("{}-XXXXXX", prefix)).string();
+    if (mkdtemp(pattern.data()) == nullptr) {
+        fmt::print(stderr, "mkdtemp failed for {}\n", pattern);
+        std::abort();
+    }
+    return pattern;
+}
+
 inline std::filesystem::path UseScratchHome(const char* harness) {
-    const auto home =
-        std::filesystem::temp_directory_path() / fmt::format("lichii-{}-{}", harness, getpid());
+    const auto home = MakePrivateTempDir(fmt::format("lichii-{}", harness).c_str());
     for (const char* sub : {"", "/.local/share", "/.config", "/.cache", "/tmp"}) {
         std::filesystem::create_directories(home.string() + sub);
     }
@@ -97,8 +109,7 @@ inline std::filesystem::path UseScratchHome(const char* harness) {
 // any real keys, and the harness never reads or writes the user's own keys. Call it before
 // anything touches Core::Crypto::KeyManager.
 inline void UseSyntheticKeys() {
-    const auto dir = std::filesystem::temp_directory_path() / fmt::format("lichii-fuzz-keys-{}", getpid());
-    std::filesystem::create_directories(dir);
+    const auto dir = MakePrivateTempDir("lichii-fuzz-keys");
     std::ofstream keys{dir / "prod.keys"};
     for (const char* kind : {"application", "ocean", "system"}) {
         for (int generation = 0; generation < 0x20; ++generation) {
