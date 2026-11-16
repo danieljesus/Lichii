@@ -651,19 +651,6 @@ void TextureCache<P>::TickFrame() {
                             retention_limit = (std::min)(
                                 (std::min)(retention_limit + other_memory, heap_room),
                                 host_critical);
-                            // The retention floor compares the same usage, so it needs the same
-                            // raise: otherwise usage stays past it and images go after mode_age.
-                            static const bool raise_retention = [] {
-                                const char* v = std::getenv("EDEN_NX2_IGPU_RETENTION");
-                                return v == nullptr || v[0] != '0';
-                            }();
-                            if (raise_retention) {
-                                const u64 heap_room =
-                                    heap_budget - (std::min)(room_margin, heap_budget / 2);
-                                retention_limit = (std::min)(
-                                    (std::min)(retention_limit + other_memory, heap_room),
-                                    host_critical);
-                            }
                         }
                     }
                     // Log the first values and real changes (the budget moves by a few MiB all
