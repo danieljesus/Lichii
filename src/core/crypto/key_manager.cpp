@@ -550,17 +550,20 @@ static std::array<u8, target_size> MGF1(const std::array<u8, in_size>& seed) {
 
 template <size_t size>
 static std::optional<u64> FindTicketOffset(const std::array<u8, size>& data) {
-    u64 offset = 0;
+    // OAEP data block: the label hash (0x20 bytes), zero padding, 0x01, then the message. The
+    // message is the 16-byte title key, so the 0x01 must come right before the block's last 16
+    // bytes: a block without it, or with a message of another size, holds no title key.
     for (size_t i = 0x20; i < data.size() - 0x10; ++i) {
         if (data[i] == 0x1) {
-            offset = i + 1;
-            break;
+            if (i + 1 + 0x10 != data.size()) {
+                return std::nullopt;
+            }
+            return u64(i + 1);
         } else if (data[i] != 0x0) {
             return std::nullopt;
         }
     }
-
-    return offset;
+    return std::nullopt;
 }
 
 std::optional<Key128> KeyManager::ParseTicketTitleKey(const Ticket& ticket) {
@@ -642,7 +645,6 @@ std::optional<Key128> KeyManager::ParseTicketTitleKey(const Ticket& ticket) {
     if (!offset) {
         return std::nullopt;
     }
-    ASSERT(*offset > 0);
 
     Key128 key_temp{};
     std::memcpy(key_temp.data(), m_2.data() + *offset, key_temp.size());

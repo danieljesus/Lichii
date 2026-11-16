@@ -86,4 +86,49 @@ TEST_CASE("A personalized ticket's title key is decrypted with the eticket RSA k
           Common::HexStringToArray<0x10>("00112233445566778899aabbccddeeff"));
 }
 
+// An empty message encrypted to the same key with the same OAEP parameters: the decrypted block
+// has no 16-byte title key after its 0x01.
+constexpr std::string_view EmptyMessageBlock =
+    "5f51f41627b27666169fc69716b6ee8f9d444dad2e67c7ebda87ade69b0fe4385d617b1fcc9b8d4724987fd49f319b3b"
+    "4fe6ee91b3218989eecaae111d053393b6088325bf2d93360f7c19ff372f6c0f30450f82dd04a36a7a8e99fd05f00878"
+    "eca9adaadf648ace052fb057902f578e9f168e13c3e162ecbfd1f901292cc9afe4bcaae56d95d6aeb101cecb3e318a56"
+    "fa60b1edf1c2a3f547762bd44f839420b310759510eeffcf96e899117cab9ead99799a176e243d1731f2af312da622df"
+    "412cbd738a6fb41516da0584053af7bced6a6bc6b5b271e6de098b511c9f701ba1eaaff6bafb1b784608bddda1ab758f"
+    "8e96dede8cac1c0794bd8085e1806558";
+
+TEST_CASE("A personalized ticket whose block holds no title key gives none", "[core][crypto]") {
+    // The scan for the 0x01 ended 16 bytes before the block's end and returned offset 0 when it
+    // found none, so a block like this one gave the first 16 bytes of the label hash as a key.
+    auto& keys = KeyManager::Instance();
+    const auto directory = std::filesystem::temp_directory_path() / "lichii-eticket-empty-test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    {
+        std::ofstream file{directory / "prod.keys"};
+        file << "eticket_rsa_keypair = " << PrivateExponent << Modulus << "00010001"
+             << std::string(0xC * 2, '0') << '\n';
+    }
+    const auto previous = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir);
+    Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory);
+    SCOPE_EXIT {
+        Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, previous);
+        std::filesystem::remove_all(directory);
+    };
+    keys.ReloadKeys();
+
+    RSA2048Ticket raw{};
+    raw.sig_type = SignatureType::RSA_2048_SHA256;
+    constexpr std::string_view issuer = "Root-CA00000003-XS00000020";
+    std::memcpy(raw.data.issuer.data(), issuer.data(), issuer.size());
+    raw.data.type = TitleKeyType::Personalized;
+    raw.data.title_key_block = Common::HexStringToArray<0x100>(EmptyMessageBlock);
+    raw.data.rights_id = Common::HexStringToArray<0x10>("01004d5f17e4c0000000000000000042");
+
+    u128 rights_id;
+    std::memcpy(rights_id.data(), raw.data.rights_id.data(), rights_id.size() * sizeof(u64));
+    REQUIRE_FALSE(keys.HasKey(S128KeyType::Titlekey, rights_id[1], rights_id[0]));
+    CHECK_FALSE(keys.AddTicket(Ticket{raw}));
+    CHECK_FALSE(keys.HasKey(S128KeyType::Titlekey, rights_id[1], rights_id[0]));
+}
+
 } // namespace
