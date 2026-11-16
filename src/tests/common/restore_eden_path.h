@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <system_error>
 
+#include <catch2/catch_test_macros.hpp>
+
 #include "common/fs/path_util.h"
 
 namespace Tests {
@@ -17,6 +19,9 @@ namespace Tests {
 inline void RestoreEdenPath(Common::FS::EdenPath eden_path, const std::filesystem::path& original) {
     std::error_code error;
     std::filesystem::create_directories(original, error);
+    // A folder that could not be made can't be restored: fail the test rather than leave the
+    // path on the temporary folder.
+    CHECK(std::filesystem::is_directory(original));
     Common::FS::SetEdenPath(eden_path, original);
 }
 
