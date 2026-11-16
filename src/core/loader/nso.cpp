@@ -118,10 +118,25 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     // space can neither wrap that arithmetic nor ask for gigabytes.
     const bool pass_arguments =
         should_pass_arguments && !Settings::values.program_args.GetValue().empty();
-    const u64 image_extent =
+    // A Split or PostData patch appends its section after the image when it is copied in, and
+    // the image size is narrowed to u32 after that: count the section too.
+    const size_t post_patch_size = [&]() -> size_t {
+#ifdef HAS_NCE
+        if (patches && load_into_process) {
+            auto* patch = &patches->operator[](patch_index);
+            if (patch->GetPatchMode() == Core::NCE::PatchMode::Split ||
+                patch->GetPatchMode() == Core::NCE::PatchMode::PostData) {
+                return patch->GetSectionSize();
+            }
+        }
+#endif
+        return 0;
+    }();
+    const u64 aligned_extent =
         (u64{module_start} + segments_end + (pass_arguments ? NSO_ARGUMENT_DATA_ALLOCATION_SIZE : 0) +
          nso_header.segments[2].bss_size + Core::Memory::LICHII_PAGEMASK) &
         ~u64{Core::Memory::LICHII_PAGEMASK};
+    const u64 image_extent = aligned_extent + post_patch_size;
     if (image_extent > std::numeric_limits<u32>::max()) {
         LOG_ERROR(Loader, "{}: segments end at {:#x}, past a 32-bit image", nso_file.GetName(),
                   image_extent);
