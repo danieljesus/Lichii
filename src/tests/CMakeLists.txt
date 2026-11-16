@@ -12,6 +12,7 @@ add_executable(tests
     video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/frame_gen_generations.cpp
     video_core/frame_pacer.cpp
     video_core/nx2_stutter_trace.cpp
     video_core/back_idle_trace.cpp
@@ -245,6 +246,8 @@ add_executable(tests
     core/priority_queue.cpp
     core/internal_network/network.cpp
     core/bsd_sockopt_ipc.cpp
+    core/bsd_ipv6_ipc.cpp
+    core/ipv6_sockets.cpp
     core/numeric_name_info.cpp
     core/numeric_name_info_ipc.cpp
     core/nifm_request.cpp
