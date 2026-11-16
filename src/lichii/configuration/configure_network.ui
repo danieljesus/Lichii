@@ -275,6 +275,13 @@
           </layout>
          </widget>
         </item>
+        <item row="6" column="0" colspan="2">
+         <widget class="QCheckBox" name="nextendo_sync_profile">
+          <property name="text">
+           <string>Use my Nextendo nickname and picture for the current user (replaces its name and icon)</string>
+          </property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

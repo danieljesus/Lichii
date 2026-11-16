@@ -843,6 +843,56 @@ TEST_CASE("Nextendo: presence", "[common]") {
     REQUIRE(nlohmann::json::parse(fake.Body(PresencePath))["status"] == 0);
 }
 
+TEST_CASE("Nextendo: nicknames fit the guest profile", "[common]") {
+    const std::string a31(31, 'a');
+    const std::string e_acute = "\xC3\xA9";
+    const std::string hiragana = "\xE3\x81\x82";
+    REQUIRE(Nextendo::ProfileNickname("tester", 32) == "tester");
+    REQUIRE(Nextendo::ProfileNickname(std::string(40, 'a'), 32) == std::string(32, 'a'));
+    REQUIRE(Nextendo::ProfileNickname(a31 + e_acute, 32) == a31);
+    REQUIRE(Nextendo::ProfileNickname(a31 + "b" + e_acute, 32) == a31 + "b");
+    std::string eleven;
+    for (int i = 0; i < 11; ++i) {
+        eleven += hiragana;
+    }
+    REQUIRE(Nextendo::ProfileNickname(eleven, 32) == eleven.substr(0, 30));
+}
+
+TEST_CASE("Nextendo: the profile picture is pulled when it changes", "[common]") {
+    constexpr const char* AvatarPath = "/api/avatar";
+    const auto user = Common::UUID::MakeRandom();
+    FakeNextendo fake;
+    for (const char* picture : {"one", "one", "one", "two", "two", "two"}) {
+        fake.Answer(AvatarPath, 200, picture);
+    }
+    fake.Answer(AvatarPath, 404, "{}");
+    Settings::values.nextendo_enabled = true;
+    Nextendo::SaveAccount(SignedIn(2 * 60 * 60, 30 * 60));
+
+    REQUIRE_FALSE(Nextendo::PullProfile(ClientId, user, false).has_value());
+    REQUIRE(fake.TotalHits() == 0);
+
+    Settings::values.nextendo_sync_profile = true;
+    const auto first = Nextendo::PullProfile(ClientId, user, false);
+    REQUIRE(first->nickname == "tester");
+    REQUIRE(first->avatar == "one");
+    REQUIRE(fake.Param(AvatarPath, "pid") == "1");
+    REQUIRE(fake.Authorization(AvatarPath).empty());
+    REQUIRE_FALSE(Nextendo::PullProfile(ClientId, user, false)->avatar.has_value());
+    REQUIRE(Nextendo::PullProfile(ClientId, user, true)->avatar == "one");
+    REQUIRE(Nextendo::PullProfile(ClientId, user, false)->avatar == "two");
+    REQUIRE(Nextendo::PullProfile(ClientId, Common::UUID::MakeRandom(), false)->avatar == "two");
+    Nextendo::SaveAccount(SignedIn(2 * 60 * 60, 30 * 60));
+    REQUIRE(Nextendo::PullProfile(ClientId, user, false)->avatar == "two");
+    const auto unreachable = Nextendo::PullProfile(ClientId, user, false);
+    REQUIRE(unreachable->nickname == "tester");
+    REQUIRE_FALSE(unreachable->avatar.has_value());
+    REQUIRE(fake.Hits(AvatarPath) == 7);
+
+    Settings::values.nextendo_sync_profile = false;
+    Settings::values.nextendo_enabled = false;
+}
+
 TEST_CASE("Nextendo: the game catalogue is checked before it is used", "[common]") {
     const CatalogSigner signer;
     const s64 now = Now();

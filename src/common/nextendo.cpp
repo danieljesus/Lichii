@@ -63,6 +63,8 @@ std::optional<Presence> last_presence;
 std::chrono::steady_clock::time_point last_presence_time;
 // One presence post at a time, so two can't both decide it is due.
 std::mutex presence_mutex;
+// The guest profile the last PullProfile returned a picture for, and the picture's SHA-256.
+std::optional<std::pair<UUID, std::array<u8, SHA256_DIGEST_LENGTH>>> pulled_avatar;
 
 std::filesystem::path AccountPath() {
     return FS::GetEdenPath(FS::EdenPath::ConfigDir) / "nextendo_account.json";
@@ -499,6 +501,7 @@ void NewAccountGenerationLocked() {
     std::scoped_lock lock{social_mutex};
     friend_cache = {};
     last_presence.reset();
+    pulled_avatar.reset();
 }
 
 void ClearAccountLocked() {
@@ -1376,6 +1379,56 @@ SocialResult UpdatePresence(std::string_view client_id, u64 app_id) {
         last_presence_time = now;
     }
     return result;
+}
+
+std::string ProfileNickname(std::string_view username, std::size_t size) {
+    if (username.size() <= size) {
+        return std::string{username};
+    }
+    while (size > 0 && (static_cast<u8>(username[size]) & 0xC0) == 0x80) {
+        --size;
+    }
+    return std::string{username.substr(0, size)};
+}
+
+std::optional<ProfilePull> PullProfile(std::string_view client_id, const UUID& user, bool force) {
+    if (!OnlinePlayActive() || !Settings::values.nextendo_sync_profile.GetValue()) {
+        return std::nullopt;
+    }
+    std::optional<Account> account;
+    u64 generation;
+    {
+        std::scoped_lock lock{account_mutex};
+        account = LoadAccountLocked();
+        generation = account_generation;
+    }
+    if (!account) {
+        return std::nullopt;
+    }
+    ProfilePull pull{.nickname = account->username};
+    ApiClient api{5};
+    // Public, so the request carries no token.
+    auto result = api.Get(fmt::format("/api/avatar?pid={}", account->pid), BaseHeaders(client_id));
+    if (!result || result->status != 200) {
+        LOG_WARNING(Common, "Could not fetch the Nextendo profile picture: {}",
+                    result ? fmt::format("HTTP {}", result->status)
+                           : httplib::to_string(result.error()));
+    }
+    std::scoped_lock lock{account_mutex, social_mutex};
+    if (generation != account_generation) {
+        return std::nullopt;
+    }
+    if (!result || result->status != 200) {
+        return pull;
+    }
+    std::array<u8, SHA256_DIGEST_LENGTH> hash;
+    SHA256(reinterpret_cast<const u8*>(result->body.data()), result->body.size(), hash.data());
+    if (!force && pulled_avatar && pulled_avatar->first == user && pulled_avatar->second == hash) {
+        return pull;
+    }
+    pulled_avatar.emplace(user, hash);
+    pull.avatar = std::move(result->body);
+    return pull;
 }
 
 } // namespace Common::Nextendo

@@ -397,6 +397,7 @@ private:
     void GetFriendListIds(HLERequestContext& ctx) {
         IPC::RequestParser rp{ctx};
         const auto offset = rp.Pop<u32>();
+        rp.Skip(1, false); // Padding: the Uid that follows is 8-byte aligned
         [[maybe_unused]] const auto uuid = rp.PopRaw<Common::UUID>();
         const auto friends = FilteredFriends(rp.PopRaw<SizedFriendFilter>());
         const bool want_nsa = WantsNsaIds(system);
@@ -418,6 +419,7 @@ private:
     void GetFriendList(HLERequestContext& ctx) {
         IPC::RequestParser rp{ctx};
         const auto offset = rp.Pop<u32>();
+        rp.Skip(1, false); // Padding: the Uid that follows is 8-byte aligned
         const auto uuid = rp.PopRaw<Common::UUID>();
         const auto friends = FilteredFriends(rp.PopRaw<SizedFriendFilter>());
         const bool want_nsa = WantsNsaIds(system);

@@ -144,6 +144,7 @@ void ConfigureNetwork::ApplyConfiguration() {
     Settings::values.lan_play = ui->lan_play->isChecked();
     if (!per_game) {
         Settings::values.nextendo_enabled = ui->nextendo_enabled->isChecked();
+        Settings::values.nextendo_sync_profile = ui->nextendo_sync_profile->isChecked();
         Settings::values.nextendo_client_id = NextendoClientId(ui->nextendo_client_id->text());
         Settings::values.online_service_redirect = ui->online_service_redirect->isChecked();
         Settings::values.online_redirect_hosts = ui->redirect_hosts->text().trimmed().toStdString();
@@ -187,6 +188,7 @@ void ConfigureNetwork::SetConfiguration() {
         Settings::values.online_redirect_loopback_only.GetValue());
     ui->redirect_group->setEnabled(runtime_lock);
     ui->nextendo_enabled->setChecked(Settings::values.nextendo_enabled.GetValue());
+    ui->nextendo_sync_profile->setChecked(Settings::values.nextendo_sync_profile.GetValue());
     ui->nextendo_client_id->setText(
         QString::fromStdString(Settings::values.nextendo_client_id.GetValue()));
     UpdateNextendoStatus();
@@ -303,6 +305,7 @@ void ConfigureNetwork::UpdateNextendoStatus(const QString& error, bool signed_in
         }
     }
     ui->nextendo_status->setText(status);
+    ui->nextendo_sync_profile->setEnabled(account && ui->nextendo_enabled->isChecked());
     const bool friends =
         account && Common::Nextendo::HasSocialScopes(*account) && ui->nextendo_enabled->isChecked();
     ui->nextendo_friends->setVisible(friends);
