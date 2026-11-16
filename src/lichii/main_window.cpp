@@ -64,6 +64,7 @@
 
 #include "configuration/configure_dialog.h"
 #include "configuration/configure_input.h"
+#include "configuration/configure_network.h"
 #include "configuration/configure_per_game.h"
 #include "configuration/configure_tas.h"
 
@@ -464,27 +465,56 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     show();
 
 #ifdef ENABLE_UPDATE_CHECKER
+    connect(&update_watcher, &QFutureWatcher<UpdateChecker::CheckResult>::finished, this,
+            &MainWindow::OnEmulatorUpdateAvailable);
     if (UISettings::values.check_for_updates) {
-        update_future = QtConcurrent::run([]() { return UpdateChecker::Check(); });
-        update_watcher.connect(&update_watcher, &QFutureWatcher<QString>::finished, this,
-                               &MainWindow::OnEmulatorUpdateAvailable);
-        update_watcher.setFuture(update_future);
+        CheckForUpdates(false);
     }
 #endif
 
-    if constexpr (Common::Nextendo::OnlinePlayAvailable) {
-        connect(&nextendo_session_watcher, &QFutureWatcher<bool>::finished, this, [this] {
-            if (nextendo_session_watcher.result()) {
+    connect(&nextendo_session_watcher,
+            &QFutureWatcher<Common::Nextendo::SignOutReason>::finished, this, [this] {
+                QString why;
+                switch (nextendo_session_watcher.result()) {
+                case Common::Nextendo::SignOutReason::None:
+                    return;
+                case Common::Nextendo::SignOutReason::SessionExpired:
+                    why = tr("Your Nextendo session expired, so Lichii signed you out.");
+                    break;
+                case Common::Nextendo::SignOutReason::SessionRevoked:
+                    why = tr("Your session was ended on nextendo.network, so Lichii signed you "
+                             "out.");
+                    break;
+                case Common::Nextendo::SignOutReason::MissingScope:
+                    why = tr("Your Nextendo sign-in didn't allow online play, so Lichii signed "
+                             "you out.");
+                    break;
+                }
                 QMessageBox::warning(this, tr("Signed out of Nextendo"),
-                                     tr("Your session was ended on nextendo.network, so Lichii "
-                                        "signed you out. Sign in again in Configure > Network."));
-            }
-        });
-        connect(&nextendo_session_timer, &QTimer::timeout, this,
-                &MainWindow::KeepNextendoSessionAlive);
-        nextendo_session_timer.start(std::chrono::minutes{2});
-        KeepNextendoSessionAlive();
-    }
+                                     why + QLatin1Char(' ') +
+                                         tr("Sign in again in Configure > Network."));
+            });
+    connect(&nextendo_status_watcher,
+            &QFutureWatcher<std::optional<Common::Nextendo::OnlineStatus>>::finished, this,
+            [this] {
+                const auto status = nextendo_status_watcher.result();
+                QString message;
+                if (!Common::Nextendo::LoadAccount()) {
+                    message = tr("Nextendo online play is on, but you aren't signed in. Sign in "
+                                 "in Configure > Network.");
+                } else if (status && !status->allow) {
+                    LOG_WARNING(Frontend, "nextendo.network refuses online play: {}",
+                                status->reason);
+                    message = ConfigureNetwork::OnlineRefusal(status->reason);
+                }
+                if (!message.isEmpty()) {
+                    statusBar()->showMessage(message, 30000);
+                }
+            });
+    connect(&nextendo_session_timer, &QTimer::timeout, this,
+            &MainWindow::KeepNextendoSessionAlive);
+    nextendo_session_timer.start(std::chrono::minutes{2});
+    KeepNextendoSessionAlive();
 
     // Setup content providers.
     QtCommon::SetupContentProviders();
@@ -1775,6 +1805,11 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Firmware_From_Folder, &MainWindow::OnInstallFirmware);
     connect_menu(ui->action_Firmware_From_ZIP, &MainWindow::OnInstallFirmwareFromZIP);
     connect_menu(ui->action_Install_Keys, &MainWindow::OnInstallDecryptionKeys);
+#ifdef ENABLE_UPDATE_CHECKER
+    connect_menu(ui->action_Check_For_Updates, [this] { CheckForUpdates(true); });
+#else
+    ui->action_Check_For_Updates->setVisible(false);
+#endif
     connect_menu(ui->action_Whats_New, &MainWindow::OnWhatsNew);
     connect_menu(ui->action_About, &MainWindow::OnAbout);
     connect_menu(ui->action_Eden_Dependencies, &MainWindow::OnEdenDependencies);
@@ -2492,6 +2527,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             ResetWindowSize720();
         }
     }
+    CheckNextendoOnlineStatus();
     OnStartGame();
 }
 
@@ -3848,6 +3884,9 @@ void MainWindow::ShowFullscreen() {
             return;
         }
         window->hide();
+        // A maximized window keeps the work area and ignores the new geometry, so the taskbar
+        // stays visible; the saved geometry restores the maximized state afterwards.
+        window->setWindowState(window->windowState() & ~Qt::WindowMaximized);
         window->setWindowFlags(window->windowFlags() | Qt::FramelessWindowHint);
         const auto screen_geometry = GuessCurrentScreen(window)->geometry();
         window->setGeometry(screen_geometry.x(), screen_geometry.y(), screen_geometry.width(),
@@ -4063,6 +4102,7 @@ void MainWindow::OnConfigure() {
         !UISettings::values.reset_to_defaults) {
         // Runs if the user hit Cancel or closed the window, and did not ever press the Apply button
         // or `Reset to Defaults` button
+        configure_dialog.RestoreInputConfiguration();
         return;
     }
     // Applied settings (OK, Apply or Reset to Defaults) replace the speed limit the hotkeys changed.
@@ -4135,6 +4175,11 @@ void MainWindow::OnConfigure() {
     UISettings::values.configuration_applied = false;
 
     config->SaveAllValues();
+
+    if (result != QDialog::Accepted) {
+        // Cancel after Apply: keep what was applied, drop the controller edits made after it
+        configure_dialog.RestoreInputConfiguration();
+    }
 
     if ((UISettings::values.hide_mouse || Settings::values.mouse_panning) && emulation_running) {
         render_window->installEventFilter(render_window);
@@ -5262,9 +5307,62 @@ void MainWindow::KeepNextendoSessionAlive() {
         }));
 }
 
+void MainWindow::CheckNextendoOnlineStatus() {
+    if (!Common::Nextendo::OnlinePlayActive() || nextendo_status_watcher.isRunning()) {
+        return;
+    }
+    nextendo_status_watcher.setFuture(
+        QtConcurrent::run([client_id = Settings::values.nextendo_client_id.GetValue()] {
+            return Common::Nextendo::CheckOnlineStatus(client_id);
+        }));
+}
+
 #ifdef ENABLE_UPDATE_CHECKER
+void MainWindow::CheckForUpdates(bool manual) {
+    if (update_check_running) {
+        // Report the check already in flight instead of starting another one.
+        update_check_manual |= manual;
+        return;
+    }
+    update_check_running = true;
+    update_check_manual = manual;
+    update_future = QtConcurrent::run([] { return UpdateChecker::Check(); });
+    update_watcher.setFuture(update_future);
+}
+
 void MainWindow::OnEmulatorUpdateAvailable() {
+    const bool manual = std::exchange(update_check_manual, false);
+    update_check_running = false;
     const auto result = update_future.result();
+    if (manual && result.failure != UpdateChecker::Failure::None) {
+        const auto title = tr("Check for Updates");
+        switch (result.failure) {
+        case UpdateChecker::Failure::NotReleaseBuild:
+            QMessageBox::information(
+                this, title,
+                tr("This is a test or development build (%1) without a published release tag, so "
+                   "Lichii cannot compare it with published releases. Download a release from "
+                   "GitHub to get updates.")
+                    .arg(QString::fromUtf8(Common::g_build_version)));
+            break;
+        case UpdateChecker::Failure::RateLimited:
+            QMessageBox::warning(this, title,
+                                 tr("GitHub is limiting requests from your network right now. "
+                                    "Please try again later."));
+            break;
+        case UpdateChecker::Failure::Http:
+            QMessageBox::warning(this, title,
+                                 tr("GitHub answered with HTTP error %1. Please try again later.")
+                                     .arg(result.status));
+            break;
+        default:
+            QMessageBox::warning(
+                this, title,
+                tr("Could not reach GitHub. Check your internet connection and try again."));
+            break;
+        }
+        return;
+    }
     if (result.failure == UpdateChecker::Failure::RateLimited) {
         statusBar()->showMessage(
             tr("Could not check for updates: GitHub rate limit reached. Lichii will try again at "
@@ -5279,13 +5377,18 @@ void MainWindow::OnEmulatorUpdateAvailable() {
         return;
     }
     if (!result.update) {
+        if (manual) {
+            QMessageBox::information(this, tr("Check for Updates"),
+                                     tr("You're on the latest build (%1).")
+                                         .arg(QString::fromUtf8(Common::g_build_release_tag)));
+        }
         return;
     }
 
     const auto& release = *result.update;
     const auto now = static_cast<unsigned long long>(QDateTime::currentSecsSinceEpoch());
-    if (UISettings::values.skipped_update_tag.GetValue() == release.tag ||
-        UISettings::values.update_remind_at.GetValue() > now) {
+    if (!manual && (UISettings::values.skipped_update_tag.GetValue() == release.tag ||
+                    UISettings::values.update_remind_at.GetValue() > now)) {
         return;
     }
 
@@ -6144,7 +6247,7 @@ static QPalette LichiiPalette() {
 }
 
 void MainWindow::UpdateMenuIcons() {
-    const std::array<std::pair<QAction*, const char*>, 55> icons{{
+    const std::array<std::pair<QAction*, const char*>, 56> icons{{
         {ui->action_Install_File_NAND, "download"},
         {ui->action_Load_File, "file"},
         {ui->action_Load_Folder, "folder"},
@@ -6197,6 +6300,7 @@ void MainWindow::UpdateMenuIcons() {
         {ui->action_Open_UserHandbook, "help"},
         {ui->action_Apply_Recommended_Settings, "wand"},
         {ui->action_Restore_Previous_Settings, "restart"},
+        {ui->action_Check_For_Updates, "download"},
         {ui->action_Whats_New, "sparkles"},
         {ui->action_About, "info"},
         {ui->action_Eden_Dependencies, "list"},
