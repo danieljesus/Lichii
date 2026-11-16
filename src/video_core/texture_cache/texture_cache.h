@@ -152,13 +152,6 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
-    if constexpr (requires { runtime.PooledImageBytes(); }) {
-        // Host images kept for reuse (EDEN_NX2_IMAGE_POOL) go first when memory runs short.
-        const u64 pooled = runtime.PooledImageBytes();
-        if (pooled != 0 && (out_of_memory || total_used_memory + pooled >= expected_memory)) {
-            runtime.TrimImagePool();
-        }
-    }
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -335,6 +328,19 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     if (out_of_memory || total_used_memory >= critical_memory) {
         Configure(true);
         Collect();
+    }
+    if constexpr (requires { runtime.PooledImageBytes(); }) {
+        // Host images kept for reuse (EDEN_NX2_IMAGE_POOL), after the collection: all of them when
+        // memory runs out or stays critical. Past the expected budget (where a device with little
+        // memory sits while the collector keeps up) the pool keeps at most half the room left under
+        // critical: emptying it there would only make the next frame's images again.
+        if (const u64 pooled = runtime.PooledImageBytes(); pooled != 0) {
+            if (out_of_memory || total_used_memory >= critical_memory) {
+                runtime.TrimImagePool(0);
+            } else if (total_used_memory + pooled > expected_memory) {
+                runtime.TrimImagePool((critical_memory - total_used_memory) / 2);
+            }
+        }
     }
 }
 

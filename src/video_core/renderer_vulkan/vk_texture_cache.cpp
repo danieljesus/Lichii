@@ -629,11 +629,14 @@ struct ImagePool {
         DropOld(now);
     }
 
-    void Trim() {
+    /// Drops the oldest until at most target bytes are kept.
+    void Trim(u64 target) {
         std::scoped_lock lock{mutex};
-        trimmed += entries.size();
-        entries.clear();
-        bytes = 0;
+        while (!entries.empty() && bytes > target) {
+            bytes -= entries.front().bytes;
+            ++trimmed;
+            entries.pop_front();
+        }
     }
 };
 
@@ -3007,7 +3010,7 @@ u64 TextureCacheRuntime::GetDeviceLocalMemory() const {
 
 TextureCacheRuntime::~TextureCacheRuntime() {
     // The pool's images belong to this device: destroyed before it is.
-    TrimImagePool();
+    TrimImagePool(0);
 }
 
 u64 TextureCacheRuntime::PooledImageBytes() const {
@@ -3019,9 +3022,9 @@ u64 TextureCacheRuntime::PooledImageBytes() const {
     return pool.bytes;
 }
 
-void TextureCacheRuntime::TrimImagePool() {
+void TextureCacheRuntime::TrimImagePool(u64 target_bytes) {
     if (ImagePoolEnabled()) {
-        GetImagePool().Trim();
+        GetImagePool().Trim(target_bytes);
     }
 }
 

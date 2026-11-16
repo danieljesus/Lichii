@@ -102,9 +102,10 @@ public:
     u64 GetDeviceMemoryUsage() const;
 
     /// EDEN_NX2_IMAGE_POOL: the bytes of the destroyed host images kept for reuse, and dropping
-    /// them (the texture cache does when it needs the memory).
+    /// the oldest of them until at most target_bytes are kept (the texture cache does when it
+    /// needs the memory).
     [[nodiscard]] u64 PooledImageBytes() const;
-    void TrimImagePool();
+    void TrimImagePool(u64 target_bytes);
 
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
     [[nodiscard]] u64 CurrentTick() const noexcept;
