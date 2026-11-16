@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "frontend_common/nx_archive.h"
+#include "tests/common/temp_dir.h"
 
 using namespace FrontendCommon::NxArchive;
 
@@ -15,10 +16,7 @@ namespace {
 struct TempDir {
     std::filesystem::path path;
     explicit TempDir(const char* name)
-        : path{std::filesystem::temp_directory_path() / name} {
-        std::filesystem::remove_all(path);
-        std::filesystem::create_directories(path);
-    }
+        : path{Tests::MakeTempDir(name)} {}
     ~TempDir() {
         std::error_code ec;
         std::filesystem::permissions(path, std::filesystem::perms::owner_all, ec);

@@ -12,6 +12,7 @@
 #include "core/crypto/aes_util.h"
 #include "core/crypto/key_manager.h"
 #include "tests/common/restore_eden_path.h"
+#include "tests/common/temp_dir.h"
 
 namespace {
 
@@ -37,9 +38,7 @@ TEST_CASE("Keys of a generation the key file lacks are derived from its sources"
         SKIP("Keys are installed");
     }
 
-    const auto directory = std::filesystem::temp_directory_path() / "lichii-key-derivation-test";
-    std::filesystem::remove_all(directory);
-    std::filesystem::create_directories(directory);
+    const auto directory = Tests::MakeTempDir("lichii-key-derivation-test");
     {
         std::ofstream file{directory / "prod.keys"};
         const auto line = [&file](const std::string& name, u8 value) {
@@ -73,9 +72,7 @@ TEST_CASE("Keyblob lines past the keyblob table are skipped", "[core][crypto]") 
     // AddressSanitizer the old code fails here with a global-buffer-overflow. The file holds
     // no other key, so the keys the other tests see are left as they were.
     auto& keys = KeyManager::Instance();
-    const auto directory = std::filesystem::temp_directory_path() / "lichii-keyblob-index-test";
-    std::filesystem::remove_all(directory);
-    std::filesystem::create_directories(directory);
+    const auto directory = Tests::MakeTempDir("lichii-keyblob-index-test");
     {
         std::ofstream file{directory / "prod.keys"};
         file << "keyblob_ff = " << std::string(0x90 * 2, 'a') << '\n';

@@ -22,12 +22,15 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_qmd.h"
+#include "tests/common/temp_dir.h"
 
 namespace {
 using namespace VideoCommon::GpuTrace;
 
 std::filesystem::path TempTrace(const char* name) {
-    return std::filesystem::temp_directory_path() / name;
+    // One folder for this process, removed at exit.
+    static const Tests::TempDir directory{"lichii-gpu-trace"};
+    return directory.path / name;
 }
 
 /// Rewrites the format version in a trace's header.
