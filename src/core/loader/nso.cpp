@@ -7,6 +7,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -112,6 +113,20 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             return std::nullopt;
         }
     }
+    // The whole image, the argument block and .bss included, is sized and aligned in u32 below:
+    // check its extent in 64 bits before allocating, so a segment near the top of the address
+    // space can neither wrap that arithmetic nor ask for gigabytes.
+    const bool pass_arguments =
+        should_pass_arguments && !Settings::values.program_args.GetValue().empty();
+    const u64 image_extent =
+        (u64{module_start} + segments_end + (pass_arguments ? NSO_ARGUMENT_DATA_ALLOCATION_SIZE : 0) +
+         nso_header.segments[2].bss_size + Core::Memory::LICHII_PAGEMASK) &
+        ~u64{Core::Memory::LICHII_PAGEMASK};
+    if (image_extent > std::numeric_limits<u32>::max()) {
+        LOG_ERROR(Loader, "{}: segments end at {:#x}, past a 32-bit image", nso_file.GetName(),
+                  image_extent);
+        return std::nullopt;
+    }
     // Build program image directly in codeset memory :)
     Kernel::CodeSet codeset;
     codeset.memory.resize(module_start + segments_end);
@@ -186,7 +201,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
 
-    if (should_pass_arguments && !Settings::values.program_args.GetValue().empty()) {
+    if (pass_arguments) {
         const auto arg_data{Settings::values.program_args.GetValue()};
 
         codeset.DataSegment().size += NSO_ARGUMENT_DATA_ALLOCATION_SIZE;

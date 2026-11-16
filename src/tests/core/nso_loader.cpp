@@ -130,3 +130,11 @@ TEST_CASE("NSO rejects a stored segment larger than its data", "[core][loader]")
                                      {0x2000, 0x10, 0x10}}}))
                     .has_value());
 }
+
+TEST_CASE("NSO rejects segments that end past a 32-bit image", "[core][loader]") {
+    // The review of #1920: text at 0xfffffff0 with 0x20 bytes ends at 0x100000010, which the
+    // image's u32 size arithmetic wrapped to 0x10 after allocating over 4 GiB.
+    CHECK_FALSE(Load(MakeStoredNso({{{0xfffffff0, 0x20, 0x20}, {0x1000, 0x10, 0x10},
+                                     {0x2000, 0x10, 0x10}}}))
+                    .has_value());
+}
