@@ -21,6 +21,7 @@ add_executable(tests
     video_core/hdr_output.cpp
     core/mii_model.cpp
     core/nx2_streamplay.cpp
+    core/nx2_gpu_only_regions.cpp
     core/nx2_video_ready.cpp
     core/general_channel.cpp
     core/kernel_finish_termination.cpp
@@ -204,6 +205,7 @@ add_executable(tests
     common/memory_detect.cpp
     common/multi_level_page_table.cpp
     common/nextendo.cpp
+    common/npln_patch_manifest.cpp
     common/page_table.cpp
     common/param_package.cpp
     common/poll_window.cpp
@@ -233,6 +235,7 @@ add_executable(tests
     core/internal_network/socket_proxy.cpp
     core/priority_queue.cpp
     core/internal_network/network.cpp
+    core/bsd_sockopt_ipc.cpp
     core/numeric_name_info.cpp
     core/numeric_name_info_ipc.cpp
     core/cmif_out_buffer.cpp
@@ -281,6 +284,7 @@ create_target_directory_groups(tests)
 
 target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common tz ZLIB::ZLIB)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+target_link_libraries(tests PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto)
 
 add_executable(ncz_tests
     core/ncz_cache.cpp

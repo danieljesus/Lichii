@@ -8,6 +8,8 @@
 
 #include <memory>
 #include <optional>
+#include <string>
+#include <utility>
 
 #include <filesystem>
 #include <QElapsedTimer>
@@ -22,6 +24,7 @@
 
 #include "common/common_types.h"
 #include "common/nextendo.h"
+#include "common/nextendo_game_catalog.h"
 #include "common/settings_enums.h"
 #include "core/file_sys/nup_writer.h"
 #include "frontend_common/content_manager.h"
@@ -479,6 +482,9 @@ private slots:
     void KeepNextendoSessionAlive();
     // When a game boots with online play on: says why nextendo.network refuses it, if it does.
     void CheckNextendoOnlineStatus();
+    // When a game boots with online play on: says when the signed game catalogue doesn't accept
+    // its version.
+    void CheckNextendoGameVersion(u64 title_id, std::string version);
 
 private:
     void OnGameListNxTool(const std::string& game_path, void (NxTools::*tool)(const std::string&));
@@ -566,6 +572,8 @@ private:
     QTimer nextendo_session_timer;
     QFutureWatcher<Common::Nextendo::SignOutReason> nextendo_session_watcher;
     QFutureWatcher<std::optional<Common::Nextendo::OnlineStatus>> nextendo_status_watcher;
+    QFutureWatcher<std::optional<Common::Nextendo::GameCatalog>> nextendo_catalog_watcher;
+    std::optional<std::pair<u64, std::string>> nextendo_version_check;
     OverlayDialog* shutdown_dialog{};
     BugReportDialog* bug_report_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;
