@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Static Qt on macOS doesn't use Vulkan
 // Other platforms do, and thus have conflicting VulkanMemoryAllocator symbols
 #include "core/launch_params.h"
@@ -92,6 +95,7 @@
 #include <QFileInfo>
 #include <QFutureWatcher>
 #include <QGuiApplication>
+#include <QImage>
 #include <QInputDialog>
 #include <QMimeData>
 #include <QPalette>
@@ -381,6 +385,48 @@ QString GetTranslatedGameIconSize(size_t index) {
     return QCoreApplication::translate("MainWindow", default_game_icon_sizes[index].second);
 }
 
+// After citron-nextendo's NextendoController::ApplyProfileName and WriteProfileAvatar. False when
+// the picture couldn't be saved.
+bool WriteNextendoProfile(Service::Account::ProfileManager& manager, const Common::UUID& user,
+                          const Common::Nextendo::ProfilePull& pull) {
+    Service::Account::ProfileBase profile{};
+    if (!manager.GetProfileBase(user, profile)) {
+        return true;
+    }
+    const auto username = reinterpret_cast<const char*>(profile.username.data());
+    const std::string nickname =
+        Common::Nextendo::ProfileNickname(pull.nickname, profile.username.size());
+    if (!nickname.empty() && nickname != Common::StringFromFixedZeroTerminatedBuffer(
+                                             username, profile.username.size())) {
+        profile.username.fill(0);
+        std::ranges::copy(nickname, profile.username.begin());
+        manager.SetProfileBase(user, profile);
+        manager.WriteUserSaveFile();
+        LOG_INFO(Frontend, "Took the Nextendo nickname for the current user");
+    }
+    if (!pull.avatar) {
+        return true;
+    }
+    QImage image;
+    if (!image.loadFromData(reinterpret_cast<const uchar*>(pull.avatar->data()),
+                            static_cast<int>(pull.avatar->size()))) {
+        LOG_WARNING(Frontend, "nextendo.network sent a profile picture Lichii can't read");
+        return true;
+    }
+    constexpr int size = 256;
+    image = image.scaled(size, size, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+    image = image.copy((image.width() - size) / 2, (image.height() - size) / 2, size, size);
+    const auto path = QString::fromStdString(Common::FS::PathToUTF8String(
+        Common::FS::GetEdenPath(Common::FS::EdenPath::NANDDir) /
+        fmt::format("system/save/8000000000000010/su/avators/{}.jpg", user.FormattedString())));
+    if (!QDir{}.mkpath(QFileInfo{path}.absolutePath()) || !image.save(path, "JPEG", 100)) {
+        LOG_WARNING(Frontend, "Could not save the Nextendo profile picture");
+        return false;
+    }
+    LOG_INFO(Frontend, "Took the Nextendo profile picture for the current user");
+    return true;
+}
+
 } // namespace
 
 #ifndef _WIN32
@@ -537,6 +583,24 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     nextendo_session_timer.start(std::chrono::minutes{2});
     KeepNextendoSessionAlive();
     connect(&nextendo_social_timer, &QTimer::timeout, this, &MainWindow::UpdateNextendoSocial);
+    connect(&nextendo_profile_watcher,
+            &QFutureWatcher<std::optional<Common::Nextendo::ProfilePull>>::finished, this, [this] {
+                const auto pull = nextendo_profile_watcher.result();
+                // Asked for while this pull ran, for another user or a new sign-in.
+                const bool pending = nextendo_profile_force;
+                if (pull && Common::Nextendo::OnlinePlayActive() &&
+                    Settings::values.nextendo_sync_profile.GetValue()) {
+                    // A game that booted meanwhile reads the profile: write it once the game stops.
+                    if (QtCommon::system->IsPoweredOn() ||
+                        !WriteNextendoProfile(QtCommon::system->GetProfileManager(),
+                                              nextendo_profile_user, *pull)) {
+                        nextendo_profile_force = true;
+                    }
+                }
+                if (pending) {
+                    SyncNextendoProfile(false);
+                }
+            });
 
     // Setup content providers.
     QtCommon::SetupContentProviders();
@@ -2807,6 +2871,7 @@ void MainWindow::OnEmulationStopped() {
             post_offline();
         }
     }
+    SyncNextendoProfile(false);
 
     game_list->SetReportableProgramId(report_session ? report_session->program_id : 0);
 
@@ -4151,6 +4216,13 @@ void MainWindow::OnConfigure() {
 #ifdef __unix__
     const bool old_force_x11 = UISettings::values.gui_force_x11.GetValue();
 #endif
+    const bool old_nextendo_sync = Settings::values.nextendo_sync_profile.GetValue();
+    const auto old_current_user = Settings::values.current_user.GetValue();
+    const auto nextendo_pid = [] {
+        const auto account = Common::Nextendo::LoadAccount();
+        return account ? account->pid : 0;
+    };
+    const u64 old_nextendo_pid = nextendo_pid();
 
     Settings::SetConfiguringGlobal(true);
     ConfigureDialog configure_dialog(this, hotkey_registry, input_subsystem.get(),
@@ -4224,6 +4296,11 @@ void MainWindow::OnConfigure() {
         GraphicsBackend::SetForceX11(UISettings::values.gui_force_x11.GetValue());
     }
 #endif
+    // Just ticked, or a sign-in or another user since.
+    if (!old_nextendo_sync || nextendo_pid() != old_nextendo_pid ||
+        Settings::values.current_user.GetValue() != old_current_user) {
+        SyncNextendoProfile(true);
+    }
 
     if (!multiplayer_state->IsHostingPublicRoom()) {
         multiplayer_state->UpdateCredentials();
@@ -5380,6 +5457,26 @@ void MainWindow::UpdateNextendoSocial() {
                            program_id = QtCommon::system->GetApplicationProcessProgramID()] {
             void(Common::Nextendo::RefreshFriends(client_id));
             void(Common::Nextendo::UpdatePresence(client_id, program_id));
+        }));
+}
+
+void MainWindow::SyncNextendoProfile(bool force) {
+    nextendo_profile_force |= force;
+    if (!Common::Nextendo::OnlinePlayActive() ||
+        !Settings::values.nextendo_sync_profile.GetValue() || QtCommon::system->IsPoweredOn() ||
+        nextendo_profile_watcher.isRunning()) {
+        return;
+    }
+    const auto user = QtCommon::system->GetProfileManager().GetUser(
+        static_cast<std::size_t>(Settings::values.current_user.GetValue()));
+    if (!user) {
+        return;
+    }
+    nextendo_profile_user = *user;
+    nextendo_profile_watcher.setFuture(
+        QtConcurrent::run([client_id = Settings::values.nextendo_client_id.GetValue(), user = *user,
+                           force = std::exchange(nextendo_profile_force, false)] {
+            return Common::Nextendo::PullProfile(client_id, user, force);
         }));
 }
 

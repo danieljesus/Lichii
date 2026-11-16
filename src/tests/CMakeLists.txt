@@ -12,6 +12,7 @@ add_executable(tests
     video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/frame_pacer.cpp
     video_core/nx2_stutter_trace.cpp
     video_core/back_idle_trace.cpp
     video_core/list_macro_trace.cpp
@@ -78,8 +79,10 @@ add_executable(tests
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
     video_core/conditional_barrier.cpp
+    video_core/far_plane_position.cpp
     video_core/storage_buffer_shared_tracking.cpp
     core/nup_validation.cpp
+    core/fs_read_throttle.cpp
     core/npdm_kac.cpp
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
@@ -131,6 +134,7 @@ add_executable(tests
     video_core/spirv_storage_alignment.cpp
     video_core/spirv_fragment_shuffle.cpp
     video_core/mesh_fallback.cpp
+    video_core/mesh_vertex_input.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/gpu_trace.cpp
@@ -145,6 +149,7 @@ add_executable(tests
     video_core/maxwell_fast_method.cpp
     hid_core/emulated_controller_config.cpp
     hid_core/sensor_info.cpp
+    common/flat_allocator.cpp
     common/paged_scalar.cpp
     common/queue_lifetime.cpp
     common/queue_timed_wait.cpp
