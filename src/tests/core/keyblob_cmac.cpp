@@ -49,11 +49,14 @@ TEST_CASE("A console keyblob with a valid MAC is decrypted", "[core][crypto]") {
         SKIP("Keys are installed");
     }
 
-    // Unique per run: another tests process can't remove this one's fixture before it loads.
-    const auto directory = std::filesystem::temp_directory_path() /
-                           ("lichii-keyblob-mac-test-" + std::to_string(std::random_device{}()));
-    std::filesystem::remove_all(directory);
-    std::filesystem::create_directories(directory);
+    // A folder this run creates itself (create_directory fails on one that exists), so another
+    // tests process never shares or removes it.
+    std::filesystem::path directory;
+    std::random_device random;
+    do {
+        directory = std::filesystem::temp_directory_path() /
+                    ("lichii-keyblob-mac-test-" + std::to_string(random()));
+    } while (!std::filesystem::create_directory(directory));
     {
         std::ofstream file{directory / "prod.keys"};
         const auto line = [&file](std::string_view name, char digit) {
