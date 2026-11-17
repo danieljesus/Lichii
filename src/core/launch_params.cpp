@@ -141,6 +141,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 bool argument_ok = isdigit(optarg[0]) != 0;
                 p.selected_user = atoi(optarg);
                 if (!argument_ok) {
+                    p.selected_user_name = optarg;
                     // try to look it up by username, only finds the first username that matches.
                     auto const user_idx = system.GetProfileManager().GetUserIndex(optarg);
                     if (user_idx != std::nullopt) {
