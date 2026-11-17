@@ -145,10 +145,13 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 bool argument_ok = !argument.empty() && std::ranges::all_of(argument, [](char c) {
                     return isdigit(static_cast<unsigned char>(c)) != 0;
                 });
-                p.selected_user = atoi(optarg);
-                // A later -u replaces an earlier one, a name included.
+                // A later -u replaces an earlier one, a name included, and a name that isn't found
+                // leaves no index behind.
+                p.selected_user.reset();
                 p.selected_user_name.clear();
-                if (!argument_ok) {
+                if (argument_ok) {
+                    p.selected_user = atoi(optarg);
+                } else {
                     p.selected_user_name = optarg;
                     // try to look it up by username, only finds the first username that matches.
                     auto const user_idx = system.GetProfileManager().GetUserIndex(optarg);
