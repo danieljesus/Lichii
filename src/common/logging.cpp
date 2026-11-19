@@ -283,16 +283,31 @@ struct FileBackend final : public Backend {
         };
 #endif
         // If the log can't be moved, write this session to a second log (eden_log_2.txt) so that
-        // the previous session is kept and this one still gets the full size limit. If that one
-        // can't be moved either (a third Lichii in the same folder), append to it, unlocked.
+        // the previous session is kept and this one still gets the full size limit. Outside
+        // Windows each further Lichii in the folder takes the next free log (eden_log_3.txt and
+        // on), so every writer holds the lock of the file it writes and none is moved under it.
+        // If none can be moved, append to the last one.
+#ifdef _WIN32
+        constexpr int log_slots = 2;
+#else
+        constexpr int log_slots = 8;
+#endif
+        const auto slot_path = [&filename](int slot) {
+            if (slot == 1)
+                return filename;
+            auto numbered = filename.parent_path() / filename.stem();
+            numbered += fmt::format("_{}", slot);
+            numbered += filename.extension();
+            return numbered;
+        };
         auto path = filename;
-        auto mode = FS::FileAccessMode::Write;
-        if (!claim(path)) {
-            path = filename.parent_path() / filename.stem();
-            path += "_2";
-            path += filename.extension();
-            if (!claim(path))
-                mode = FS::FileAccessMode::Append;
+        auto mode = FS::FileAccessMode::Append;
+        for (int slot = 1; slot <= log_slots; ++slot) {
+            path = slot_path(slot);
+            if (claim(path)) {
+                mode = FS::FileAccessMode::Write;
+                break;
+            }
         }
         file.emplace(path, mode, FS::FileType::TextFile);
         file_path = path;

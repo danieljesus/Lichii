@@ -12,6 +12,7 @@
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -63,6 +64,50 @@ std::string ReadText(const fs::path& path) {
     return {std::istreambuf_iterator<char>{in}, {}};
 }
 
+#ifdef LOG_LOCK_CHILD
+// Starts this test executable again on the hidden case `filter`, with LICHII_LOG_LOCK_DIR=dir.
+pid_t SpawnSelf(const fs::path& dir, const std::string& filter) {
+    const std::string variable = "LICHII_LOG_LOCK_DIR=" + dir.string();
+    std::vector<std::string> environment{variable};
+    for (char** entry = environ; *entry != nullptr; ++entry) {
+        if (std::string_view{*entry}.starts_with("LICHII_LOG_LOCK_DIR=")) {
+            continue;
+        }
+        environment.emplace_back(*entry);
+    }
+    std::vector<char*> envp;
+    for (auto& entry : environment) {
+        envp.push_back(entry.data());
+    }
+    envp.push_back(nullptr);
+    std::string exe = ExecutablePath();
+    REQUIRE_FALSE(exe.empty());
+    std::string argument = filter;
+    char* argv[] = {exe.data(), argument.data(), nullptr};
+    pid_t child{};
+    REQUIRE(posix_spawn(&child, exe.c_str(), nullptr, nullptr, argv, envp.data()) == 0);
+    return child;
+}
+
+void RequireExitedCleanly(pid_t child) {
+    int status{};
+    REQUIRE(waitpid(child, &status, 0) == child);
+    REQUIRE(WIFEXITED(status));
+    REQUIRE(WEXITSTATUS(status) == 0);
+}
+
+// Waits up to 20 s for path to exist.
+bool WaitForFile(const fs::path& path) {
+    for (int i = 0; i < 2000; ++i) {
+        if (fs::exists(path)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    return false;
+}
+#endif
+
 // Starts the log in dir, writes marker and flushes it.
 void StartLog(const fs::path& dir, const std::string& marker) {
     Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, dir);
@@ -108,6 +153,19 @@ TEST_CASE("Log lock child", "[.log_lock_child]") {
     StartLog(dir, "child marker");
 }
 
+#ifdef LOG_LOCK_CHILD
+// A Lichii that keeps its log open until the parent creates "release" in the folder.
+TEST_CASE("Log lock holder", "[.log_lock_holder]") {
+    const char* dir = std::getenv("LICHII_LOG_LOCK_DIR");
+    REQUIRE(dir != nullptr);
+    StartLog(dir, "holder marker");
+    std::ofstream{fs::path{dir} / "ready"} << "";
+    REQUIRE(WaitForFile(fs::path{dir} / "release"));
+    LOG_INFO(Log, "holder after third");
+    Common::Log::Flush();
+}
+#endif
+
 TEST_CASE("A second Lichii leaves a log another one still writes", "[common][logging]") {
 #ifndef LOG_LOCK_CHILD
     SKIP("Starts a child process with posix_spawn");
@@ -130,29 +188,7 @@ TEST_CASE("A second Lichii leaves a log another one still writes", "[common][log
     REQUIRE(Common::Log::FilePath() == log);
     REQUIRE(ReadText(dir / "eden_log.txt.old.txt") == "previous session");
 
-    const std::string variable = "LICHII_LOG_LOCK_DIR=" + dir.string();
-    std::vector<std::string> environment{variable};
-    for (char** entry = environ; *entry != nullptr; ++entry) {
-        if (std::string_view{*entry}.starts_with("LICHII_LOG_LOCK_DIR=")) {
-            continue;
-        }
-        environment.emplace_back(*entry);
-    }
-    std::vector<char*> envp;
-    for (auto& entry : environment) {
-        envp.push_back(entry.data());
-    }
-    envp.push_back(nullptr);
-    std::string exe = ExecutablePath();
-    REQUIRE_FALSE(exe.empty());
-    std::string filter = "[.log_lock_child]";
-    char* argv[] = {exe.data(), filter.data(), nullptr};
-    pid_t child{};
-    REQUIRE(posix_spawn(&child, exe.c_str(), nullptr, nullptr, argv, envp.data()) == 0);
-    int status{};
-    REQUIRE(waitpid(child, &status, 0) == child);
-    REQUIRE(WIFEXITED(status));
-    REQUIRE(WEXITSTATUS(status) == 0);
+    RequireExitedCleanly(SpawnSelf(dir, "[.log_lock_child]"));
 
     // The child wrote eden_log_2.txt; this process's log stayed where it is, untouched.
     CHECK(ReadText(dir / "eden_log.txt.old.txt") == "previous session");
@@ -163,5 +199,50 @@ TEST_CASE("A second Lichii leaves a log another one still writes", "[common][log
     CHECK(text.find("parent marker") != std::string::npos);
     CHECK(text.find("parent after child") != std::string::npos);
     CHECK(text.find("child marker") == std::string::npos);
+#endif
+}
+
+TEST_CASE("A third Lichii takes the next free log", "[common][logging]") {
+#ifndef LOG_LOCK_CHILD
+    SKIP("Starts child processes with posix_spawn");
+#else
+    if (LogStarted()) {
+        SKIP("Needs a process of its own");
+    }
+    const auto dir = TempPath("third");
+    SCOPE_EXIT {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    };
+    REQUIRE(fs::create_directories(dir));
+    StartLog(dir, "parent marker");
+    REQUIRE(Common::Log::FilePath() == dir / "eden_log.txt");
+
+    // A second Lichii holds eden_log_2.txt while a third one starts.
+    const pid_t holder = SpawnSelf(dir, "[.log_lock_holder]");
+    bool released = false;
+    SCOPE_EXIT {
+        if (!released) {
+            std::ofstream{dir / "release"} << "";
+            int status{};
+            waitpid(holder, &status, 0);
+        }
+    };
+    REQUIRE(WaitForFile(dir / "ready"));
+    RequireExitedCleanly(SpawnSelf(dir, "[.log_lock_child]"));
+    std::ofstream{dir / "release"} << "";
+    released = true;
+    RequireExitedCleanly(holder);
+
+    // Each one wrote a log of its own, which none of the others moved or wrote.
+    const auto second = ReadText(dir / "eden_log_2.txt");
+    CHECK(second.find("holder marker") != std::string::npos);
+    CHECK(second.find("holder after third") != std::string::npos);
+    CHECK(second.find("child marker") == std::string::npos);
+    const auto third = ReadText(dir / "eden_log_3.txt");
+    CHECK(third.find("child marker") != std::string::npos);
+    CHECK(third.find("holder marker") == std::string::npos);
+    CHECK_FALSE(fs::exists(dir / "eden_log_2.txt.old.txt"));
+    CHECK(ReadText(dir / "eden_log.txt").find("child marker") == std::string::npos);
 #endif
 }
