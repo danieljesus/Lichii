@@ -120,6 +120,10 @@ struct Profile {
     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
     bool has_broken_spirv_subgroup_shuffle{};
     bool has_broken_spirv_fragment_shuffle{};
+    /// Converting f32 to f16 rounds to nearest even and keeps f16 subnormals, whatever the
+    /// device reports in its float controls (MoltenVK reports no fp16 denorm preservation, but
+    /// Metal's conversion keeps them)
+    bool fp16_conversion_rounds_rte_with_denorms{};
     /// The guest's HMMA.16816.F16 runs on a cooperative matrix, in compute shaders
     bool support_cooperative_hmma{};
     /// Without the above, HMMA runs on 16x16x16 cooperative matrices through shared memory

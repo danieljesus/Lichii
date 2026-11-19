@@ -226,6 +226,9 @@ namespace {
 // fp32 -> fp16 -> fp32 conversion rounds like the software rounding below. The two agree for
 // every non-NaN fp32 input; a NaN stays a NaN.
 bool CanRoundHalfNatively(const Profile& profile, const Info& info) {
+    if (profile.fp16_conversion_rounds_rte_with_denorms && !info.uses_fp16_denorms_flush) {
+        return true;
+    }
     if (!profile.support_float_controls || profile.has_broken_fp16_float_controls ||
         !profile.support_fp16_rounding_rte || !profile.support_fp16_denorm_preserve ||
         !profile.fp16_float_controls_independent_of_fp32 || info.uses_fp16_denorms_flush) {
