@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +17,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/gpu_trace/sample.h"
 #include "video_core/gpu_trace/state.h"
 #include "video_core/gpu_trace/trace_file.h"
@@ -270,4 +272,28 @@ TEST_CASE("A format 1 trace's pusher and QMD state records restore",
     CHECK(std::memcmp(captured.data() + sizeof(address), state.data(), state.size() - 1) == 0);
     CHECK_FALSE(StateAccess::Restore(old_qmds, FormatVersion, nullptr, channel.get(), syncpoints));
     shared.CopyStates(kept);
+}
+
+TEST_CASE("The GPU thread holds commands back for a snapshot only for a while",
+          "[video_core][gpu_trace]") {
+    using Clock = SnapshotHold::Clock;
+    using std::chrono::milliseconds;
+    const Clock::time_point t0{std::chrono::seconds{100}};
+    SnapshotHold hold;
+    // Nothing requested: commands run.
+    REQUIRE_FALSE(hold.Hold(t0, false));
+    // Requested: held for HoldLimit, so suspended channels can finish.
+    REQUIRE(hold.Hold(t0, true));
+    REQUIRE(hold.Hold(t0 + SnapshotHold::HoldLimit - milliseconds{1}, true));
+    // A channel may wait for a queued command: past the limit commands run for Backoff.
+    const auto expired = t0 + SnapshotHold::HoldLimit;
+    REQUIRE_FALSE(hold.Hold(expired, true));
+    REQUIRE_FALSE(hold.Hold(expired + SnapshotHold::Backoff - milliseconds{1}, true));
+    // Then it tries again, for another HoldLimit.
+    const auto retry = expired + SnapshotHold::Backoff;
+    REQUIRE(hold.Hold(retry, true));
+    REQUIRE_FALSE(hold.Hold(retry + SnapshotHold::HoldLimit, true));
+    // Once the snapshot is taken, or the request dropped, it starts over.
+    REQUIRE_FALSE(hold.Hold(retry + SnapshotHold::HoldLimit + milliseconds{1}, false));
+    REQUIRE(hold.Hold(retry + SnapshotHold::HoldLimit + milliseconds{2}, true));
 }
