@@ -51,10 +51,6 @@ constexpr u32 Branch(u64 from, u64 to) {
     return 0x14000000 | (static_cast<u32>((to - from) >> 2) & 0x03FF'FFFF);
 }
 
-constexpr u32 LoadX(u32 rt, u32 rn) {
-    return 0xF9400000 | (rn << 5) | rt;
-}
-
 class LinkEnv final : public A64::UserCallbacks {
 public:
     A64::Jit* jit = nullptr;
@@ -121,7 +117,13 @@ TEST_CASE("JIT: a block linked to another follows the target when it is recompil
 
 constexpr const char* FaultTestName =
     "JIT: a fastmem fault resumes at the access that faulted among several in a block";
+#ifdef __linux__
 constexpr const char* FaultChildVariable = "LICHII_JIT_BLOCK_LINKS_FAULT_CHILD";
+#endif
+
+constexpr u32 LoadX(u32 rt, u32 rn) {
+    return 0xF9400000 | (rn << 5) | rt;
+}
 
 TEST_CASE(FaultTestName, "[jit][jit_block_links]") {
 #ifdef __linux__
