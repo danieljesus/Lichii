@@ -376,6 +376,17 @@ add_executable(log_file_flush_tests
 target_link_libraries(log_file_flush_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME log_file_flush_tests COMMAND log_file_flush_tests)
 
+# One process per test case: the log backend is made once per process.
+add_executable(log_file_lock_tests
+    common/log_file_lock.cpp)
+target_link_libraries(log_file_lock_tests PRIVATE common Catch2::Catch2WithMain)
+add_test(NAME log_file_lock_parents
+    COMMAND log_file_lock_tests "The log folder is created with its missing parents")
+add_test(NAME log_file_lock_live
+    COMMAND log_file_lock_tests "A second Lichii leaves a log another one still writes")
+# The live case waits for a child process: fail instead of hanging the run if it never ends.
+set_tests_properties(log_file_lock_parents log_file_lock_live PROPERTIES TIMEOUT 60)
+
 if (TARGET SDL3::SDL3)
     add_executable(sdl_window_state_tests lichii_cmd/sdl_window_state.cpp)
     target_link_libraries(sdl_window_state_tests PRIVATE SDL3::SDL3 Catch2::Catch2WithMain)
