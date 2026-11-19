@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -17,6 +18,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/fs/file_lock.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -244,5 +246,45 @@ TEST_CASE("A third Lichii takes the next free log", "[common][logging]") {
     CHECK(third.find("holder marker") == std::string::npos);
     CHECK_FALSE(fs::exists(dir / "eden_log_2.txt.old.txt"));
     CHECK(ReadText(dir / "eden_log.txt").find("child marker") == std::string::npos);
+#endif
+}
+
+TEST_CASE("A Lichii that finds every log held keeps no log file", "[common][logging]") {
+#ifdef _WIN32
+    SKIP("Windows holds no lock files: an open log can't be moved there");
+#else
+    if (LogStarted()) {
+        SKIP("Needs a process of its own");
+    }
+    const auto dir = TempPath("full");
+    SCOPE_EXIT {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    };
+    REQUIRE(fs::create_directories(dir));
+    // Eight other Lichiis hold the folder's eight logs (a lock taken through another descriptor
+    // counts as another holder, in this process too).
+    std::vector<std::unique_ptr<Common::FS::FileLock>> holders;
+    for (int slot = 1; slot <= 8; ++slot) {
+        const std::string name =
+            slot == 1 ? "eden_log.txt" : "eden_log_" + std::to_string(slot) + ".txt";
+        std::ofstream{dir / name} << "held " << slot;
+        holders.push_back(std::make_unique<Common::FS::FileLock>(dir / (name + ".lock")));
+        REQUIRE(holders.back()->Held());
+    }
+
+    StartLog(dir, "ninth marker");
+    LOG_INFO(Log, "ninth again");
+    Common::Log::Flush();
+
+    // No log was written or moved, and none is named.
+    CHECK(Common::Log::FilePath().empty());
+    for (int slot = 1; slot <= 8; ++slot) {
+        const std::string name =
+            slot == 1 ? "eden_log.txt" : "eden_log_" + std::to_string(slot) + ".txt";
+        CHECK(ReadText(dir / name) == "held " + std::to_string(slot));
+        CHECK_FALSE(fs::exists(dir / (name + ".old.txt")));
+    }
+    CHECK_FALSE(fs::exists(dir / "eden_log_9.txt"));
 #endif
 }

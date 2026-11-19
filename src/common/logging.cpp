@@ -269,14 +269,15 @@ struct FileBackend final : public Backend {
         // held instead with a lock file beside it for as long as this backend lives, and only a
         // log nobody holds is moved. A lock file that can't be made leaves it to the rename.
         // One try, no wait: a log a running Lichii holds stays held.
-        const auto claim = [this, &rotate](const std::filesystem::path& path) {
+        bool held_elsewhere = false;
+        const auto claim = [this, &rotate, &held_elsewhere](const std::filesystem::path& path) {
             auto lock_path = path;
             lock_path += ".lock";
             lock.emplace(lock_path);
+            held_elsewhere = !lock->Held() && lock->Busy();
             if (!lock->Held()) {
-                const bool busy = lock->Busy();
                 lock.reset();
-                if (busy)
+                if (held_elsewhere)
                     return false;
             }
             return rotate(path);
@@ -286,7 +287,8 @@ struct FileBackend final : public Backend {
         // the previous session is kept and this one still gets the full size limit. Outside
         // Windows each further Lichii in the folder takes the next free log (eden_log_3.txt and
         // on), so every writer holds the lock of the file it writes and none is moved under it.
-        // If none can be moved, append to the last one.
+        // If none can be moved, append to the last one, unless another Lichii holds it: with
+        // every log held, this session writes no log file at all.
 #ifdef _WIN32
         constexpr int log_slots = 2;
 #else
@@ -309,6 +311,16 @@ struct FileBackend final : public Backend {
                 break;
             }
         }
+#ifndef _WIN32
+        if (mode == FS::FileAccessMode::Append && held_elsewhere) {
+            // Too early for the log itself.
+            fmt::print(stderr, "Every log file in {} is held by another Lichii: this one keeps no "
+                               "log file\n",
+                       FS::PathToUTF8String(filename.parent_path()));
+            enabled = false;
+            return;
+        }
+#endif
         file.emplace(path, mode, FS::FileType::TextFile);
         file_path = path;
         // Count what is already there so the size limit still applies when appending.
@@ -364,7 +376,8 @@ struct FileBackend final : public Backend {
         if (flushing)
             return;
         flushing = true;
-        file->Flush();
+        if (file)
+            file->Flush();
         flushing = false;
     }
 
