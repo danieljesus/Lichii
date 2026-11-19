@@ -27,6 +27,7 @@
 #include <fmt/ranges.h>
 
 #include "common/fs/file.h"
+#include "common/fs/file_lock.h"
 #include "common/fs/fs.h"
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
@@ -259,16 +260,37 @@ struct FileBackend final : public Backend {
             std::filesystem::rename(path, old_path, ec);
             return !ec;
         };
+#ifdef _WIN32
+        const auto claim = [&rotate](const std::filesystem::path& path) { return rotate(path); };
+#else
+        // Outside Windows the rename succeeds on a log another Lichii still writes: that process
+        // would go on writing to the ".old.txt" copy, which the next start overwrites. Each log is
+        // held instead with a lock file beside it for as long as this backend lives, and only a
+        // log nobody holds is moved. A lock file that can't be made leaves it to the rename.
+        // One try, no wait: a log a running Lichii holds stays held.
+        const auto claim = [this, &rotate](const std::filesystem::path& path) {
+            auto lock_path = path;
+            lock_path += ".lock";
+            lock.emplace(lock_path);
+            if (!lock->Held()) {
+                const bool busy = lock->Busy();
+                lock.reset();
+                if (busy)
+                    return false;
+            }
+            return rotate(path);
+        };
+#endif
         // If the log can't be moved, write this session to a second log (eden_log_2.txt) so that
         // the previous session is kept and this one still gets the full size limit. If that one
         // can't be moved either, append to it.
         auto path = filename;
         auto mode = FS::FileAccessMode::Write;
-        if (!rotate(path)) {
+        if (!claim(path)) {
             path = filename.parent_path() / filename.stem();
             path += "_2";
             path += filename.extension();
-            if (!rotate(path))
+            if (!claim(path))
                 mode = FS::FileAccessMode::Append;
         }
         file.emplace(path, mode, FS::FileType::TextFile);
@@ -333,6 +355,10 @@ struct FileBackend final : public Backend {
     std::filesystem::path file_path;
 
 private:
+#ifndef _WIN32
+    // Before the file, so the file is closed first.
+    std::optional<FS::FileLock> lock;
+#endif
     std::optional<FS::IOFile> file;
     std::size_t bytes_written = 0;
     bool enabled = true;
@@ -470,7 +496,7 @@ void Initialize() {
 #ifndef __OPENORBIS__
         using namespace Common::FS;
         const auto& log_dir = GetEdenPath(EdenPath::LogDir);
-        void(CreateDir(log_dir));
+        void(CreateDirs(log_dir));
         logging_instance->file_backend.emplace(log_dir / LOG_FILE);
 #endif
     }
