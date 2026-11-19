@@ -221,11 +221,49 @@ std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Pro
     return scratch_offset / 4U;
 }
 
+// The software HMMA's fragment exchange: each lane of a warp writes its six A and B words here, and
+// reads the words of the lanes it needs back, in place of subgroup shuffles with a per-lane index.
+constexpr u32 SoftwareHmmaWordsPerLane = 6;
+constexpr u32 SoftwareHmmaWordsPerWarp = GUEST_WARP_LANES * SoftwareHmmaWordsPerLane;
+
+std::optional<u32> ReserveSoftwareHmmaScratch(const Profile& profile, IR::Program& program) {
+    // Whole warps in a row, so SubgroupId names the warp, as for the cooperative scratch.
+    if (!profile.has_slow_dynamic_shuffle || program.stage != Stage::Compute ||
+        program.workgroup_size[0] == 0 || program.workgroup_size[0] % GUEST_WARP_LANES != 0 ||
+        (profile.max_subgroup_size != 0 && profile.max_subgroup_size != GUEST_WARP_LANES)) {
+        return std::nullopt;
+    }
+    bool has_hmma{};
+    for (const auto* block : program.blocks) {
+        for (const auto& inst : block->Instructions()) {
+            has_hmma |= inst.GetOpcode() == IR::Opcode::TensorMulAdd;
+        }
+    }
+    if (!has_hmma) {
+        return std::nullopt;
+    }
+    const u32 invocations = program.workgroup_size[0] * program.workgroup_size[1] *
+                            program.workgroup_size[2];
+    const u32 warps = invocations / GUEST_WARP_LANES;
+    const u32 scratch_offset = (program.shared_memory_size + 15U) & ~15U;
+    const u32 total = scratch_offset + warps * SoftwareHmmaWordsPerWarp * 4U;
+    // Past the device limit the pipeline would fail to build: keep the shuffles.
+    if (profile.max_compute_shared_memory_size != 0 &&
+        total > profile.max_compute_shared_memory_size) {
+        return std::nullopt;
+    }
+    program.shared_memory_size = total;
+    return scratch_offset / 4U;
+}
+
 namespace {
 // Whether the entry point can request fp16 round-to-nearest-even and denorm preserve, so that an
 // fp32 -> fp16 -> fp32 conversion rounds like the software rounding below. The two agree for
 // every non-NaN fp32 input; a NaN stays a NaN.
 bool CanRoundHalfNatively(const Profile& profile, const Info& info) {
+    if (profile.fp16_conversion_rounds_rte_with_denorms && !info.uses_fp16_denorms_flush) {
+        return true;
+    }
     if (!profile.support_float_controls || profile.has_broken_fp16_float_controls ||
         !profile.support_fp16_rounding_rte || !profile.support_fp16_denorm_preserve ||
         !profile.fp16_float_controls_independent_of_fp32 || info.uses_fp16_denorms_flush) {
@@ -265,12 +303,22 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
             needed[depth == 16] = true;
         }
     }
+    const bool staged = ctx.software_hmma_scratch_word.has_value();
+    if (staged && (needed[0] || needed[1])) {
+        ctx.AddCapability(spv::Capability::GroupNonUniform);
+        const Id input_u32 = ctx.TypePointer(spv::StorageClass::Input, ctx.U32[1]);
+        ctx.tensor_subgroup_id = ctx.AddGlobalVariable(input_u32, spv::StorageClass::Input);
+        ctx.Decorate(ctx.tensor_subgroup_id, spv::Decoration::BuiltIn, spv::BuiltIn::SubgroupId);
+        ctx.interfaces.push_back(ctx.tensor_subgroup_id);
+    }
     for (u32 variant = 0; variant < 2; ++variant) {
         if (!needed[variant]) continue;
         ctx.AddCapability(spv::Capability::GroupNonUniform);
-        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+        if (!staged) {
+            ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+        }
         if (!ctx.SupportsSubgroups() ||
-            ctx.profile.has_broken_spirv_subgroup_shuffle)
+            (!staged && ctx.profile.has_broken_spirv_subgroup_shuffle))
             throw NotImplementedException("Software HMMA requires subgroup shuffle support");
         const Id u32ty = ctx.U32[1], f32ty = ctx.F32[1];
         ctx.native_half_rounding = CanRoundHalfNatively(ctx.profile, program.info);
@@ -341,19 +389,43 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         const Id col_base = ctx.OpShiftLeftLogical(u32ty, and_(lane, 3), imm(3));
         const Id a_base = add(warp_base, row_base);
         const Id b_base = add(warp_base, col_base);
+        // Staged: this lane's A and B words go to its warp's slots, and the words of other lanes
+        // are read from there. Lane indices stay within the warp (32 lanes, SubgroupId = warp).
+        Id warp_slots{};
+        if (staged) {
+            warp_slots = add(imm(*ctx.software_hmma_scratch_word),
+                             ctx.OpIMul(u32ty, ctx.OpLoad(u32ty, ctx.tensor_subgroup_id),
+                                        imm(SoftwareHmmaWordsPerWarp)));
+            const Id own = add(warp_slots, ctx.OpIMul(u32ty, and_(lane, 31),
+                                                      imm(SoftwareHmmaWordsPerLane)));
+            for (u32 i = 0; i < SoftwareHmmaWordsPerLane; ++i) {
+                ctx.StoreShared(SharedWord(ctx, add(own, imm(i))), inputs[i]);
+            }
+            SubgroupBarrier(ctx);
+        }
+        // Word `slot` (0-3 A, 4-5 B) of lane `source`, as a shuffle or from the staged slots.
+        const auto fetch = [&](Id value, Id slot, Id source) {
+            if (!staged) {
+                return ctx.OpGroupNonUniformShuffle(u32ty, imm(3), value, source);
+            }
+            const Id word = add(add(warp_slots, ctx.OpIMul(u32ty, and_(source, 31),
+                                                           imm(SoftwareHmmaWordsPerLane))),
+                                slot);
+            return ctx.LoadShared(u32ty, SharedWord(ctx, word));
+        };
         // Unrolling a K=8 group lets its shuffles overlap, which latency-bound small dispatches
         // need; unrolling all of K=16 raises register pressure and slows large dispatches.
         const auto emit_group = [&](auto pick) {
             for (u32 component = 0; component < 4; ++component) {
                 const Id b = pick(inputs[4], inputs[5]);
+                const Id b_slot = pick(imm(4), imm(5));
                 std::array<Id, 2> bs;
                 for (u32 col = 0; col < 2; ++col)
-                    bs[col] = unpack(ctx.OpGroupNonUniformShuffle(
-                        u32ty, imm(3), b, add(b_base, imm(component + col * 4))));
+                    bs[col] = unpack(fetch(b, b_slot, add(b_base, imm(component + col * 4))));
                 for (u32 row = 0; row < 2; ++row) {
-                    const Id as = unpack(ctx.OpGroupNonUniformShuffle(
-                        u32ty, imm(3), pick(inputs[row], inputs[row + 2]),
-                        add(a_base, imm(component))));
+                    const Id as = unpack(fetch(pick(inputs[row], inputs[row + 2]),
+                                               pick(imm(row), imm(row + 2)),
+                                               add(a_base, imm(component))));
                     for (u32 col = 0; col < 2; ++col) {
                         Id value = ctx.OpLoad(f32ty, accumulators[row * 2 + col]);
                         for (u32 half = 0; half < 2; ++half) {
@@ -388,6 +460,10 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
             ctx.OpStore(counter, add(group, imm(1)));
             ctx.OpBranch(header);
             ctx.AddLabel(end);
+        }
+        if (staged) {
+            // The next HMMA of the warp writes the slots again.
+            SubgroupBarrier(ctx);
         }
         std::array<Id, 2> packed;
         for (u32 row = 0; row < 2; ++row)
