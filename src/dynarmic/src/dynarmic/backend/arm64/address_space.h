@@ -97,7 +97,7 @@ protected:
     std::map<CodePtr, IR::LocationDescriptor> reverse_block_entries;
     ::Common::unordered_map<IR::LocationDescriptor, CodePtr> block_entries;
     ::Common::unordered_map<CodePtr, EmittedBlockInfo> block_infos;
-    /// The blocks that link to each location (a block can appear more than once).
+    /// The blocks that link to each location, each once per location.
     ::Common::unordered_map<IR::LocationDescriptor, std::vector<CodePtr>> block_references;
 
     ExceptionHandler exception_handler;

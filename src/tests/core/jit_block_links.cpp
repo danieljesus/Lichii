@@ -6,9 +6,11 @@
 // against.
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <utility>
 
 #include <catch2/catch_test_macros.hpp>
 
