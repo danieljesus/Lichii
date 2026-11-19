@@ -17,6 +17,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <sys/sysctl.h>
+#elif defined(__linux__) && defined(__aarch64__)
+#include <sys/auxv.h>
+#endif
 #if defined(__linux__) && defined(__x86_64__)
 #include <spawn.h>
 #include <sys/mman.h>
@@ -174,31 +179,46 @@ std::vector<Encoding> TestableEncodings() {
     return result;
 }
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+/// FEAT_FP16, which the arm64 backend's scalar half-precision emitters need.
+bool HostHasFP16() {
+#if defined(__APPLE__)
+    int value = 0;
+    size_t size = sizeof(value);
+    return sysctlbyname("hw.optional.arm.FEAT_FP16", &value, &size, nullptr, 0) == 0 && value != 0;
+#elif defined(__linux__)
+    return (getauxval(AT_HWCAP) & (1UL << 10)) != 0;  // HWCAP_FPHP
+#else
+    return false;
+#endif
+}
+#endif
+
 /// The arm64 backend asserts on these opcodes (UNREACHABLE emitters), so an arm64 host skips
-/// the instructions that still use them after the passes the JIT runs.
+/// the instructions that still use them after the passes the JIT runs. The scalar half-precision
+/// ones need FEAT_FP16 on the host.
 bool UnimplementedOnHost([[maybe_unused]] IR::Block& block) {
 #if defined(__aarch64__) || defined(_M_ARM64)
     using enum IR::Opcode;
     static constexpr std::array unimplemented{
-        FPAbs16, FPMulAdd16, FPMulSub16, FPNeg16, FPRecipEstimate16, FPRecipExponent16,
-        FPRecipStepFused16, FPRoundInt16, FPRSqrtEstimate16, FPRSqrtStepFused16,
-        FPHalfToFixedS16, FPHalfToFixedS32, FPHalfToFixedS64, FPHalfToFixedU16, FPHalfToFixedU32,
-        FPHalfToFixedU64, FPVectorEqual16, FPVectorMulAdd16, FPVectorNeg16, FPVectorRecipEstimate16,
-        FPVectorRecipStepFused16, FPVectorRSqrtEstimate16, FPVectorRSqrtStepFused16,
-        FPVectorToSignedFixed16, FPVectorToUnsignedFixed16, SignedSaturatedAdd8,
-        SignedSaturatedAdd16, SignedSaturatedAdd32, SignedSaturatedAdd64,
-        SignedSaturatedDoublingMultiplyReturnHigh16, SignedSaturatedDoublingMultiplyReturnHigh32,
-        SignedSaturatedSub8, SignedSaturatedSub16, SignedSaturatedSub32, SignedSaturatedSub64,
-        UnsignedSaturatedAdd8, UnsignedSaturatedAdd16, UnsignedSaturatedAdd32,
-        UnsignedSaturatedAdd64, UnsignedSaturatedSub8, UnsignedSaturatedSub16,
-        UnsignedSaturatedSub32, UnsignedSaturatedSub64, SM4AccessSubstitutionBox, VectorEqual128,
-        VectorSignExtend64, VectorSignedMultiply16, VectorSignedMultiply32,
-        VectorUnsignedMultiply16, VectorUnsignedMultiply32,
+        FPRecipEstimate16, FPRecipExponent16, FPRecipStepFused16, FPRSqrtEstimate16,
+        FPRSqrtStepFused16, FPHalfToFixedS16, FPHalfToFixedU16, FPVectorEqual16, FPVectorMulAdd16,
+        FPVectorNeg16, FPVectorRecipEstimate16, FPVectorRecipStepFused16, FPVectorRSqrtEstimate16,
+        FPVectorRSqrtStepFused16, FPVectorToSignedFixed16, FPVectorToUnsignedFixed16,
+        SM4AccessSubstitutionBox, VectorEqual128, VectorSignExtend64, VectorSignedMultiply16,
+        VectorSignedMultiply32, VectorUnsignedMultiply16, VectorUnsignedMultiply32,
     };
+    static constexpr std::array needs_fp16{
+        FPMulAdd16, FPMulSub16, FPRoundInt16, FPHalfToFixedS32, FPHalfToFixedS64,
+        FPHalfToFixedU32, FPHalfToFixedU64,
+    };
+    static const bool has_fp16 = HostHasFP16();
     Optimization::Optimize(block, A64::UserConfig{}, {});
     return std::any_of(block.instructions.begin(), block.instructions.end(), [](const IR::Inst& inst) {
-        return std::find(unimplemented.begin(), unimplemented.end(), inst.GetOpcode()) !=
-               unimplemented.end();
+        const auto contains = [&inst](const auto& list) {
+            return std::find(list.begin(), list.end(), inst.GetOpcode()) != list.end();
+        };
+        return contains(unimplemented) || (!has_fp16 && contains(needs_fp16));
     });
 #else
     return false;
