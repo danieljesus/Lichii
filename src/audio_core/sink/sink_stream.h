@@ -87,6 +87,10 @@ public:
         failed = true;
     }
 
+    StreamType GetType() const {
+        return type;
+    }
+
     virtual bool TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples);
 
     /// Bound queued sysmix blocks; discard sinks use one to preserve the timer cadence.
