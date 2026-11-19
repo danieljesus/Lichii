@@ -11,6 +11,9 @@
 #include <sys/types.h>
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/sysctl.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #elif defined(__linux__)
 #include <sys/sysinfo.h>
 #else
@@ -228,6 +231,12 @@ std::optional<u64> GetSystemCommitRoom() {
         const u64 committed = performance.CommitTotal;
         return (committed < limit ? limit - committed : 0) * performance.PageSize;
     }
+#elif defined(__APPLE__)
+    // macOS has no commit limit: it compresses and swaps instead. Device memory is RAM there
+    // (unified memory), so what can still be handed out without paging is the room.
+    if (const u64 available = GetAvailablePhysicalMemory(); available != 0) {
+        return available;
+    }
 #endif
     return std::nullopt;
 }
@@ -257,6 +266,21 @@ u64 GetAvailablePhysicalMemory() {
     }
     std::fclose(file);
     return available_kib * 1024;
+#elif defined(__APPLE__)
+    // Free, inactive, purgeable and speculative pages: what the kernel hands out before it
+    // compresses or swaps.
+    static const mach_port_t host = mach_host_self();
+    vm_statistics64_data_t stats{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_size_t page_size{};
+    if (host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&stats), &count) !=
+            KERN_SUCCESS ||
+        host_page_size(host, &page_size) != KERN_SUCCESS) {
+        return 0;
+    }
+    return (u64{stats.free_count} + stats.inactive_count + stats.purgeable_count +
+            stats.speculative_count) *
+           page_size;
 #else
     return 0;
 #endif

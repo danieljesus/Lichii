@@ -50,13 +50,18 @@ TEST_CASE("The host memory bound does not wrap", "[video_core][texture_cache][ho
     REQUIRE(VideoCommon::HostCriticalMemory(max, max) == max - VideoCommon::HostCommitReserve);
 }
 
-TEST_CASE("The system's commit room is reported where there is a commit limit",
+TEST_CASE("The system's commit room is reported where the host can tell it",
           "[video_core][texture_cache][host_memory_limit]") {
     const std::optional<u64> room = Common::GetSystemCommitRoom();
 #ifdef _WIN32
     REQUIRE(room.has_value());
     const Common::ProcessMemoryUsage usage = Common::GetProcessMemoryUsage();
     REQUIRE(*room <= usage.system_commit_limit);
+#elif defined(__APPLE__)
+    // No commit limit on macOS: the physical memory it can hand out without paging.
+    REQUIRE(room.has_value());
+    REQUIRE(*room > 0);
+    REQUIRE(*room <= Common::GetMemInfo().TotalPhysicalMemory);
 #else
     REQUIRE_FALSE(room.has_value());
 #endif
