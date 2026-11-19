@@ -596,6 +596,10 @@ std::vector<std::string> ProfileManager::FindOrphanedProfiles()
                 return std::isxdigit(static_cast<unsigned char>(c)) != 0;
             };
             if (uuid.size() != 32 || !std::ranges::all_of(uuid, is_hex)) {
+                // Most often a title's save folder copied in one level too high: say where it is,
+                // as the game won't find it there.
+                LOG_WARNING(Service_ACC, "Ignoring {} in the user saves: not a user ID folder",
+                            Common::FS::PathToUTF8String(entry.path()));
                 return true;
             }
 
@@ -629,6 +633,10 @@ std::vector<std::string> ProfileManager::FindOrphanedProfiles()
             if (is_empty) {
                 std::error_code error;
                 fs::remove_all(entry, error);
+                if (error) {
+                    LOG_WARNING(Service_ACC, "Could not remove the empty profile folder {}: {}",
+                                Common::FS::PathToUTF8String(entry.path()), error.message());
+                }
                 return true;
             }
 
