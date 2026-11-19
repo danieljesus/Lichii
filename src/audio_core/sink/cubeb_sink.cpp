@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "audio_core/common/common.h"
 #include "audio_core/sink/cubeb_sink.h"
 #include "audio_core/sink/sink_stream.h"
+#include "audio_core/sink/stream_standby.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
@@ -20,9 +22,10 @@
 
 namespace AudioCore::Sink {
 /**
- * Cubeb sink stream, responsible for sinking samples to hardware.
+ * Cubeb sink stream, responsible for sinking samples to hardware. Stands in for its device when
+ * cubeb gives up on it (see StandbySinkStream).
  */
-class CubebSinkStream final : public SinkStream {
+class CubebSinkStream final : public StandbySinkStream {
 public:
     /**
      * Create a new sink stream.
@@ -30,17 +33,15 @@ public:
      * @param ctx_             - Cubeb context to create this stream with.
      * @param device_channels_ - Number of channels supported by the hardware.
      * @param system_channels_ - Number of channels the audio systems expect.
-     * @param output_device    - Cubeb output device id.
-     * @param input_device     - Cubeb input device id.
+     * @param device_name_     - Friendly name of the configured device, empty for the default.
      * @param name_            - Name of this stream.
      * @param type_            - Type of this stream.
      * @param system_          - Core system.
-     * @param event            - Event used only for audio renderer, signalled on buffer consume.
      */
     CubebSinkStream(cubeb* ctx_, u32 device_channels_, u32 system_channels_,
-                    cubeb_devid output_device, cubeb_devid input_device, const std::string& name_,
-                    StreamType type_, Core::System& system_)
-        : SinkStream(system_, type_), ctx{ctx_} {
+                    std::string device_name_, const std::string& name_, StreamType type_,
+                    Core::System& system_)
+        : StandbySinkStream(system_, type_), ctx{ctx_}, device_name{std::move(device_name_)} {
 #ifdef _WIN32
         com_init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 #endif
@@ -52,7 +53,6 @@ public:
             return;
         }
 
-        cubeb_stream_params params{};
         params.rate = TargetSampleRate;
         params.channels = device_channels;
         params.format = CUBEB_SAMPLE_S16LE;
@@ -76,30 +76,14 @@ public:
             minimum_latency = TargetSampleCount * 2;
         }
 
-        minimum_latency = (std::max)(minimum_latency, TargetSampleCount * 2);
+        latency = (std::max)(minimum_latency, TargetSampleCount * 2);
 
         LOG_INFO(Service_Audio,
                  "Opening cubeb stream {} type {} with: rate {} channels {} (system channels {}) "
                  "latency {}",
-                 name, type, params.rate, params.channels, system_channels, minimum_latency);
+                 name, type, params.rate, params.channels, system_channels, latency);
 
-        auto init_error{0};
-        if (type == StreamType::In) {
-            init_error = cubeb_stream_init(ctx, &stream_backend, name.c_str(), input_device,
-                                           &params, output_device, nullptr, minimum_latency,
-                                           &CubebSinkStream::DataCallback,
-                                           &CubebSinkStream::StateCallback, this);
-        } else {
-            init_error = cubeb_stream_init(ctx, &stream_backend, name.c_str(), input_device,
-                                           nullptr, output_device, &params, minimum_latency,
-                                           &CubebSinkStream::DataCallback,
-                                           &CubebSinkStream::StateCallback, this);
-        }
-
-        if (init_error != CUBEB_OK) {
-            LOG_CRITICAL(Audio_Sink, "Error initializing cubeb stream, error: {}", init_error);
-            return;
-        }
+        OpenInitialBackend();
     }
 
     /**
@@ -108,9 +92,8 @@ public:
     ~CubebSinkStream() override {
         LOG_DEBUG(Service_Audio, "Destructing cubeb stream {}", name);
 
-        if (ctx) {
-            Finalize();
-        }
+        // Joins the standby worker, which calls the hooks below.
+        Finalize();
 
 #ifdef _WIN32
         if (SUCCEEDED(com_init_result)) {
@@ -119,57 +102,95 @@ public:
 #endif
     }
 
-    /**
-     * Finalize the sink stream.
-     */
-    void Finalize() override {
-        if (!stream_backend) {
-            return;
-        }
-        Stop();
-        cubeb_stream_destroy(stream_backend);
-        stream_backend = nullptr;
-    }
-
-    bool IsReady() const override {
-        return stream_backend != nullptr && !failed;
-    }
-
-    /**
-     * Start the sink stream.
-     *
-     * @param resume - Set to true if this is resuming the stream a previously-active stream.
-     *                 Default false.
-     */
-    void Start(bool resume = false) override {
-        if (!IsReady() || !paused) {
-            return;
-        }
-
-        if (cubeb_stream_start(stream_backend) != CUBEB_OK) {
-            failed = true;
-            LOG_CRITICAL(Audio_Sink, "Error starting cubeb stream");
-            return;
-        }
-        paused = false;
-    }
-
-    /**
-     * Stop the sink stream.
-     */
-    void Stop() override {
-        if (!stream_backend || paused) {
-            return;
-        }
-
-        SignalPause();
-        if (cubeb_stream_stop(stream_backend) != CUBEB_OK) {
-            failed = true;
-            LOG_CRITICAL(Audio_Sink, "Error stopping cubeb stream");
-        }
-    }
-
 private:
+    /// Open on the configured device, or on the default one when none is configured or it is not
+    /// listed. A stream that was on the configured device waits ConfiguredDeviceAttempts reopens
+    /// for it to come back, then also tries the default one, but still takes the configured one
+    /// when it is listed and opens. The device is looked up by name at each open, and its id used
+    /// only while the enumeration that gave it is alive.
+    void* OpenBackend(u32 attempt) override {
+        const bool configured = !device_name.empty();
+        cubeb_device_collection collection{};
+        const bool enumerated =
+            configured && cubeb_enumerate_devices(ctx,
+                                                  type == StreamType::In ? CUBEB_DEVICE_TYPE_INPUT
+                                                                         : CUBEB_DEVICE_TYPE_OUTPUT,
+                                                  &collection) == CUBEB_OK;
+        SCOPE_EXIT {
+            if (enumerated) {
+                cubeb_device_collection_destroy(ctx, &collection);
+            }
+        };
+        if (configured && !enumerated && attempt == 0) {
+            LOG_WARNING(Audio_Sink, "Audio device enumeration not supported");
+        }
+        cubeb_devid device{};
+        for (size_t i = 0; enumerated && i < collection.count; ++i) {
+            const cubeb_device_info& info = collection.device[i];
+            if (info.friendly_name && device_name == info.friendly_name &&
+                info.state == CUBEB_DEVICE_STATE_ENABLED) {
+                device = info.devid;
+                break;
+            }
+        }
+        const bool may_fall_back = attempt == 0 || attempt > ConfiguredDeviceAttempts;
+        // Not listed, or the enumeration failed while devices come and go.
+        if (!device && opened_on_configured && !may_fall_back) {
+            LOG_DEBUG(Audio_Sink, "Cubeb stream {}: {} is not back yet", name, device_name);
+            return nullptr;
+        }
+        if (opened_on_configured && attempt == ConfiguredDeviceAttempts + 1) {
+            LOG_WARNING(Audio_Sink, "Cubeb stream {}: {} has not come back, trying the default too",
+                        name, device_name);
+        }
+        int error{};
+        cubeb_stream* opened = Init(device, error);
+        if (!opened && device && (may_fall_back || !opened_on_configured)) {
+            // Listed, but it does not open, and nothing waits for it: the default one, then.
+            device = nullptr;
+            opened = Init(device, error);
+        }
+        if (!opened) {
+            if (attempt == 0) {
+                LOG_ERROR(Audio_Sink, "Error initializing cubeb stream {}, error: {}", name, error);
+            } else {
+                LOG_DEBUG(Audio_Sink, "Cubeb stream {} could not reopen yet, error {}", name,
+                          error);
+            }
+            return nullptr;
+        }
+        opened_on_configured = device != nullptr;
+        return opened;
+    }
+
+    cubeb_stream* Init(cubeb_devid device, int& error) {
+        cubeb_stream* opened{};
+        if (type == StreamType::In) {
+            error = cubeb_stream_init(ctx, &opened, name.c_str(), device, &params, nullptr, nullptr,
+                                      latency, &CubebSinkStream::DataCallback,
+                                      &CubebSinkStream::StateCallback, this);
+        } else {
+            error = cubeb_stream_init(ctx, &opened, name.c_str(), nullptr, nullptr, device, &params,
+                                      latency, &CubebSinkStream::DataCallback,
+                                      &CubebSinkStream::StateCallback, this);
+        }
+        return error == CUBEB_OK ? opened : nullptr;
+    }
+
+    bool StartBackend(void* backend) override {
+        return cubeb_stream_start(static_cast<cubeb_stream*>(backend)) == CUBEB_OK;
+    }
+
+    bool StopBackend(void* backend) override {
+        return cubeb_stream_stop(static_cast<cubeb_stream*>(backend)) == CUBEB_OK;
+    }
+
+    /// cubeb requires a stop before the destroy; harmless on a stream not started or lost.
+    void DestroyBackend(void* backend) override {
+        cubeb_stream_stop(static_cast<cubeb_stream*>(backend));
+        cubeb_stream_destroy(static_cast<cubeb_stream*>(backend));
+    }
+
     /**
      * Main callback from Cubeb. Either expects samples from us (audio render/audio out), or will
      * provide samples to be copied (audio in).
@@ -205,29 +226,41 @@ private:
     }
 
     /**
-     * Cubeb callback for if a device state changes. Unused currently.
+     * Cubeb callback for if a device state changes.
+     *
+     * An error is cubeb giving up on the device, such as when it was unplugged while the system
+     * had no default device to move the stream to. It does not retry, so the stream reopens it,
+     * standing in meanwhile if it is a renderer or audio out stream (see StandbySinkStream).
      *
      * @param stream      - Cubeb-specific data about the stream.
      * @param user_data   - Custom data pointer passed along, points to a CubebSinkStream.
      * @param state       - New state of the device.
      */
     static void StateCallback(cubeb_stream*, void* user_data, cubeb_state state) {
+        auto* const impl = static_cast<CubebSinkStream*>(user_data);
         if (state == CUBEB_STATE_ERROR) {
-            static_cast<CubebSinkStream*>(user_data)->MarkFaulted();
+            impl->BackendLost();
+            return;
         }
+        LOG_DEBUG(Audio_Sink, "Cubeb stream {} state {}", impl->name, static_cast<int>(state));
     }
 
     /// Main Cubeb context
     cubeb* ctx{};
-    /// Cubeb stream backend
-    cubeb_stream* stream_backend{};
+    /// Friendly name of the configured device; empty follows the system default
+    std::string device_name;
+    cubeb_stream_params params{};
+    u32 latency{};
+    /// Whether the backend last opened on the configured device. Only OpenBackend uses it, on the
+    /// constructing thread and then on the standby worker.
+    bool opened_on_configured{};
 #ifdef _WIN32
     /// Result of this stream's COM initialization, balanced only when it succeeded
     HRESULT com_init_result{};
 #endif
 };
 
-/// Resolve enabled input and output devices independently, using defaults when unspecified.
+/// Streams open on the device named in the settings, or on the defaults when unspecified.
 CubebSink::CubebSink(std::string_view target_device_name) {
     // Cubeb requires COM to be initialized on the thread calling cubeb_init on Windows
 #ifdef _WIN32
@@ -239,28 +272,10 @@ CubebSink::CubebSink(std::string_view target_device_name) {
         return;
     }
 
+    // Looked up by name at each stream open: a cubeb device id is only valid with the
+    // enumeration that returned it.
     if (target_device_name != auto_device_name && !target_device_name.empty()) {
-        cubeb_device_collection collection;
-        if (cubeb_enumerate_devices(ctx, static_cast<cubeb_device_type>(
-                                            CUBEB_DEVICE_TYPE_INPUT | CUBEB_DEVICE_TYPE_OUTPUT),
-                                    &collection) != CUBEB_OK) {
-            LOG_WARNING(Audio_Sink, "Audio device enumeration not supported");
-        } else {
-            for (size_t i = 0; i < collection.count; ++i) {
-                const auto& device = collection.device[i];
-                if (!device.friendly_name || target_device_name != device.friendly_name ||
-                    device.state != CUBEB_DEVICE_STATE_ENABLED) {
-                    continue;
-                }
-                if (device.type & CUBEB_DEVICE_TYPE_INPUT) {
-                    input_device = device.devid;
-                }
-                if (device.type & CUBEB_DEVICE_TYPE_OUTPUT) {
-                    output_device = device.devid;
-                }
-            }
-            cubeb_device_collection_destroy(ctx, &collection);
-        }
+        device_name = target_device_name;
     }
 
     cubeb_get_max_channel_count(ctx, &device_channels);
@@ -285,14 +300,13 @@ CubebSink::~CubebSink() {
 #endif
 }
 
-/// Open a unidirectional stream with only its matching device ID and channel layout.
+/// Open a unidirectional stream on the configured device and with its channel layout.
 SinkStream* CubebSink::AcquireSinkStream(Core::System& system, u32 system_channels_,
                                          const std::string& name, StreamType type) {
     system_channels = system_channels_;
-    SinkStreamPtr& stream = sink_streams.emplace_back(std::make_unique<CubebSinkStream>(
-        ctx, type == StreamType::In ? 2U : device_channels, system_channels,
-        type == StreamType::In ? nullptr : output_device,
-        type == StreamType::In ? input_device : nullptr, name, type, system));
+    SinkStreamPtr& stream = sink_streams.emplace_back(
+        std::make_unique<CubebSinkStream>(ctx, type == StreamType::In ? 2U : device_channels,
+                                          system_channels, device_name, name, type, system));
     stream->SetDeviceVolume(device_volume);
 
     return stream.get();
