@@ -120,6 +120,22 @@ struct Profile {
     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
     bool has_broken_spirv_subgroup_shuffle{};
     bool has_broken_spirv_fragment_shuffle{};
+    /// Converting f32 to f16 rounds to nearest even and keeps f16 subnormals without any execution
+    /// mode, whatever the device reports in its float controls (Apple GPUs: MoltenVK reports no
+    /// fp16 denorm preservation, but Metal's conversion keeps them)
+    bool fp16_conversion_rounds_rte_with_denorms{};
+    /// Subgroup shuffles with a per-lane index are slow (Apple GPUs through MoltenVK): the software
+    /// HMMA exchanges its fragments through shared memory instead
+    bool has_slow_dynamic_shuffle{};
+    /// A compute pipeline can require full subgroups (VK_EXT_subgroup_size_control)
+    bool support_compute_full_subgroups{};
+    /// Compute subgroups are guest warps, 32 lanes: a required subgroup size of 32 is supported in
+    /// compute, the device only has 32-lane subgroups, or it is an Apple GPU, which runs compute in
+    /// 32-wide SIMD groups although MoltenVK reports a minimum subgroup size of 4 and no required
+    /// size. Measured on an M6 (threadExecutionWidth 32, threads_per_simdgroup 32 and
+    /// simdgroup_index_in_threadgroup tid / 32 for threadgroups of 64 to 256) and assumed for other
+    /// Apple GPUs. Were it wrong, the software HMMA's per-subgroup slots would overlap.
+    bool compute_subgroups_are_guest_warps{};
     /// The guest's HMMA.16816.F16 runs on a cooperative matrix, in compute shaders
     bool support_cooperative_hmma{};
     /// Without the above, HMMA runs on 16x16x16 cooperative matrices through shared memory
