@@ -17,11 +17,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#if defined(__APPLE__) && defined(__aarch64__)
-#include <sys/sysctl.h>
-#elif defined(__linux__) && defined(__aarch64__)
-#include <sys/auxv.h>
-#endif
 #if defined(__linux__) && defined(__x86_64__)
 #include <spawn.h>
 #include <sys/mman.h>
@@ -30,6 +25,7 @@ extern char** environ;
 #endif
 
 #include "common/common_types.h"
+#include "tests/core/host_cpu_features.h"
 
 // dynarmic's internal headers are written for dynarmic's own warning flags. This test pulls them
 // into a target built with the project's -Werror=shadow, which they do not pass on GCC.
@@ -179,21 +175,6 @@ std::vector<Encoding> TestableEncodings() {
     return result;
 }
 
-#if defined(__aarch64__) || defined(_M_ARM64)
-/// FEAT_FP16, which the arm64 backend's scalar half-precision emitters need.
-bool HostHasFP16() {
-#if defined(__APPLE__)
-    int value = 0;
-    size_t size = sizeof(value);
-    return sysctlbyname("hw.optional.arm.FEAT_FP16", &value, &size, nullptr, 0) == 0 && value != 0;
-#elif defined(__linux__)
-    return (getauxval(AT_HWCAP) & (1UL << 10)) != 0;  // HWCAP_FPHP
-#else
-    return false;
-#endif
-}
-#endif
-
 /// The arm64 backend asserts on these opcodes (UNREACHABLE emitters), so an arm64 host skips
 /// the instructions that still use them after the passes the JIT runs. The scalar half-precision
 /// ones need FEAT_FP16 on the host.
@@ -212,7 +193,7 @@ bool UnimplementedOnHost([[maybe_unused]] IR::Block& block) {
         FPMulAdd16, FPMulSub16, FPRoundInt16, FPHalfToFixedS32, FPHalfToFixedS64,
         FPHalfToFixedU32, FPHalfToFixedU64,
     };
-    static const bool has_fp16 = HostHasFP16();
+    static const bool has_fp16 = Tests::HostHasScalarFP16();
     Optimization::Optimize(block, A64::UserConfig{}, {});
     return std::any_of(block.instructions.begin(), block.instructions.end(), [](const IR::Inst& inst) {
         const auto contains = [&inst](const auto& list) {

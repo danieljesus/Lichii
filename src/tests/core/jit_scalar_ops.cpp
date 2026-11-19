@@ -18,6 +18,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/common_types.h"
+#include "tests/core/host_cpu_features.h"
 
 #ifdef __GNUC__
 #pragma GCC diagnostic push
@@ -200,9 +201,13 @@ void CheckSaturating(ScalarRunner& runner, u32 base, Op op) {
     for (int i = 0; i < 4000; ++i) {
         u64 a = Random() & Mask<T>();
         u64 b = Random() & Mask<T>();
-        // Push half of them to the limits, where they saturate.
+        // Push half of them to the limits, where they saturate: within 3 of the maximum or the
+        // minimum (computed in u64, which wraps where T would overflow).
         if (i % 2 == 0) {
-            a = static_cast<u64>(static_cast<T>((i & 4) ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min()) - static_cast<T>(Random() & 3)) & Mask<T>();
+            const u64 r = Random() & 3;
+            a = ((i & 4) ? static_cast<u64>(std::numeric_limits<T>::max()) - r
+                         : static_cast<u64>(std::numeric_limits<T>::min()) + r) &
+                Mask<T>();
         }
         bool saturated = false;
         const T expected = op(static_cast<T>(a), static_cast<T>(b), saturated);
@@ -291,6 +296,11 @@ TEST_CASE("JIT: scalar SQDMULH matches the reference", "[jit][scalar_ops]") {
 }
 
 TEST_CASE("JIT: half-precision scalar arithmetic matches the reference", "[jit][scalar_ops][fp16]") {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (!Tests::HostHasScalarFP16()) {
+        SKIP("No FEAT_FP16: the arm64 backend's scalar half-precision emitters would assert");
+    }
+#endif
     ScalarRunner runner;
     for (int i = 0; i < 20000; ++i) {
         const u16 a = RandomHalf();
@@ -354,6 +364,11 @@ TEST_CASE("JIT: half-precision scalar arithmetic matches the reference", "[jit][
 }
 
 TEST_CASE("JIT: half-precision to integer and fixed point matches the reference", "[jit][scalar_ops][fp16]") {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (!Tests::HostHasScalarFP16()) {
+        SKIP("No FEAT_FP16: the arm64 backend's scalar half-precision emitters would assert");
+    }
+#endif
     ScalarRunner runner;
     struct ConvertCase {
         u32 base;
