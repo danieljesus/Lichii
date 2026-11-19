@@ -11,6 +11,9 @@
 #include <sys/types.h>
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/sysctl.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #elif defined(__linux__)
 #include <sys/sysinfo.h>
 #else
@@ -259,6 +262,39 @@ u64 GetAvailablePhysicalMemory() {
     return available_kib * 1024;
 #else
     return 0;
+#endif
+}
+
+std::optional<HostPageCounts> GetHostPageCounts() {
+#ifdef __APPLE__
+    static const mach_port_t host = mach_host_self();
+    vm_statistics64_data_t stats{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&stats), &count) !=
+        KERN_SUCCESS) {
+        return std::nullopt;
+    }
+    return HostPageCounts{
+        .free = stats.free_count,
+        .external = stats.external_page_count,
+        .page_size = vm_kernel_page_size,
+    };
+#else
+    return std::nullopt;
+#endif
+}
+
+std::optional<HostMemoryRoom> GetHostMemoryRoom() {
+#ifdef __APPLE__
+    if (const std::optional<HostPageCounts> counts = GetHostPageCounts()) {
+        return HostMemoryRoom{.bytes = counts->Room(), .instantaneous = true};
+    }
+    return std::nullopt;
+#else
+    if (const std::optional<u64> room = GetSystemCommitRoom()) {
+        return HostMemoryRoom{.bytes = *room, .instantaneous = false};
+    }
+    return std::nullopt;
 #endif
 }
 

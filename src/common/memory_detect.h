@@ -65,6 +65,38 @@ struct ProcessMemoryUsage {
 /// Physical memory the host can hand out now without paging anything out (0 when unknown).
 [[nodiscard]] u64 GetAvailablePhysicalMemory();
 
+/// macOS page counts (host_statistics64), in pages of `page_size` bytes (vm_kernel_page_size,
+/// which a translated process also gets right; host_page_size says 4 KiB there).
+struct HostPageCounts {
+    u64 free;     ///< free_count, which includes the speculative pages
+    u64 external; ///< File-backed pages, which the kernel drops without writing them anywhere
+    u64 page_size;
+
+    /// What the kernel can hand out without compressing or swapping anything. Not inactive pages:
+    /// the anonymous ones among them are only reclaimed by compressing or swapping them. Not
+    /// purgeable pages, already among the active and inactive ones.
+    [[nodiscard]] constexpr u64 Room() const {
+        return (free + external) * page_size;
+    }
+};
+
+/// The counts above on macOS; no value elsewhere.
+[[nodiscard]] std::optional<HostPageCounts> GetHostPageCounts();
+
+/// Memory the host has room for before it runs short, for HostCriticalMemory. Its meaning depends
+/// on the host, as each runs short in its own way:
+/// - Windows: the commit left (GetSystemCommitRoom). Device memory is charged to the commit limit.
+/// - macOS: the RAM it can hand out without paging (HostPageCounts::Room). It has no commit limit
+///   and compresses and swaps instead; device memory is RAM (unified memory). This follows free
+///   memory as it is now, so `instantaneous` is set.
+/// No value elsewhere.
+struct HostMemoryRoom {
+    u64 bytes;
+    /// The figure follows free memory from moment to moment (see SmoothHostRoom).
+    bool instantaneous;
+};
+[[nodiscard]] std::optional<HostMemoryRoom> GetHostMemoryRoom();
+
 /// Whether the host is short of RAM: less than a quarter of it, and less than 4 GiB, free.
 [[nodiscard]] constexpr bool IsLowOnMemory(u64 available, u64 total) {
     return available != 0 && available < (std::min<u64>)(total / 4, u64{4} << 30);

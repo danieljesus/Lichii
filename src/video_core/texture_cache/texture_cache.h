@@ -1413,10 +1413,17 @@ void TextureCache<P>::TickFrame() {
                     critical_memory = budget - (std::min)(reserved, budget / 2);
                     // The device's budget is not all the room there is: see HostCriticalMemory.
                     // The usage is the driver's, which still counts images waiting to be freed.
-                    const std::optional<u64> commit_room = Common::GetSystemCommitRoom();
+                    std::optional<u64> host_room;
+                    if (const auto room = Common::GetHostMemoryRoom()) {
+                        host_room = room->bytes;
+                        if (room->instantaneous) {
+                            smoothed_host_room = SmoothHostRoom(smoothed_host_room, room->bytes);
+                            host_room = smoothed_host_room;
+                        }
+                    }
                     const u64 host_critical =
-                        commit_room
-                            ? HostCriticalMemory(runtime.GetDeviceMemoryUsage(), *commit_room)
+                        host_room
+                            ? HostCriticalMemory(runtime.GetDeviceMemoryUsage(), *host_room)
                             : (std::numeric_limits<u64>::max)();
                     critical_memory = (std::min)(critical_memory, host_critical);
                     retention_budget = RetentionBudget(retention_budget, budget);
@@ -1491,9 +1498,9 @@ void TextureCache<P>::TickFrame() {
                                  margin >> 20, pressure_margin >> 20, spill_margin >> 20,
                                  slack_margin >> 20, other_memory >> 20, budget >> 20,
                                  retention_limit >> 20, retention_budget >> 20);
-                        if (commit_room) {
-                            LOG_INFO(HW_GPU, "Host memory: {} MiB of commit left, {}",
-                                     *commit_room >> 20,
+                        if (host_room) {
+                            LOG_INFO(HW_GPU, "Host memory: {} MiB of room left, {}",
+                                     *host_room >> 20,
                                      critical_memory == host_critical
                                          ? "which bounds the thresholds"
                                          : "the device budget bounds the thresholds");
