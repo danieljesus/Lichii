@@ -13,8 +13,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #if defined(__linux__) || defined(__APPLE__)
+#include <cstdlib>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
+#ifdef __linux__
+#include <spawn.h>
+#include <sys/wait.h>
+extern char** environ;
 #endif
 
 #include "common/common_types.h"
@@ -111,8 +117,30 @@ TEST_CASE("JIT: a block linked to another follows the target when it is recompil
 
 #if defined(__linux__) || defined(__APPLE__)
 
-TEST_CASE("JIT: a fastmem fault resumes at the access that faulted, among several in a block",
-          "[jit][jit_block_links]") {
+constexpr const char* FaultTestName =
+    "JIT: a fastmem fault resumes at the access that faulted among several in a block";
+constexpr const char* FaultChildVariable = "LICHII_JIT_BLOCK_LINKS_FAULT_CHILD";
+
+TEST_CASE(FaultTestName, "[jit][jit_block_links]") {
+#ifdef __linux__
+    if (!std::getenv(FaultChildVariable)) {
+        // dynarmic installs its SIGSEGV handler once per process, and Catch replaces the process's
+        // handler around each test case: after another case made a JIT, the fault would reach
+        // Catch. Run this one in a fresh process, as "JIT codegen options: fastmem faults" does.
+        char* argv[] = {const_cast<char*>("/proc/self/exe"), const_cast<char*>(FaultTestName),
+                        nullptr};
+        REQUIRE(setenv(FaultChildVariable, "1", 1) == 0);
+        pid_t pid{};
+        const int spawned = posix_spawn(&pid, "/proc/self/exe", nullptr, nullptr, argv, environ);
+        unsetenv(FaultChildVariable);
+        REQUIRE(spawned == 0);
+        int status = 0;
+        REQUIRE(waitpid(pid, &status, 0) == pid);
+        REQUIRE(WIFEXITED(status));
+        REQUIRE(WEXITSTATUS(status) == 0);
+        return;
+    }
+#endif
     const long page = sysconf(_SC_PAGESIZE);
     REQUIRE(page > 0);
     const size_t page_size = static_cast<size_t>(page);
