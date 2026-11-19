@@ -674,8 +674,11 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     const std::optional<u32> tensor_scratch_word{ReserveCooperativeHmmaScratch(profile, program)};
     const bool cooperative_hmma{tensor_scratch_word.has_value() ||
                                 UsesCooperativeHmma(profile, program)};
+    const std::optional<u32> software_hmma_scratch_word{
+        cooperative_hmma ? std::nullopt : ReserveSoftwareHmmaScratch(profile, program)};
     EmitContext ctx{profile, runtime_info, program, bindings, cooperative_hmma};
     ctx.tensor_scratch_word = tensor_scratch_word;
+    ctx.software_hmma_scratch_word = software_hmma_scratch_word;
     DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program, ctx, main);

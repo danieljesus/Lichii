@@ -847,3 +847,36 @@ TEST_CASE("Native matrix lowering selects compact software helpers without legac
     code[0].words[0] += 1U << 24;
     REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
 }
+
+TEST_CASE("Software HMMA exchanges fragments through shared memory where shuffles are slow",
+          "[video_core][tensor][ampere]") {
+    constexpr u32 OpGroupNonUniformShuffle = 345;
+    constexpr u32 OpDecorate = 71;
+    constexpr u32 OpControlBarrier = 224;
+    constexpr u32 DecorationBuiltIn = 11;
+    constexpr u32 BuiltInSubgroupId = 40;
+    for (const u32 depth : {8U, 16U}) {
+        TensorProgram shuffled{1, depth};
+        const auto reference = shuffled.Emit();
+        REQUIRE_FALSE(Instructions(reference, OpGroupNonUniformShuffle).empty());
+
+        TensorProgram staged{1, depth};
+        staged.profile.has_slow_dynamic_shuffle = true;
+        const auto code = staged.Emit(depth == 8 ? "software-staged-k8" : "software-staged-k16");
+        // Six words a lane for each warp of the 64-invocation workgroup.
+        REQUIRE(staged.program.shared_memory_size == 2 * 32 * 6 * 4);
+        REQUIRE(Instructions(code, OpGroupNonUniformShuffle).empty());
+        REQUIRE(std::ranges::any_of(Instructions(code, OpDecorate), [](const auto& words) {
+            return words.size() == 3 && words[1] == DecorationBuiltIn &&
+                   words[2] == BuiltInSubgroupId;
+        }));
+        // One barrier after the warp writes its words, one before the next HMMA writes again.
+        REQUIRE(Instructions(code, OpControlBarrier).size() == 2);
+    }
+    // A workgroup that is not whole warps keeps the shuffles.
+    TensorProgram partial{1, 16};
+    partial.program.workgroup_size = {48, 1, 1};
+    partial.profile.has_slow_dynamic_shuffle = true;
+    REQUIRE_FALSE(Instructions(partial.Emit(), OpGroupNonUniformShuffle).empty());
+    REQUIRE(partial.program.shared_memory_size == 0);
+}
