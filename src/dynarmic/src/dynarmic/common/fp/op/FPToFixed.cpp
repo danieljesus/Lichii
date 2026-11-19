@@ -40,13 +40,16 @@ u64 FPToFixed(size_t ibits, FPT op, size_t fbits, bool unsigned_, FPCR fpcr, Rou
         return 0;
     }
 
-    if (sign && unsigned_) {
+    // value *= 2.0^fbits and reshift the decimal point back to bit zero.
+    int exponent = value.exponent + static_cast<int>(fbits) - normalized_point_position;
+
+    // A negative value this large (2^62 or more after scaling) is below the unsigned range whatever
+    // the rounding, and shifting it below would overflow. Smaller ones, from -1 down, are caught
+    // after rounding.
+    if (sign && unsigned_ && exponent >= 0) {
         FPProcessException(FPExc::InvalidOp, fpcr, fpsr);
         return 0;
     }
-
-    // value *= 2.0^fbits and reshift the decimal point back to bit zero.
-    int exponent = value.exponent + static_cast<int>(fbits) - normalized_point_position;
 
     u64 int_result = sign ? Safe::Negate<u64>(value.mantissa) : static_cast<u64>(value.mantissa);
     const ResidualError error = ResidualErrorOnRightShift(int_result, -exponent);
@@ -75,6 +78,13 @@ u64 FPToFixed(size_t ibits, FPT op, size_t fbits, bool unsigned_, FPCR fpcr, Rou
 
     if (round_up) {
         int_result++;
+    }
+
+    // As in Arm's FPToFixed, a negative value is out of the unsigned range only if it rounds
+    // below zero. One that rounds to zero gives 0 and is inexact, as it is not zero itself.
+    if (sign && unsigned_) {
+        FPProcessException(int_result == 0 ? FPExc::Inexact : FPExc::InvalidOp, fpcr, fpsr);
+        return 0;
     }
 
     // Detect Overflow
