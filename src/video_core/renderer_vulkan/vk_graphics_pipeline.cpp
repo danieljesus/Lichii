@@ -1677,6 +1677,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
         });
     }
+    { // TEMP: EDEN_TMP_FORCE_SPLIT=k ends the active pass before every k-th draw (same FB reopens)
+        static const u32 temp_k = [] {
+            const char* v = std::getenv("EDEN_TMP_FORCE_SPLIT");
+            return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0U;
+        }();
+        static u32 temp_count = 0;
+        if (temp_k != 0 && ++temp_count % temp_k == 0 && scheduler.IsRenderPassActive()) {
+            scheduler.RequestOutsideRenderPassOperationContext();
+        }
+    }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (writes_storage) {
         scheduler.NoteRenderPassStores();
