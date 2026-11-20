@@ -90,4 +90,28 @@ struct AttachmentlessState {
     };
 }
 
+/// The size an attachment-less pass's framebuffer gets on an update of the render targets, from
+/// `full` (the surface clip's) and `needed` (what this call needs: AttachmentlessRenderArea for a
+/// draw its scissors bound, `full` for anything else, such as a clear or DrawTexture).
+///
+/// Without the cut (`cut` false, a host that does not pay for the render area) it is what it
+/// always was: the full size when the targets changed, the current one otherwise. With it, the
+/// size follows what is needed when the targets changed and only grows while they do not: no call
+/// gets a framebuffer smaller than it needs, and draws that need different sizes cost one growth,
+/// not a new framebuffer and render pass each.
+[[nodiscard]] constexpr Extent2D NextAttachmentlessSize(bool cut, bool targets_changed,
+                                                        Extent2D current, Extent2D full,
+                                                        Extent2D needed) {
+    if (!cut) {
+        return targets_changed ? full : current;
+    }
+    if (targets_changed) {
+        return needed;
+    }
+    return Extent2D{
+        .width = (std::max)(current.width, needed.width),
+        .height = (std::max)(current.height, needed.height),
+    };
+}
+
 } // namespace VideoCommon

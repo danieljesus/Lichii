@@ -1332,10 +1332,15 @@ FN_MAX_LIMIT_LIST
     /// one too through Mesa's shader cache, unless it is disabled.
     bool DriverCachesPipelines() const noexcept;
 
-    /// Whether the GPU pays for a render pass's area even where nothing is drawn: Apple's tiled
-    /// GPUs through MoltenVK (PCI vendor ID 0x106B, not Intel or AMD GPUs in a Mac).
+    /// Apple's PCI vendor ID, which its own GPUs report (not Intel or AMD GPUs in a Mac).
+    static constexpr u32 VendorApple = 0x106B;
+
+    /// Whether the GPU pays for a render pass's area even where nothing is drawn: Apple's GPUs
+    /// through MoltenVK. Narrower than IsTiler on purpose: only measured there (a 1x1 draw in a
+    /// 32768x32768 pass, 2.7 ms on an M6), and the other tilers' drivers may bound the area
+    /// themselves.
     bool HasRenderAreaCost() const noexcept {
-        return IsMoltenVK() && GetVendorID() == 0x106B;
+        return IsMoltenVK() && GetVendorID() == VendorApple;
     }
 
     bool IsMoltenVK() const noexcept {

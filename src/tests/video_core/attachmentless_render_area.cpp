@@ -119,3 +119,56 @@ TEST_CASE("A pass without attachments covers its host scissors at every scale",
         }
     }
 }
+
+TEST_CASE("A pass without attachments is cut to the largest scissor at a non-native scale",
+          "[video_core][texture_cache][render_area]") {
+    // 1.5x (3 >> 1): each scissor ends at its scaled offset plus scaled extent.
+    const AttachmentlessState state{{49152, 49152}, false, true, 3, 1};
+    std::array<GuestScissor, 3> scissors{{
+        {true, 0, 1, 0, 1},
+        {true, 10, 101, 0, 20},
+        {true, 0, 40, 33, 300},
+    }};
+    const auto end = [](u32 min, u32 max) {
+        return static_cast<u32>(ScaleScissorCoordinate(static_cast<s32>(min), 3, 1) +
+                                ScaleScissorCoordinate(static_cast<s32>(max - min), 3, 1));
+    };
+    REQUIRE(end(10, 101) == 151);
+    REQUIRE(end(33, 300) == 449);
+    REQUIRE(AttachmentlessRenderArea(state, scissors) == Extent2D{256, 512});
+}
+
+TEST_CASE("An attachment-less framebuffer only grows while its targets stay",
+          "[video_core][texture_cache][render_area]") {
+    using VideoCommon::NextAttachmentlessSize;
+    constexpr Extent2D one{1, 1};
+    constexpr Extent2D wide{512, 2};
+    SECTION("Without the cut it is what it always was") {
+        for (const Extent2D current : {one, wide, Max}) {
+            for (const Extent2D needed : {one, wide, Max}) {
+                REQUIRE(NextAttachmentlessSize(false, true, current, Max, needed) == Max);
+                REQUIRE(NextAttachmentlessSize(false, false, current, Max, needed) == current);
+            }
+        }
+    }
+    SECTION("New targets take what the call needs") {
+        REQUIRE(NextAttachmentlessSize(true, true, Max, Max, one) == one);
+        // A clear or DrawTexture needs the full clip.
+        REQUIRE(NextAttachmentlessSize(true, true, one, Max, Max) == Max);
+    }
+    SECTION("The same targets grow, never shrink") {
+        REQUIRE(NextAttachmentlessSize(true, false, one, Max, one) == one);
+        REQUIRE(NextAttachmentlessSize(true, false, one, Max, wide) == wide);
+        REQUIRE(NextAttachmentlessSize(true, false, wide, Max, one) == wide);
+        REQUIRE(NextAttachmentlessSize(true, false, Extent2D{2, 512}, Max, wide) ==
+                Extent2D{512, 512});
+        // A widened scissor and then a DrawTexture: the full clip, not the stale cut.
+        REQUIRE(NextAttachmentlessSize(true, false, one, Max, Max) == Max);
+        // Alternating needs cost one growth.
+        Extent2D size = one;
+        for (int i = 0; i < 8; ++i) {
+            size = NextAttachmentlessSize(true, false, size, Max, i % 2 ? Max : one);
+        }
+        REQUIRE(size == Max);
+    }
+}

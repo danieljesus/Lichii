@@ -380,11 +380,12 @@ public:
 
     /// Update bound render targets and upload memory if necessary
     /// @param is_clear True when the render targets are being used for clears
-    /// @param bounding_scissors For a host that pays for the render area: how many of the guest
-    ///                          scissors bound a draw without attachments (1, or all of them when
-    ///                          a shader picks the viewport), whose framebuffer is then cut to
-    ///                          them (AttachmentlessRenderArea). 0 (anything else) makes no cut,
-    ///                          and keeps a pass's cut size when its targets did not change.
+    /// @param bounding_scissors How many of the guest scissors bound a draw (1, or those the host
+    ///                          binds when a shader picks the viewport). Where the runtime cuts
+    ///                          attachment-less passes (CutsAttachmentlessRenderArea) such a draw
+    ///                          gets a framebuffer cut to them (AttachmentlessRenderArea,
+    ///                          NextAttachmentlessSize); 0, for a clear or anything that is not a
+    ///                          bounded draw, needs the full surface clip.
     void UpdateRenderTargets(bool is_clear, u32 bounding_scissors = 0);
 
     /// Find a framebuffer with the currently bound render targets
@@ -510,10 +511,9 @@ public:
     Common::SpinRecursiveMutex mutex;
 
 private:
-    /// The framebuffer size for the current surface clip, cut down to the first
-    /// `bounding_scissors` scissors for a pass without attachments (AttachmentlessRenderArea).
-    [[nodiscard]] Extent2D RenderTargetsSize(u32 up_scale, u32 down_shift,
-                                             u32 bounding_scissors) const;
+    /// The framebuffer size for the current surface clip and targets: for a pass without
+    /// attachments, where the runtime cuts it, what NextAttachmentlessSize gives.
+    [[nodiscard]] Extent2D RenderTargetsSize(bool targets_changed, u32 bounding_scissors) const;
 
     /// Iterate over all page indices in a range
     template <typename Func>
