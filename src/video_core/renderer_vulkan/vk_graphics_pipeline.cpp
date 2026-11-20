@@ -417,6 +417,12 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    // Without a shader that picks the viewport, only the first one and its scissor apply.
+    const bool picks_viewport = std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+        return info.stores[Shader::IR::Attribute::ViewportIndex] ||
+               info.stores[Shader::IR::Attribute::ViewportMask];
+    });
+    bounding_scissors = picks_viewport ? Maxwell::NumViewports : 1;
     on_far_plane = infos[0] && infos[0]->position_on_far_plane && !infos[1] && !infos[2] &&
                    !infos[3] && key.state.extended_dynamic_state_2 != 0;
     // The guest leaves render target components the fragment shader doesn't output untouched,
@@ -1250,7 +1256,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
-        texture_cache.UpdateRenderTargets(false);
+        texture_cache.UpdateRenderTargets(false, bounding_scissors);
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
         CheckColorFeedbackLoop(view_span, Spec::enabled_stages, fragment_entry);
@@ -1425,7 +1431,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     }
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
-        texture_cache.UpdateRenderTargets(false);
+        texture_cache.UpdateRenderTargets(false, bounding_scissors);
         const std::span<const VideoCommon::ImageViewInOut> view_span{delta_views};
         texture_cache.CheckFeedbackLoop(view_span);
         CheckColorFeedbackLoop(view_span, configured_stages, fragment_entry);

@@ -42,6 +42,7 @@
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/surface.h"
+#include "video_core/texture_cache/attachmentless_render_area.h"
 #include "video_core/texture_cache/descriptor_table.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/image_info.h"
@@ -379,7 +380,11 @@ public:
 
     /// Update bound render targets and upload memory if necessary
     /// @param is_clear True when the render targets are being used for clears
-    void UpdateRenderTargets(bool is_clear);
+    /// @param bounding_scissors How many of the guest scissors bound a draw without attachments
+    ///                          (1, or all of them when a shader picks the viewport): its
+    ///                          framebuffer is cut to them (AttachmentlessRenderArea). 0 keeps the
+    ///                          surface clip's size.
+    void UpdateRenderTargets(bool is_clear, u32 bounding_scissors = 0);
 
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this
@@ -504,6 +509,11 @@ public:
     Common::SpinRecursiveMutex mutex;
 
 private:
+    /// The framebuffer size for the current surface clip, cut down to the first
+    /// `bounding_scissors` scissors for a pass without attachments (AttachmentlessRenderArea).
+    [[nodiscard]] Extent2D RenderTargetsSize(u32 up_scale, u32 down_shift,
+                                             u32 bounding_scissors) const;
+
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachCPUPage(DAddr addr, size_t size, Func&& func) {
