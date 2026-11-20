@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <cstring>
 #include <optional>
 #include <string_view>
 #include <unordered_set>
@@ -324,6 +325,41 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    /// The guest registers a draw's render targets come from, as raw words: other values mean
+    /// other targets, and almost always another render pass.
+    struct RenderTargetRegisters {
+        using Regs = Tegra::Engines::Maxwell3D::Regs;
+        std::array<u8, sizeof(Regs::rt) + sizeof(Regs::zeta) + sizeof(Regs::surface_clip) +
+                           sizeof(Regs::rt_control) + sizeof(Regs::zeta_size) +
+                           sizeof(Regs::zeta_enable) + sizeof(Regs::anti_alias_samples_mode)>
+            words{};
+
+        static RenderTargetRegisters Read(const Regs& regs) {
+            RenderTargetRegisters result;
+            u8* out = result.words.data();
+            const auto copy = [&out](const auto& field) {
+                std::memcpy(out, &field, sizeof(field));
+                out += sizeof(field);
+            };
+            copy(regs.rt);
+            copy(regs.zeta);
+            copy(regs.surface_clip);
+            copy(regs.rt_control);
+            copy(regs.zeta_size);
+            copy(regs.zeta_enable);
+            copy(regs.anti_alias_samples_mode);
+            return result;
+        }
+
+        bool operator==(const RenderTargetRegisters&) const = default;
+    };
+
+    /// A flush the draw budget asked for inside a render pass, waiting for a draw that begins
+    /// another (SubmissionPolicy::FlushBeforeDraw): the tick it was asked at, the registers of the
+    /// pass's targets then, and the draws since
+    std::optional<u64> deferred_flush_tick;
+    RenderTargetRegisters deferred_flush_targets;
+    u32 deferred_flush_draws = 0;
     std::optional<u64> oot_camera_sample_frame;
     /// Why this frame's largest scene-target draw with a camera buffer gave no camera.
     struct OcarinaCameraRefusal {

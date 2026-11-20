@@ -4206,6 +4206,24 @@ void RasterizerVulkan::FlushWork() {
         }();
         legacy_budget = forced_draws != 0 ? forced_draws : (device.IsMoltenVK() ? 128U : 4096U);
     }
+    // Both budgets submit every 128 draws on MoltenVK (the native one everywhere, the legacy one
+    // there so that the GPU starts earlier, 3b1d6eb9c), but a submission in the middle of a render
+    // pass splits it, and an Apple GPU then stores and loads its tiles again. There a flush asked
+    // for inside a pass waits, at the start of each draw, for one that begins another pass
+    // (FlushBeforeDraw): the same counters and budgets, only the point it cuts at moves.
+    const u32 flush_budget = native && !android ? budget : legacy_budget;
+    if (deferred_flush_tick) {
+        if (*deferred_flush_tick != scheduler.CurrentTick()) {
+            deferred_flush_tick.reset(); // Something else submitted in the meantime
+        } else if (SubmissionPolicy::FlushBeforeDraw(
+                       scheduler.IsRenderPassActive(),
+                       deferred_flush_targets != RenderTargetRegisters::Read(maxwell3d->regs),
+                       ++deferred_flush_draws, flush_budget)) {
+            deferred_flush_tick.reset();
+            scheduler.Flush();
+            pending_native_work = false;
+        }
+    }
     switch (SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget)) {
     case SubmissionPolicy::Action::None:
         break;
@@ -4213,6 +4231,14 @@ void RasterizerVulkan::FlushWork() {
         scheduler.DispatchWork();
         break;
     case SubmissionPolicy::Action::Flush:
+        if (device.IsMoltenVK() && scheduler.IsRenderPassActive()) {
+            // The registers the active pass's targets came from: this draw is still in it.
+            deferred_flush_tick = scheduler.CurrentTick();
+            deferred_flush_targets = RenderTargetRegisters::Read(maxwell3d->regs);
+            deferred_flush_draws = 0;
+            break;
+        }
+        deferred_flush_tick.reset();
         scheduler.Flush();
         pending_native_work = false;
         break;
