@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
@@ -257,6 +258,13 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
     if (lane.IsImmediate() && segment.IsImmediate() && segment.U32() == 0) {
         return ctx.OpSelect(ctx.U32[1], in_range, BroadcastLane(ctx, value, lane.U32() & 31),
                             value);
+    }
+    { // TEMP pricing only (wrong in general): fragment SHFL.IDX without segments as BroadcastFirst
+        static const bool temp_first = std::getenv("EDEN_TMP_FRAG_BROADCAST_FIRST") != nullptr;
+        if (temp_first && ctx.stage == Stage::Fragment && segment.IsImmediate() &&
+            segment.U32() == 0) {
+            return ctx.OpGroupNonUniformBroadcastFirst(ctx.U32[1], SubgroupScope(ctx), value);
+        }
     }
     const Id shuffled{ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id))};
     return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
