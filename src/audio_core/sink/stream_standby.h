@@ -29,15 +29,19 @@ namespace AudioCore::Sink {
  * paced and never waits forever for queue space, which also blocked emulation shutdown. Their
  * owners never check that a stream is ready, so a dead one left the game silent until restarted.
  * The backend is reopened with backoff, on the default device once the configured one has failed a
- * few times, and started again unless the owner paused the stream meanwhile.
+ * few times, and started again unless the owner paused the stream meanwhile. Each reopen opens on
+ * a thread of its own, since opening can block while devices come and go: the stand-in plays on
+ * meanwhile, so neither the renderer nor the owner's Start and Stop wait for it. Only closing the
+ * stream does, as an open cannot be cancelled.
  *
  * Input and sysmix streams do not stand in: their owners check IsReady and fall back to silence or
  * fail the guest's open, so a loss leaves them not ready, as it always did. A fault the owner
  * reports with MarkFaulted, as sysmix does for a guest fault, is final for every stream.
  *
- * Only one backend exists at a time: the lost one is destroyed, which stops its callbacks, before
- * the stand-in plays a block or a new one opens. So a loss reported while a reopen is under way
- * comes from the new backend, which is then dropped instead of published.
+ * Only one backend plays at a time: the lost one is destroyed, which stops its callbacks, before
+ * the stand-in plays a block or a new one opens, and a new one has no callbacks until the worker,
+ * which is then not standing in, starts it. So a loss reported while a reopen is under way comes
+ * from the new backend, which is then dropped instead of published.
  *
  * The derived constructor calls OpenInitialBackend last, and the derived destructor must call
  * Finalize first: the worker calls the hooks, so it is joined there, while the derived stream is
@@ -53,6 +57,26 @@ public:
     /// Reopens on a configured device before the backend should try the default one.
     static constexpr u32 ConfiguredDeviceAttempts = 3;
 
+    enum class DeviceChoice {
+        Wait,                  ///< Open nothing: the configured device may come back.
+        Configured,            ///< Only the configured device.
+        ConfiguredThenDefault, ///< The configured device, or the default one if it does not open.
+        Default,               ///< Only the default device.
+    };
+    /**
+     * Which device a backend with a configured device opens. A stream published on the configured
+     * device waits ConfiguredDeviceAttempts reopens for it; any other takes the default one when
+     * the configured one is not listed or does not open. One that takes the default one also does
+     * when the configured one opened but failed to start the last time.
+     *
+     * @param attempt                 - As given to OpenBackend.
+     * @param listed                  - The configured device is listed and enabled.
+     * @param published_on_configured - The stream's last published backend was on it.
+     * @param start_failed            - A backend on it failed to start since that one.
+     */
+    static DeviceChoice ChooseDevice(u32 attempt, bool listed, bool published_on_configured,
+                                     bool start_failed);
+
     ~StandbySinkStream() override;
 
     void Start(bool resume = false) override;
@@ -66,13 +90,18 @@ protected:
     StandbySinkStream(Core::System& system_, StreamType type_)
         : StandbySinkStream(system_, type_, Timing{}) {}
 
-    /// Open a backend, or return null. attempt is 0 for the stream's first open, then numbers the
-    /// reopens since the device was lost from 1. Called without any of the stream's locks, since it
-    /// may block.
+    /// Open a backend, or return null. Until StartBackend it must not consume the stream, which
+    /// the stand-in may be playing, though it may report a loss. attempt is 0 for the stream's
+    /// first open, on the constructing thread, then numbers the reopens since the device was lost
+    /// from 1, each on a thread of its own. Called without any of the stream's locks, since it may
+    /// block.
     virtual void* OpenBackend(u32 attempt) = 0;
     virtual bool StartBackend(void* backend) = 0;
     virtual bool StopBackend(void* backend) = 0;
     virtual void DestroyBackend(void* backend) = 0;
+    /// The backend became the stream's, on its first open or a reopen; any other one opened since
+    /// was destroyed. Called before the stream opens another one.
+    virtual void BackendPublished(void* backend) {}
 
     /// Open the first backend. Renderer and audio out streams with no device yet stand in.
     void OpenInitialBackend();
@@ -94,8 +123,8 @@ private:
     enum class State : u8 {
         Live,      ///< The published backend plays the stream.
         Lost,      ///< No usable backend; a renderer or audio out stream stands in.
-        Reopening, ///< The worker is opening a backend. Nothing plays while it opens; the
-                   ///< stand-in makes up for the time afterwards.
+        Reopening, ///< A backend is opening, or the worker is starting it. The stand-in plays on
+                   ///< while it opens.
         Stopped,   ///< Never opened (no backend context), or finalized.
     };
     enum class Reopen { Opened, Failed, Stopped };
@@ -104,17 +133,21 @@ private:
         return type == StreamType::Render || type == StreamType::Out;
     }
     void Run(std::stop_token stop_token);
-    /// Play blocks into nothing until `until`. Returns false when stopping. Worker thread only.
-    bool StandIn(std::stop_token stop_token, std::chrono::steady_clock::time_point until);
+    /// Play blocks into nothing until `until`, a fault, or `done` when given. Returns false when
+    /// stopping. Worker thread only.
+    bool StandIn(std::stop_token stop_token, std::chrono::steady_clock::time_point until,
+                 const std::atomic<bool>* done = nullptr);
     void ReleaseBackend();
-    Reopen TryReopen(u32 attempt);
-    /// Stop and join the worker, and return the state before.
+    Reopen TryReopen(std::stop_token stop_token, u32 attempt);
+    /// Mark the stream finalized and pause it, so that nothing waits for queue space meanwhile,
+    /// then stop and join the worker, which waits for an open under way. Returns the state before.
     State StopWorker();
 
     Timing timing;
 
-    /// Serializes Start, Stop, Finalize and the worker's release and publication: held around
-    /// backend calls, except OpenBackend.
+    /// Serializes Start, Stop, Finalize, the worker's release and publication, and each block the
+    /// stand-in plays, so that none plays after Stop returns: held around backend calls, except
+    /// OpenBackend. Never taken by a backend's callbacks.
     std::mutex control_mutex;
     /// Guards the fields below. Never held around a backend call.
     mutable std::mutex state_mutex;

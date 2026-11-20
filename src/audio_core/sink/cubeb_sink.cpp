@@ -103,11 +103,15 @@ public:
     }
 
 private:
-    /// Open on the configured device, or on the default one when none is configured or it is not
-    /// listed. A stream that was on the configured device waits ConfiguredDeviceAttempts reopens
-    /// for it to come back, then also tries the default one, but still takes the configured one
-    /// when it is listed and opens. The device is looked up by name at each open, and its id used
-    /// only while the enumeration that gave it is alive.
+    /// A cubeb stream, and whether it is on the configured device.
+    struct Backend {
+        cubeb_stream* stream;
+        bool on_configured;
+    };
+
+    /// Open on the configured device or the default one, as ChooseDevice says. The device is
+    /// looked up by name at each open, and its id used only while the enumeration that gave it is
+    /// alive.
     void* OpenBackend(u32 attempt) override {
         const bool configured = !device_name.empty();
         cubeb_device_collection collection{};
@@ -133,19 +137,33 @@ private:
                 break;
             }
         }
-        const bool may_fall_back = attempt == 0 || attempt > ConfiguredDeviceAttempts;
-        // Not listed, or the enumeration failed while devices come and go.
-        if (!device && opened_on_configured && !may_fall_back) {
+        // Not listed also when the enumeration failed while devices come and go.
+        const DeviceChoice choice =
+            configured ? ChooseDevice(attempt, device != nullptr, published_on_configured,
+                                      configured_start_failed)
+                       : DeviceChoice::Default;
+        if (choice == DeviceChoice::Wait) {
             LOG_DEBUG(Audio_Sink, "Cubeb stream {}: {} is not back yet", name, device_name);
+            // Gone again: once back it may well start.
+            configured_start_failed = false;
             return nullptr;
         }
-        if (opened_on_configured && attempt == ConfiguredDeviceAttempts + 1) {
+        if (!device && published_on_configured && attempt == ConfiguredDeviceAttempts + 1) {
             LOG_WARNING(Audio_Sink, "Cubeb stream {}: {} has not come back, trying the default too",
                         name, device_name);
         }
+        if (choice == DeviceChoice::Default) {
+            if (device) {
+                LOG_DEBUG(Audio_Sink, "Cubeb stream {}: {} did not start, trying the default",
+                          name, device_name);
+            }
+            // Taken, so the next attempt tries the configured device again.
+            configured_start_failed = false;
+            device = nullptr;
+        }
         int error{};
         cubeb_stream* opened = Init(device, error);
-        if (!opened && device && (may_fall_back || !opened_on_configured)) {
+        if (!opened && device && choice == DeviceChoice::ConfiguredThenDefault) {
             // Listed, but it does not open, and nothing waits for it: the default one, then.
             device = nullptr;
             opened = Init(device, error);
@@ -159,8 +177,7 @@ private:
             }
             return nullptr;
         }
-        opened_on_configured = device != nullptr;
-        return opened;
+        return new Backend{opened, device != nullptr};
     }
 
     cubeb_stream* Init(cubeb_devid device, int& error) {
@@ -178,17 +195,34 @@ private:
     }
 
     bool StartBackend(void* backend) override {
-        return cubeb_stream_start(static_cast<cubeb_stream*>(backend)) == CUBEB_OK;
+        const auto* const opened = static_cast<Backend*>(backend);
+        if (cubeb_stream_start(opened->stream) == CUBEB_OK) {
+            return true;
+        }
+        // Listed and opening, but not playing: the next open that may take the default does.
+        if (opened->on_configured) {
+            configured_start_failed = true;
+        }
+        return false;
     }
 
     bool StopBackend(void* backend) override {
-        return cubeb_stream_stop(static_cast<cubeb_stream*>(backend)) == CUBEB_OK;
+        return cubeb_stream_stop(static_cast<Backend*>(backend)->stream) == CUBEB_OK;
     }
 
     /// cubeb requires a stop before the destroy; harmless on a stream not started or lost.
     void DestroyBackend(void* backend) override {
-        cubeb_stream_stop(static_cast<cubeb_stream*>(backend));
-        cubeb_stream_destroy(static_cast<cubeb_stream*>(backend));
+        const auto* const opened = static_cast<Backend*>(backend);
+        cubeb_stream_stop(opened->stream);
+        cubeb_stream_destroy(opened->stream);
+        delete opened;
+    }
+
+    /// Only a published backend tells which device the stream was on: one that opened but did
+    /// not start, or was dropped, does not.
+    void BackendPublished(void* backend) override {
+        published_on_configured = static_cast<Backend*>(backend)->on_configured;
+        configured_start_failed = false;
     }
 
     /**
@@ -251,9 +285,11 @@ private:
     std::string device_name;
     cubeb_stream_params params{};
     u32 latency{};
-    /// Whether the backend last opened on the configured device. Only OpenBackend uses it, on the
-    /// constructing thread and then on the standby worker.
-    bool opened_on_configured{};
+    /// Whether the last published backend is on the configured device.
+    std::atomic<bool> published_on_configured{};
+    /// A backend on the configured device failed to start since then. Set wherever the stream
+    /// starts, read by the opener.
+    std::atomic<bool> configured_start_failed{};
 #ifdef _WIN32
     /// Result of this stream's COM initialization, balanced only when it succeeded
     HRESULT com_init_result{};

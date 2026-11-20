@@ -82,6 +82,11 @@ public:
     std::atomic<int> lose_on_open{};
     std::atomic<int> start_failures_left{};
     std::atomic<u32> destroyed{};
+    std::atomic<u32> published{};
+    /// While set, reopens block in OpenBackend, as one can while devices come and go.
+    std::atomic<bool> hold_open{};
+    /// A reopen is blocked on hold_open.
+    std::atomic<bool> opening{};
     /// Runs in StartBackend, with the stream's control lock held.
     std::function<void()> on_start;
 
@@ -94,6 +99,16 @@ private:
                 attempt_times.push_back(Clock::now());
                 attempt_numbers.push_back(attempt);
             }
+        }
+        if (constructed && hold_open) {
+            opening = true;
+            while (hold_open) {
+                std::this_thread::sleep_for(1ms);
+            }
+            opening = false;
+        }
+        {
+            std::scoped_lock lock{mutex};
             if (failures_left.fetch_sub(1) > 0) {
                 return nullptr;
             }
@@ -128,12 +143,23 @@ private:
         delete static_cast<Backend*>(backend);
         ++destroyed;
     }
+    void BackendPublished(void*) override {
+        ++published;
+    }
 
     std::mutex mutex;
     std::set<Backend*> live;
     std::vector<Clock::time_point> attempt_times;
     std::vector<u32> attempt_numbers;
     std::atomic<bool> constructed{};
+};
+
+/// Lets blocked opens through when it goes, before the stream is closed, which waits for them.
+struct OpenGate {
+    LosableStream& stream;
+    ~OpenGate() {
+        stream.hold_open = false;
+    }
 };
 
 std::unique_ptr<LosableStream> MakeStream(SysmixTests::Context& context, StreamType type,
@@ -247,6 +273,9 @@ TEST_CASE("A lost stream keeps its owner's pause and resume through the reopen",
 
 TEST_CASE("A stop while a reopen starts the new backend stops it", "[audio_core][stream_standby]") {
     SysmixTests::Context context;
+    // Before the stream, whose worker runs on_start: they outlive it however the test ends.
+    std::atomic<bool> armed{};
+    std::atomic<bool> starting{};
     auto owned = MakeStream(context, StreamType::Render);
     auto& stream = *owned;
     for (u64 cycle = 1; cycle <= 5; ++cycle) {
@@ -254,8 +283,8 @@ TEST_CASE("A stop while a reopen starts the new backend stops it", "[audio_core]
         stream.Start();
         // The emulation stops the stream while the reopen starts the new backend: the stop waits
         // on the control lock for the reopen to publish it, and then has to stop it.
-        std::atomic<bool> armed{true};
-        std::atomic<bool> starting{};
+        armed = true;
+        starting = false;
         stream.on_start = [&] {
             if (armed.exchange(false)) {
                 starting = true;
@@ -475,5 +504,163 @@ TEST_CASE("A stream that never opened is not ready and stays paused",
         CHECK(Render(stream, 20));
         stream.ReportLost();
         CHECK(stream.ReopenAttempts() == 0);
+    }
+}
+
+TEST_CASE("A stream stands in while a reopen is still opening", "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    auto owned = MakeStream(context, StreamType::Render);
+    auto& stream = *owned;
+    OpenGate gate{stream};
+    stream.Start();
+    stream.hold_open = true;
+    stream.ReportLost();
+    REQUIRE(WaitFor([&] { return stream.opening.load(); }));
+
+    // Neither the renderer nor the owner's pause and resume wait for the open.
+    REQUIRE(Render(stream, 40));
+    stream.Stop();
+    CHECK(stream.IsPaused());
+    stream.Start();
+    CHECK_FALSE(stream.IsPaused());
+    CHECK(stream.opening);
+    CHECK(stream.IsStandingIn());
+    CHECK(stream.IsReady());
+    CHECK(stream.ReopenAttempts() == 1);
+
+    stream.hold_open = false;
+    REQUIRE(WaitFor([&] { return stream.Reopens() == 1; }));
+    CHECK(stream.Running());
+    CHECK(stream.Live() == 1);
+    CHECK(stream.published == 2);
+}
+
+TEST_CASE("Closing a stream while a reopen is opening releases its renderer before the open ends",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    auto owned = MakeStream(context, StreamType::Render);
+    auto& stream = *owned;
+    OpenGate gate{stream};
+    stream.Start();
+    stream.hold_open = true;
+    stream.ReportLost();
+    REQUIRE(WaitFor([&] { return stream.opening.load(); }));
+    // As in the close test above: after the close, enough blocks to fill the queue and wait.
+    std::atomic<int> left{-1};
+    std::atomic<bool> finished{};
+    std::jthread renderer([&](std::stop_token stop_token) {
+        SinkBuffer block{240, 0, 0, false};
+        std::array<s16, 480> samples{};
+        while (left != 0 && !stop_token.stop_requested()) {
+            stream.AppendBuffer(block, samples);
+            stream.WaitFreeSpace(stop_token);
+            if (left > 0) {
+                --left;
+            }
+        }
+        finished = !stop_token.stop_requested();
+    });
+    std::this_thread::sleep_for(50ms);
+    // The close waits for the open, which cannot be cancelled; the renderer must not.
+    std::atomic<bool> closed{};
+    std::jthread closer([&] {
+        stream.Finalize();
+        closed = true;
+    });
+    left = 32;
+    const bool released = WaitFor([&] { return finished.load(); });
+    const bool closed_before_open_ended = closed.load();
+    stream.hold_open = false;
+    closer.join();
+    renderer.request_stop();
+    renderer.join();
+    CHECK(released);
+    CHECK_FALSE(closed_before_open_ended);
+    // The backend it opened was dropped, not published.
+    CHECK(stream.Live() == 0);
+    CHECK(stream.Reopens() == 0);
+    CHECK(stream.destroyed == 2);
+    CHECK_FALSE(stream.IsReady());
+}
+
+TEST_CASE("A fault while a reopened backend starts drops that backend",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    std::atomic<bool> armed{true};
+    auto owned = MakeStream(context, StreamType::Render);
+    auto& stream = *owned;
+    stream.Start();
+    // The owner faults the stream while the worker starts the new backend.
+    stream.on_start = [&armed, faulted = owned.get()] {
+        if (armed.exchange(false)) {
+            faulted->MarkFaulted();
+        }
+    };
+    stream.ReportLost();
+    REQUIRE(WaitFor([&] { return stream.destroyed == 2; }));
+    CHECK(WaitFor([&] { return stream.IsPaused(); }));
+    std::this_thread::sleep_for(150ms);
+    CHECK(stream.Reopens() == 0);
+    CHECK(stream.Live() == 0);
+    CHECK(stream.published == 1);
+    CHECK_FALSE(stream.IsReady());
+}
+
+TEST_CASE("A stream that stands in plays nothing after Stop returns",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    auto owned = MakeStream(context, StreamType::Render);
+    auto& stream = *owned;
+    stream.failures_left = 1000;
+    stream.ReportLost();
+    SinkBuffer block{240, 0, 0, false};
+    std::array<s16, 480> samples{};
+    // The owner clears the queue once Stop returns, as audio out does: nothing may play it then.
+    int played_after_stop = 0;
+    for (int cycle = 0; cycle < 50; ++cycle) {
+        stream.Start();
+        for (int i = 0; i < 3; ++i) {
+            stream.AppendBuffer(block, samples);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{cycle % 6});
+        stream.Stop();
+        const u32 queued = stream.GetQueueSize();
+        std::this_thread::sleep_for(12ms);
+        played_after_stop += stream.GetQueueSize() != queued;
+        stream.ClearQueue();
+    }
+    CHECK(played_after_stop == 0);
+}
+
+TEST_CASE("A stream with a configured device chooses it, waits for it, or takes the default",
+          "[audio_core][stream_standby]") {
+    using AudioCore::Sink::StandbySinkStream;
+    using Choice = StandbySinkStream::DeviceChoice;
+    constexpr u32 waits = StandbySinkStream::ConfiguredDeviceAttempts;
+    const auto choose = &StandbySinkStream::ChooseDevice;
+
+    // The first open: the configured device, or the default one.
+    CHECK(choose(0, true, false, false) == Choice::ConfiguredThenDefault);
+    CHECK(choose(0, false, false, false) == Choice::Default);
+
+    // Published on it, a stream waits for it a few reopens, even for one that fails to start.
+    for (u32 attempt = 1; attempt <= waits; ++attempt) {
+        INFO("attempt " << attempt);
+        CHECK(choose(attempt, false, true, false) == Choice::Wait);
+        CHECK(choose(attempt, true, true, false) == Choice::Configured);
+        CHECK(choose(attempt, true, true, true) == Choice::Configured);
+    }
+    // Then it takes the default one too, and instead of one that opened but did not start.
+    CHECK(choose(waits + 1, false, true, false) == Choice::Default);
+    CHECK(choose(waits + 1, true, true, false) == Choice::ConfiguredThenDefault);
+    CHECK(choose(waits + 1, true, true, true) == Choice::Default);
+
+    // Published on the default one, nothing waits for the configured device: one that came back
+    // but did not start, and left again, does not keep it from the default.
+    for (const u32 attempt : {1U, waits, waits + 1}) {
+        INFO("attempt " << attempt);
+        CHECK(choose(attempt, false, false, false) == Choice::Default);
+        CHECK(choose(attempt, true, false, false) == Choice::ConfiguredThenDefault);
+        CHECK(choose(attempt, true, false, true) == Choice::Default);
     }
 }

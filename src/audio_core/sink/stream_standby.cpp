@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <system_error>
 #include <utility>
 
 #include "audio_core/common/common.h"
@@ -21,7 +22,36 @@ namespace AudioCore::Sink {
 namespace {
 constexpr std::chrono::microseconds BlockPeriod{TargetSampleCount * 1'000'000ULL /
                                                 TargetSampleRate};
+
+/// For the backend calls made on the stream's own threads.
+struct ComScope {
+#ifdef _WIN32
+    ComScope() : result{CoInitializeEx(nullptr, COINIT_MULTITHREADED)} {}
+    ~ComScope() {
+        if (SUCCEEDED(result)) {
+            CoUninitialize();
+        }
+    }
+    ComScope(const ComScope&) = delete;
+    ComScope& operator=(const ComScope&) = delete;
+    HRESULT result;
+#endif
+};
 } // Anonymous namespace
+
+StandbySinkStream::DeviceChoice StandbySinkStream::ChooseDevice(u32 attempt, bool listed,
+                                                                bool published_on_configured,
+                                                                bool start_failed) {
+    const bool may_take_default =
+        attempt == 0 || attempt > ConfiguredDeviceAttempts || !published_on_configured;
+    if (!listed) {
+        return may_take_default ? DeviceChoice::Default : DeviceChoice::Wait;
+    }
+    if (!may_take_default) {
+        return DeviceChoice::Configured;
+    }
+    return start_failed ? DeviceChoice::Default : DeviceChoice::ConfiguredThenDefault;
+}
 
 StandbySinkStream::StandbySinkStream(Core::System& system_, StreamType type_, Timing timing_)
     : SinkStream{system_, type_}, timing{timing_} {}
@@ -55,17 +85,28 @@ bool StandbySinkStream::IsStandingIn() const {
 void StandbySinkStream::OpenInitialBackend() {
     void* const opened = OpenBackend(0);
     {
-        std::scoped_lock lock{state_mutex};
-        if (opened && losses == 0) {
-            live_backend = opened;
-            state = State::Live;
+        // As a reopen publishes: a loss reported once it is live has the worker release it, which
+        // waits for this lock, so it is not destroyed before BackendPublished.
+        std::scoped_lock control{control_mutex};
+        bool published{};
+        {
+            std::scoped_lock lock{state_mutex};
+            published = opened && losses == 0;
+            if (published) {
+                live_backend = opened;
+                state = State::Live;
+            } else {
+                state = State::Lost;
+            }
+        }
+        if (published) {
+            BackendPublished(opened);
             return;
         }
-        state = State::Lost;
-    }
-    // It did not open, or reported a loss while it did.
-    if (opened) {
-        DestroyBackend(opened);
+        // It did not open, or reported a loss while it did.
+        if (opened) {
+            DestroyBackend(opened);
+        }
     }
     if (!StandsIn()) {
         // Not ready, as the owners of input and sysmix streams expect of one that did not open.
@@ -161,12 +202,11 @@ void StandbySinkStream::Stop() {
 }
 
 void StandbySinkStream::Finalize() {
-    // The worker releases and reopens the backend: join it before destroying that.
+    const bool playing = !paused;
+    // The worker releases and reopens the backend: join it before destroying that. It pauses the
+    // stream first, so a renderer is not left waiting for an open under way.
     const State before = StopWorker();
     std::scoped_lock control{control_mutex};
-    const bool playing = !paused;
-    // Always: a renderer waiting for queue space that no device or stand-in frees any more.
-    SignalPause();
     void* current{};
     {
         std::scoped_lock lock{state_mutex};
@@ -189,6 +229,7 @@ StandbySinkStream::State StandbySinkStream::StopWorker() {
         state = State::Stopped;
         joining = std::move(worker);
     }
+    SignalPause();
     if (joining.joinable()) {
         joining.request_stop();
         wake.notify_all();
@@ -199,10 +240,7 @@ StandbySinkStream::State StandbySinkStream::StopWorker() {
 
 void StandbySinkStream::Run(std::stop_token stop_token) {
     Common::SetCurrentThreadName("AudioStandby");
-#ifdef _WIN32
-    // For the backend calls made here, once for the thread.
-    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-#endif
+    [[maybe_unused]] ComScope com;
     stand_in_block.resize(TargetSampleCount * GetDeviceChannels());
     bool running = true;
     while (running) {
@@ -237,7 +275,7 @@ void StandbySinkStream::Run(std::stop_token stop_token) {
                 running = false;
                 break;
             }
-            const Reopen result = TryReopen(attempt);
+            const Reopen result = TryReopen(stop_token, attempt);
             if (result == Reopen::Opened) {
                 break;
             }
@@ -248,11 +286,6 @@ void StandbySinkStream::Run(std::stop_token stop_token) {
             delay = (std::min)(delay * 2, timing.max_retry);
         }
     }
-#ifdef _WIN32
-    if (SUCCEEDED(com)) {
-        CoUninitialize();
-    }
-#endif
 }
 
 void StandbySinkStream::ReleaseBackend() {
@@ -267,7 +300,7 @@ void StandbySinkStream::ReleaseBackend() {
     }
 }
 
-StandbySinkStream::Reopen StandbySinkStream::TryReopen(u32 attempt) {
+StandbySinkStream::Reopen StandbySinkStream::TryReopen(std::stop_token stop_token, u32 attempt) {
     u64 seen{};
     {
         std::scoped_lock lock{state_mutex};
@@ -278,29 +311,67 @@ StandbySinkStream::Reopen StandbySinkStream::TryReopen(u32 attempt) {
         seen = losses;
     }
     ++attempts;
-    // Without any lock: opening may block while the device comes and goes, and the emulation's
-    // Start and Stop must not wait for it.
-    void* const opened = system.IsShuttingDown() ? nullptr : OpenBackend(attempt);
+    void* opened{};
+    std::atomic<bool> open_done{};
+    std::jthread opener;
+    try {
+        // On a thread of its own, without any lock: opening may block while the device comes and
+        // goes, and the stand-in plays on meanwhile. The backend has no data callback until it is
+        // started.
+        opener = std::jthread([this, attempt, &opened, &open_done] {
+            Common::SetCurrentThreadName("AudioOpener");
+            [[maybe_unused]] ComScope com;
+            void* const result = system.IsShuttingDown() ? nullptr : OpenBackend(attempt);
+            {
+                std::scoped_lock lock{state_mutex};
+                opened = result;
+                open_done = true;
+            }
+            wake.notify_all();
+        });
+    } catch (const std::system_error& error) {
+        // No thread for the open: try again later, standing in meanwhile.
+        LOG_ERROR(Audio_Sink, "Stream {} could not start a thread to reopen: {}", name,
+                  error.what());
+    }
+    if (opener.joinable()) {
+        StandIn(stop_token, std::chrono::steady_clock::time_point::max(), &open_done);
+        if (!open_done && failed) {
+            // Faulted with the open under way: nothing frees queue space while the opener is
+            // joined. A close has paused the stream already.
+            std::scoped_lock control{control_mutex};
+            SignalPause();
+        }
+        opener.join();
+    }
     std::scoped_lock control{control_mutex};
     if (opened) {
-        bool usable;
-        {
+        // Not finalized, faulted, or lost again by the new backend. Checked again once it starts.
+        const auto usable = [this, seen] {
             std::scoped_lock lock{state_mutex};
-            usable = state == State::Reopening && losses == seen && !failed;
-        }
+            return state == State::Reopening && losses == seen && !failed;
+        };
         // Started before it is published, still standing in: the stream stays ready throughout.
-        if (usable && (paused || StartBackend(opened))) {
-            std::scoped_lock lock{state_mutex};
-            if (state == State::Reopening && losses == seen) {
-                live_backend = opened;
-                state = State::Live;
+        if (usable() && !system.IsShuttingDown() && (paused || StartBackend(opened))) {
+            bool published{};
+            {
+                std::scoped_lock lock{state_mutex};
+                published = state == State::Reopening && losses == seen && !failed;
+                if (published) {
+                    live_backend = opened;
+                    state = State::Live;
+                }
+            }
+            if (published) {
+                BackendPublished(opened);
                 ++reopens;
                 LOG_INFO(Audio_Sink, "Stream {} reopened after {} attempts{}", name, attempt,
                          paused ? ", paused" : "");
                 return Reopen::Opened;
             }
         }
-        // Finalized, faulted, not started, or the new backend reported a loss: drop it.
+        // Closing, shutting down, faulted, not started, or the new backend reported a loss: drop
+        // it.
         DestroyBackend(opened);
     }
     std::scoped_lock lock{state_mutex};
@@ -311,19 +382,22 @@ StandbySinkStream::Reopen StandbySinkStream::TryReopen(u32 attempt) {
 }
 
 bool StandbySinkStream::StandIn(std::stop_token stop_token,
-                                std::chrono::steady_clock::time_point until) {
+                                std::chrono::steady_clock::time_point until,
+                                const std::atomic<bool>* done) {
+    const auto is_done = [done] { return done && done->load(); };
     while (true) {
         if (stop_token.stop_requested()) {
             return false;
         }
         const auto now = std::chrono::steady_clock::now();
-        if (now >= until || failed) {
+        if (now >= until || failed || is_done()) {
             return true;
         }
         if (paused) {
             // As a stopped device would, play nothing until Start, which signals it.
             std::unique_lock lock{state_mutex};
-            wake.wait_until(lock, stop_token, until, [this] { return !paused.load(); });
+            wake.wait_until(lock, stop_token, (std::min)(until, now + std::chrono::seconds{1}),
+                            [this, &is_done] { return !paused.load() || is_done(); });
             next_block = std::chrono::steady_clock::now();
             continue;
         }
@@ -333,8 +407,16 @@ bool StandbySinkStream::StandIn(std::stop_token stop_token,
             }
             continue;
         }
-        ProcessAudioOutAndRender(stand_in_block, TargetSampleCount);
-        // The clock runs on across reopen attempts, so a slow open is made up for afterwards; but
+        {
+            // Under the lock Stop holds as it pauses: no block plays after Stop returns, when the
+            // owner may clear the queue.
+            std::scoped_lock control{control_mutex};
+            if (paused) {
+                continue;
+            }
+            ProcessAudioOutAndRender(stand_in_block, TargetSampleCount);
+        }
+        // The clock runs on while a backend starts, so that time is made up for afterwards; but
         // after a host stall skip all but 20 blocks of it.
         next_block = (std::max)(next_block + BlockPeriod, now - 20 * BlockPeriod);
     }
