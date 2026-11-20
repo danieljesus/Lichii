@@ -4206,6 +4206,22 @@ void RasterizerVulkan::FlushWork() {
         }();
         legacy_budget = forced_draws != 0 ? forced_draws : (device.IsMoltenVK() ? 128U : 4096U);
     }
+    // MoltenVK submits every 128 draws so that the GPU starts earlier (3b1d6eb9c), but a submission
+    // in the middle of a render pass splits it, and an Apple GPU then stores and loads its tiles
+    // again. There the flush waits for the pass to end instead (FlushAtPassBoundary): the same
+    // counter and budget, only the point it cuts at moves.
+    const bool targets_dirty = maxwell3d->dirty.flags[VideoCommon::Dirty::RenderTargets];
+    if (deferred_flush_tick) {
+        if (*deferred_flush_tick != scheduler.CurrentTick()) {
+            deferred_flush_tick.reset(); // Something else submitted in the meantime
+        } else if (SubmissionPolicy::FlushAtPassBoundary(scheduler.IsRenderPassActive(),
+                                                         targets_dirty, ++deferred_flush_draws,
+                                                         legacy_budget)) {
+            deferred_flush_tick.reset();
+            scheduler.Flush();
+            pending_native_work = false;
+        }
+    }
     switch (SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget)) {
     case SubmissionPolicy::Action::None:
         break;
@@ -4213,6 +4229,14 @@ void RasterizerVulkan::FlushWork() {
         scheduler.DispatchWork();
         break;
     case SubmissionPolicy::Action::Flush:
+        if (!native && device.IsMoltenVK() &&
+            !SubmissionPolicy::FlushAtPassBoundary(scheduler.IsRenderPassActive(), targets_dirty,
+                                                   0, legacy_budget)) {
+            deferred_flush_tick = scheduler.CurrentTick();
+            deferred_flush_draws = 0;
+            break;
+        }
+        deferred_flush_tick.reset();
         scheduler.Flush();
         pending_native_work = false;
         break;
