@@ -266,7 +266,8 @@ void SetAppDirectory(const std::string& app_directory);
 
 /**
  * Sets a new filesystem path associated with the EdenPath enum.
- * If the filesystem object at new_path is not a directory, this function will not do anything.
+ * If the filesystem object at new_path is not a directory, this function will not do anything
+ * but log an error. An empty new_path (a path setting left unset) is ignored without one.
  *
  * @param eden_path EdenPath enum
  * @param new_path New filesystem path

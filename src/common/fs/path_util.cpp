@@ -316,6 +316,10 @@ std::string GetLegacyPathString(EmuPath legacy_path) {
 }
 
 void SetEdenPath(EdenPath eden_path, const fs::path& new_path) {
+    // An empty path is a setting left unset (a new configuration has none): keep the path.
+    if (new_path.empty()) {
+        return;
+    }
     auto& instance = PathManagerImpl::GetInstance();
     if (FS::IsDir(new_path)) {
         instance.SetEdenPathImpl(eden_path, new_path);

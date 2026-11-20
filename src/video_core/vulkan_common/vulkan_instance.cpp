@@ -42,7 +42,17 @@ namespace {
     return true;
 }
 
-[[nodiscard]] std::vector<const char*> RequiredExtensions(
+/// Whether the driver lists an optional extension: one that may be missing, so with no error.
+[[nodiscard]] bool HasExtension(std::vector<VkExtensionProperties> const& properties,
+                                const char* extension) {
+    return std::ranges::any_of(properties, [extension](const VkExtensionProperties& property) {
+        return std::strcmp(extension, property.extensionName) == 0;
+    });
+}
+
+} // Anonymous namespace
+
+std::vector<const char*> RequiredExtensions(
     const vk::InstanceDispatch& dld, std::vector<VkExtensionProperties> const& properties,
     Core::Frontend::WindowSystemType window_type, bool enable_validation) {
     std::vector<const char*> extensions;
@@ -50,7 +60,7 @@ namespace {
     // Headless presents to VK_EXT_headless_surface where the driver has it (GPU trace replay).
     const bool headless_surface =
         window_type == Core::Frontend::WindowSystemType::Headless &&
-        AreExtensionsSupported(dld, properties, std::array{VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME});
+        HasExtension(properties, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME);
     switch (window_type) {
     case Core::Frontend::WindowSystemType::Headless:
         if (headless_surface) {
@@ -104,11 +114,11 @@ namespace {
     // Probe optional extensions against the same snapshot the caller verifies against, so the
     // check here and the verification in CreateInstance can never disagree (see TOCTOU note below).
 #ifdef __APPLE__
-    if (AreExtensionsSupported(dld, properties, std::array{VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME}))
+    if (HasExtension(properties, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
         extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 #endif
     if ((enable_validation || Vulkan::AddressMap::Wanted()) &&
-        AreExtensionsSupported(dld, properties, std::array{VK_EXT_DEBUG_UTILS_EXTENSION_NAME}))
+        HasExtension(properties, VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 #ifdef EGLANTINE_STREAMLINE
     // What NVIDIA's DLSS asks for through Streamline, where available. Static: the returned
@@ -127,6 +137,8 @@ namespace {
 #endif
     return extensions;
 }
+
+namespace {
 
 [[nodiscard]] std::vector<const char*> Layers(bool enable_validation) {
     std::vector<const char*> layers;

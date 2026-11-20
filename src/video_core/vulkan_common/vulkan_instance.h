@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include "common/common_types.h"
 #include "common/dynamic_library.h"
 #include "core/frontend/emu_window.h"
@@ -25,5 +27,11 @@ namespace Vulkan {
     const Common::DynamicLibrary& library, vk::InstanceDispatch& dld, u32 required_version,
     Core::Frontend::WindowSystemType window_type = Core::Frontend::WindowSystemType::Headless,
     bool enable_validation = false);
+
+/// The instance extensions CreateInstance enables for a window type, chosen from the driver's
+/// list. An optional one the driver lacks is left out without an error. Exposed for tests.
+[[nodiscard]] std::vector<const char*> RequiredExtensions(
+    const vk::InstanceDispatch& dld, std::vector<VkExtensionProperties> const& properties,
+    Core::Frontend::WindowSystemType window_type, bool enable_validation);
 
 } // namespace Vulkan
