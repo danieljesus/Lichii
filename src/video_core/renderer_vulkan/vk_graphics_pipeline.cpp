@@ -1263,7 +1263,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
-    return ConfigureDraw(rescaling, render_area);
+    return ConfigureDraw(rescaling, render_area, is_indexed);
 }
 
 bool GraphicsPipeline::DeltaImagesChange() const noexcept {
@@ -1438,7 +1438,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
-    return ConfigureDraw(rescaling, render_area);
+    return ConfigureDraw(rescaling, render_area, is_indexed);
 }
 
 void GraphicsPipeline::KeepImageDescriptors(size_t stage, size_t first_entry) {
@@ -1505,7 +1505,7 @@ void GraphicsPipeline::CheckColorFeedbackLoop(std::span<const VideoCommon::Image
 /// and bindings. Returns false, and the draw is skipped, when the queued descriptor count does not
 /// match the pipeline or no descriptor memory can be reserved.
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
-                                     const RenderAreaPushConstant& render_area) {
+                                     const RenderAreaPushConstant& render_area, bool is_indexed) {
     if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
         LOG_CRITICAL(Render_Vulkan, "Graphics descriptor count mismatch: expected {}, got {}",
                      num_descriptor_entries, guest_descriptor_queue.UpdateCount());
@@ -1676,6 +1676,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
         });
+    }
+    // A flush the draw budget left for the next pass boundary happens here when this draw does not
+    // continue the pass. The flush starts a new command buffer, so the vertex and index buffers
+    // bound for this draw are bound again (it marks them dirty); everything else is bound below.
+    if (scheduler.FlushIfAtPassBoundary(texture_cache.GetFramebuffer())) {
+        buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (writes_storage) {
