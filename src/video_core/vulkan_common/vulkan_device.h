@@ -896,7 +896,9 @@ FN_MAX_LIMIT_LIST
     /// device has, or an Apple GPU through MoltenVK, which runs compute in 32-wide SIMD groups
     /// though MoltenVK reports a minimum subgroup size of 4 and no required size. Measured on an M6
     /// (threadExecutionWidth 32, threads_per_simdgroup 32 and simdgroup_index_in_threadgroup
-    /// tid / 32 for threadgroups of 32 to 1024) and assumed for other Apple GPUs.
+    /// tid / 32 for threadgroups of 32 to 1024) and assumed for other Apple GPUs. That assumption
+    /// is probed at startup (ProbeComputeSubgroupsAreGuestWarps), and only the shader profile keeps
+    /// the verdict: this still returns the assumption.
     bool AreComputeSubgroupsGuestWarps() const {
         return CanRequireComputeGuestWarpSize() ||
                (GetMinSubgroupSize() == GuestWarpSize && GetMaxSubgroupSize() == GuestWarpSize) ||

@@ -131,7 +131,8 @@ bool RunTest(const Device& device) {
                   std::span{words}.subspan(lane * COOPERATIVE_HMMA_TEST_LANE_WORDS,
                                            COOPERATIVE_HMMA_TEST_LANE_WORDS));
     }
-    RunComputeProbe(device, code, words);
+    // Unbounded, as it always was.
+    static_cast<void>(RunComputeProbe(device, code, words));
     const u32 wrong = CountWrongLanes(matrices, words);
     if (wrong != 0) {
         LOG_WARNING(Render_Vulkan,

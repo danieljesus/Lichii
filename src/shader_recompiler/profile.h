@@ -134,6 +134,9 @@ struct Profile {
     bool support_compute_full_subgroups{};
     /// Compute subgroups are guest warps, 32 lanes (Device::AreComputeSubgroupsGuestWarps)
     bool compute_subgroups_are_guest_warps{};
+    /// compute_subgroups_are_guest_warps was probed on the device, and holds only for the
+    /// workgroups the probe ran (Backend::SPIRV::IsSubgroupProbeShape)
+    bool compute_subgroup_layout_probed{};
     /// Shaders can ask for maximal reconvergence (SPV_KHR_maximal_reconvergence)
     bool support_maximal_reconvergence{};
     /// The guest's HMMA.16816.F16 runs on a cooperative matrix, in compute shaders

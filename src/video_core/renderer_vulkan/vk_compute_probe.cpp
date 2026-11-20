@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstring>
+#include <memory>
 
 #include "video_core/renderer_vulkan/vk_compute_probe.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -10,9 +11,30 @@
 
 namespace Vulkan {
 
-void RunComputeProbe(const Device& device, std::span<const u32> code, std::span<u32> words) {
+namespace {
+/// Everything a probe's submission uses, in the order it is made (and destroyed in reverse).
+struct ProbeObjects {
+    vk::ShaderModule module;
+    vk::DescriptorSetLayout set_layout;
+    vk::PipelineLayout layout;
+    vk::Pipeline pipeline;
+    vk::DescriptorPool pool;
+    vk::DescriptorSets sets;
+    std::unique_ptr<MemoryAllocator> allocator;
+    vk::Buffer buffer;
+    vk::CommandPool command_pool;
+    vk::CommandBuffers command_buffers;
+    vk::Fence fence;
+};
+} // Anonymous namespace
+
+ProbeResult RunComputeProbe(const Device& device, std::span<const u32> code, std::span<u32> words,
+                            u64 timeout_ns) {
     const auto& logical = device.GetLogical();
-    const vk::ShaderModule module = logical.CreateShaderModule(VkShaderModuleCreateInfo{
+    auto objects = std::make_unique<ProbeObjects>();
+    auto& [module, set_layout, layout, pipeline, pool, sets, allocator, buffer, command_pool,
+           command_buffers, fence] = *objects;
+    module = logical.CreateShaderModule(VkShaderModuleCreateInfo{
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -26,16 +48,15 @@ void RunComputeProbe(const Device& device, std::span<const u32> code, std::span<
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         .pImmutableSamplers = nullptr,
     };
-    const vk::DescriptorSetLayout set_layout =
-        logical.CreateDescriptorSetLayout(VkDescriptorSetLayoutCreateInfo{
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .bindingCount = 1,
-            .pBindings = &binding,
-        });
+    set_layout = logical.CreateDescriptorSetLayout(VkDescriptorSetLayoutCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .bindingCount = 1,
+        .pBindings = &binding,
+    });
     const VkDescriptorSetLayout set_layout_handle = *set_layout;
-    const vk::PipelineLayout layout = logical.CreatePipelineLayout(VkPipelineLayoutCreateInfo{
+    layout = logical.CreatePipelineLayout(VkPipelineLayoutCreateInfo{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -44,7 +65,7 @@ void RunComputeProbe(const Device& device, std::span<const u32> code, std::span<
         .pushConstantRangeCount = 0,
         .pPushConstantRanges = nullptr,
     });
-    const vk::Pipeline pipeline = logical.CreateComputePipeline(VkComputePipelineCreateInfo{
+    pipeline = logical.CreateComputePipeline(VkComputePipelineCreateInfo{
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -65,7 +86,7 @@ void RunComputeProbe(const Device& device, std::span<const u32> code, std::span<
         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         .descriptorCount = 1,
     };
-    const vk::DescriptorPool pool = logical.CreateDescriptorPool(VkDescriptorPoolCreateInfo{
+    pool = logical.CreateDescriptorPool(VkDescriptorPoolCreateInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .pNext = nullptr,
         .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
@@ -73,7 +94,7 @@ void RunComputeProbe(const Device& device, std::span<const u32> code, std::span<
         .poolSizeCount = 1,
         .pPoolSizes = &pool_size,
     });
-    const vk::DescriptorSets sets = pool.Allocate(VkDescriptorSetAllocateInfo{
+    sets = pool.Allocate(VkDescriptorSetAllocateInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .pNext = nullptr,
         .descriptorPool = *pool,
@@ -82,8 +103,8 @@ void RunComputeProbe(const Device& device, std::span<const u32> code, std::span<
     });
     const VkDescriptorSet set = sets[0];
 
-    const MemoryAllocator allocator{device};
-    vk::Buffer buffer = allocator.CreateBuffer(
+    allocator = std::make_unique<MemoryAllocator>(device);
+    buffer = allocator->CreateBuffer(
         VkBufferCreateInfo{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .pNext = nullptr,
@@ -120,13 +141,13 @@ void RunComputeProbe(const Device& device, std::span<const u32> code, std::span<
 
     // Its own submission: this runs while the renderer is being built, before the scheduler can
     // flush (it needs the query cache) and before anything else submits to the queue.
-    const vk::CommandPool command_pool = logical.CreateCommandPool(VkCommandPoolCreateInfo{
+    command_pool = logical.CreateCommandPool(VkCommandPoolCreateInfo{
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
         .queueFamilyIndex = device.GetGraphicsFamily(),
     });
-    const vk::CommandBuffers command_buffers = command_pool.Allocate(1);
+    command_buffers = command_pool.Allocate(1);
     const vk::CommandBuffer cmdbuf{command_buffers[0], device.GetDispatchLoader()};
     cmdbuf.Begin(VkCommandBufferBeginInfo{
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -146,7 +167,7 @@ void RunComputeProbe(const Device& device, std::span<const u32> code, std::span<
     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
                            read_results);
     cmdbuf.End();
-    const vk::Fence fence = logical.CreateFence(VkFenceCreateInfo{
+    fence = logical.CreateFence(VkFenceCreateInfo{
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -163,17 +184,22 @@ void RunComputeProbe(const Device& device, std::span<const u32> code, std::span<
         .signalSemaphoreCount = 0,
         .pSignalSemaphores = nullptr,
     };
+    // The pipeline (and with it the shader's compilation) was made before the submission: the
+    // timeout covers only running it.
     vk::Check(device.GetGraphicsQueue().Submit(submit, *fence));
-    // Bounded: a probe that never finishes fails instead of freezing the start. The objects it
-    // uses go when this returns or throws, so the device has to be done with them first.
-    constexpr u64 Timeout = u64{2'000'000'000}; // 2 s
-    if (const VkResult result = fence.Wait(Timeout); result != VK_SUCCESS) {
-        static_cast<void>(logical.WaitIdle());
-        vk::Check(result == VK_TIMEOUT ? VK_ERROR_DEVICE_LOST : result);
+    if (const VkResult result = fence.Wait(timeout_ns); result != VK_SUCCESS) {
+        // Still running, or the device is lost: the objects may be in use, so they are left alive
+        // (never freed) instead of destroyed under the device, and nothing waits for it.
+        static_cast<void>(objects.release());
+        if (result == VK_TIMEOUT) {
+            return ProbeResult::TimedOut;
+        }
+        throw vk::Exception(result);
     }
 
     buffer.Invalidate();
     std::memcpy(words.data(), buffer.Mapped().data(), words.size_bytes());
+    return ProbeResult::Finished;
 }
 
 } // namespace Vulkan

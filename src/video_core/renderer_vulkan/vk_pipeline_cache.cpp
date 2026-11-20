@@ -732,7 +732,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     if (profile.compute_subgroups_are_guest_warps && profile.support_compute_full_subgroups &&
         device.AssumesAppleComputeSubgroupsAreGuestWarps()) {
         // Nothing in Vulkan says so on an Apple GPU: check it once on the device.
-        profile.compute_subgroups_are_guest_warps = ProbeComputeSubgroupsAreGuestWarps(device);
+        subgroup_probe_passed = ProbeComputeSubgroupsAreGuestWarps(device);
+        profile.compute_subgroups_are_guest_warps = *subgroup_probe_passed;
+        profile.compute_subgroup_layout_probed = *subgroup_probe_passed;
     }
     profile.support_cooperative_hmma_16x16x16 =
         !profile.support_cooperative_hmma && device.IsCooperativeHmma16x16x16Supported();
@@ -2010,8 +2012,9 @@ namespace {
 /// The precache marker's variant: the build's SPIR-V emission stamp and the settings that change
 /// what the driver gets for a precache build. Resolution scaling bakes the scale into the
 /// rescaling code of the shaders; the loop safety checks and the bloom fix change the SPIR-V; the
-/// debug setting adds a create flag.
-u64 WarmVariant() {
+/// debug setting adds a create flag. So does the subgroup probe's verdict where it ran (the
+/// staged or the shuffled software HMMA); it is left out where it did not, keeping the variant.
+u64 WarmVariant(std::optional<bool> subgroup_probe_passed) {
     const auto& resolution = Settings::values.resolution_info;
     const std::array<u64, 7> inputs{
         VideoCommon::ShaderWarm::EmissionStamp(),
@@ -2022,7 +2025,13 @@ u64 WarmVariant() {
         Settings::values.fix_bloom_effects.GetValue() ? 1ULL : 0ULL,
         Settings::values.renderer_debug.GetValue() ? 1ULL : 0ULL,
     };
-    return Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));
+    const u64 variant =
+        Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));
+    if (!subgroup_probe_passed) {
+        return variant;
+    }
+    const std::array<u64, 2> probed{variant, *subgroup_probe_passed ? 2ULL : 1ULL};
+    return Common::CityHash64(reinterpret_cast<const char*>(probed.data()), sizeof(probed));
 }
 } // Anonymous namespace
 
@@ -2034,7 +2043,8 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
     const std::string path = Common::FS::PathToUTF8String(warm_file);
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
-                                            device.GetDeviceID(), CACHE_VERSION, WarmVariant());
+                                            device.GetDeviceID(), CACHE_VERSION,
+                                            WarmVariant(subgroup_probe_passed));
     };
     // Compute programs of the precache file, unless a matching marker says they were built.
     size_t file_entries = 0;

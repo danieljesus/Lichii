@@ -20,23 +20,31 @@ struct Shape {
     u32 x, y, z;
 };
 
-/// The workgroups the staged software HMMA may run with: x a multiple of 32, 32 to 1024
-/// invocations. Every one-dimensional size, and some with y and z, within the device's limits.
+/// The workgroups the probe runs (IsSubgroupProbeShape) within the device's limits.
 std::vector<Shape> ProbedShapes(const Device& device) {
-    const u32 max_invocations = (std::min)(device.GetMaxComputeWorkGroupInvocations(), 1024U);
+    using Shader::Backend::SPIRV::IsSubgroupProbeShape;
+    const u32 max_invocations = device.GetMaxComputeWorkGroupInvocations();
     const std::array<u32, 3> max_size = device.GetMaxComputeWorkGroupSize();
+    const auto fits = [&](const Shape& shape) {
+        return shape.x <= max_size[0] && shape.y <= max_size[1] && shape.z <= max_size[2] &&
+               u64{shape.x} * shape.y * shape.z <= max_invocations;
+    };
     std::vector<Shape> shapes;
-    for (u32 x = GuestWarpSize; x <= (std::min)(max_invocations, max_size[0]); x += GuestWarpSize) {
-        shapes.push_back({x, 1, 1});
+    for (u32 x = GuestWarpSize; IsSubgroupProbeShape(x, 1, 1); x += GuestWarpSize) {
+        if (fits({x, 1, 1})) {
+            shapes.push_back({x, 1, 1});
+        }
     }
-    for (const Shape shape : {Shape{32, 4, 1}, Shape{64, 2, 2}, Shape{32, 8, 4}}) {
-        if (shape.x * shape.y * shape.z <= max_invocations && shape.x <= max_size[0] &&
-            shape.y <= max_size[1] && shape.z <= max_size[2]) {
-            shapes.push_back(shape);
+    for (const auto& [x, y, z] : Shader::Backend::SPIRV::SUBGROUP_PROBE_PLANAR_SHAPES) {
+        if (fits({x, y, z})) {
+            shapes.push_back({x, y, z});
         }
     }
     return shapes;
 }
+
+/// A dispatch of a few invocations takes well under a millisecond: this only catches a hang.
+constexpr u64 ProbeTimeout = u64{2'000'000'000}; // 2 s
 } // Anonymous namespace
 
 bool ProbeComputeSubgroupsAreGuestWarps(const Device& device) {
@@ -47,14 +55,27 @@ bool ProbeComputeSubgroupsAreGuestWarps(const Device& device) {
         return false;
     }
     const std::vector<Shape> shapes = ProbedShapes(device);
+    if (shapes.empty()) {
+        LOG_WARNING(Render_Vulkan, "No compute workgroup to probe subgroups with within the "
+                                   "device's limits: the software HMMA keeps its shuffles");
+        return false;
+    }
     try {
         for (const Shape shape : shapes) {
             const u32 invocations = shape.x * shape.y * shape.z;
             const std::vector<u32> code = Shader::Backend::SPIRV::EmitSubgroupLayoutProbe(
                 device.SupportedSpirvVersion(), shape.x, shape.y, shape.z);
             std::vector<u32> words(invocations, 0);
-            RunComputeProbe(device, code, words);
+            if (RunComputeProbe(device, code, words, ProbeTimeout) == ProbeResult::TimedOut) {
+                LOG_WARNING(Render_Vulkan,
+                            "Compute subgroup probe timed out (a {}x{}x{} workgroup did not finish "
+                            "in {} s): the software HMMA keeps its shuffles",
+                            shape.x, shape.y, shape.z, ProbeTimeout / 1'000'000'000);
+                return false;
+            }
             for (u32 index = 0; index < invocations; ++index) {
+                // SubgroupSize is a constant on MoltenVK (its fixed subgroup size, 32, unless the
+                // pipeline allows a varying size): the subgroup and the lane are what is probed.
                 const u32 expected = SUBGROUP_PROBE_VALID | GuestWarpSize |
                                      ((index / GuestWarpSize) << 8) |
                                      ((index % GuestWarpSize) << 16);

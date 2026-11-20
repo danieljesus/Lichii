@@ -327,6 +327,9 @@ std::optional<u32> ReserveSoftwareHmmaScratch(const Profile& profile, IR::Progra
         program.workgroup_size[0] == 0 || program.workgroup_size[0] % GUEST_WARP_LANES != 0 ||
         WorkgroupInvocations(program) < GUEST_WARP_LANES ||
         WorkgroupInvocations(program) > SoftwareHmmaMaxInvocations ||
+        (profile.compute_subgroup_layout_probed &&
+         !IsSubgroupProbeShape(program.workgroup_size[0], program.workgroup_size[1],
+                               program.workgroup_size[2])) ||
         profile.max_subgroup_size != GUEST_WARP_LANES || Summarize(program).count == 0 ||
         !HmmaConverged(program)) {
         return std::nullopt;

@@ -1248,6 +1248,24 @@ TEST_CASE("Software HMMA's native rounding needs 16-bit floats",
     REQUIRE_FALSE(HasCapability(code, 9)); // Float16
 }
 
+TEST_CASE("The subgroup layout probe covers the workgroups it names", "[video_core][tensor]") {
+    using Backend::SPIRV::IsSubgroupProbeShape;
+    for (u32 x = 32; x <= 1024; x += 32) {
+        REQUIRE(IsSubgroupProbeShape(x, 1, 1));
+    }
+    REQUIRE(IsSubgroupProbeShape(32, 4, 1));
+    REQUIRE(IsSubgroupProbeShape(64, 2, 2));
+    REQUIRE(IsSubgroupProbeShape(32, 8, 4));
+    // Never run, so the staged HMMA does not take them on a probed device.
+    REQUIRE_FALSE(IsSubgroupProbeShape(32, 2, 1));
+    REQUIRE_FALSE(IsSubgroupProbeShape(32, 1, 8));
+    REQUIRE_FALSE(IsSubgroupProbeShape(96, 2, 1));
+    REQUIRE_FALSE(IsSubgroupProbeShape(1056, 1, 1));
+    REQUIRE_FALSE(IsSubgroupProbeShape(48, 1, 1));
+    REQUIRE_FALSE(IsSubgroupProbeShape(0, 1, 1));
+    REQUIRE_FALSE(IsSubgroupProbeShape(64, 4, 8));
+}
+
 TEST_CASE("The subgroup layout probe writes each invocation's subgroup", "[video_core][tensor]") {
     constexpr u32 BuiltInLocalInvocationIndex = 29;
     constexpr u32 BuiltInSubgroupSize = 36;
