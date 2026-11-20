@@ -53,6 +53,13 @@ constexpr u32 COOPERATIVE_HMMA_TEST_LANE_WORDS = 10;
 /// buffer (set 0, binding 0), to check at startup that the driver's matrix layout is the expected.
 [[nodiscard]] std::vector<u32> EmitCooperativeHmmaTest(u32 spirv_version);
 
+/// A compute shader of one workgroup of x * y * z invocations in which each writes, at its
+/// LocalInvocationIndex in a storage buffer at set 0 binding 0, SUBGROUP_PROBE_VALID | SubgroupSize
+/// | SubgroupId << 8 | SubgroupLocalInvocationId << 16: how the device lays its subgroups out.
+/// Needs SPIR-V 1.3 (the subgroup built-ins).
+[[nodiscard]] std::vector<u32> EmitSubgroupLayoutProbe(u32 spirv_version, u32 x, u32 y, u32 z);
+constexpr u32 SUBGROUP_PROBE_VALID = 1U << 31;
+
 /// Index the emulation writes for the vertices of a point or line past the primitive count. The
 /// vertex shader moves such a vertex outside the clip volume. (Triangles get 0 0 0 instead, a
 /// degenerate triangle.)

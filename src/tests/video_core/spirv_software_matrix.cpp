@@ -1247,3 +1247,32 @@ TEST_CASE("Software HMMA's native rounding needs 16-bit floats",
     REQUIRE(Instructions(code, OpFConvert).empty());
     REQUIRE_FALSE(HasCapability(code, 9)); // Float16
 }
+
+TEST_CASE("The subgroup layout probe writes each invocation's subgroup", "[video_core][tensor]") {
+    constexpr u32 BuiltInLocalInvocationIndex = 29;
+    constexpr u32 BuiltInSubgroupSize = 36;
+    constexpr u32 BuiltInSubgroupLocalInvocationId = 41;
+    constexpr u32 ExecutionModeLocalSize = 17;
+    for (const u32 invocations : {32U, 1024U}) {
+        const auto code = Backend::SPIRV::EmitSubgroupLayoutProbe(0x00010500U, invocations, 1, 1);
+        if (const char* directory = std::getenv("EDEN_TENSOR_TEST_OUTPUT")) {
+            std::filesystem::create_directories(directory);
+            std::ofstream file{std::filesystem::path{directory} /
+                                   ("subgroup-probe-" + std::to_string(invocations) + ".spv"),
+                               std::ios::binary};
+            file.write(reinterpret_cast<const char*>(code.data()),
+                       static_cast<std::streamsize>(code.size() * sizeof(u32)));
+        }
+        const auto decorations = Instructions(code, OpDecorate);
+        for (const u32 builtin : {BuiltInLocalInvocationIndex, BuiltInSubgroupSize,
+                                  BuiltInSubgroupId, BuiltInSubgroupLocalInvocationId}) {
+            REQUIRE(std::ranges::any_of(decorations, [&](const auto& words) {
+                return words.size() == 3 && words[1] == DecorationBuiltIn && words[2] == builtin;
+            }));
+        }
+        REQUIRE(std::ranges::any_of(Instructions(code, OpExecutionMode), [&](const auto& words) {
+            return words.size() == 5 && words[1] == ExecutionModeLocalSize &&
+                   words[2] == invocations && words[3] == 1 && words[4] == 1;
+        }));
+    }
+}

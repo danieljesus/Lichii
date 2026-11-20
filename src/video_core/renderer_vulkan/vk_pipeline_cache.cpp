@@ -73,6 +73,7 @@
 #include "video_core/renderer_vulkan/vk_shader_cache_v2.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/renderer_vulkan/vk_subgroup_probe.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_cache_v2/cache_file.h"
@@ -604,8 +605,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     if (driver_id == VK_DRIVER_ID_MESA_TURNIP) {
         supported_subgroup_stages &= ~(1u << static_cast<u32>(Shader::Stage::Geometry));
     }
-    // PCI vendor ID Apple's own GPUs report (not Intel or AMD GPUs in a Mac).
-    const bool is_apple_gpu = device.GetVendorID() == 0x106B;
+    // Apple's own GPUs through MoltenVK (not Intel or AMD GPUs in a Mac).
+    const bool is_apple_gpu = device.IsAppleGpu();
     profile = Shader::Profile{
         .supported_spirv = device.SupportedSpirvVersion(),
         .unified_descriptor_binding = true,
@@ -711,8 +712,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_float16 = device.IsFloat16Supported(),
         // Measured on Apple GPUs only (an M6): Intel and AMD Macs keep the default paths.
         .fp16_conversion_rounds_rte_with_denorms =
-            device.IsMoltenVK() && is_apple_gpu && device.IsFloat16Supported(),
-        .has_slow_dynamic_shuffle = device.IsMoltenVK() && is_apple_gpu,
+            is_apple_gpu && device.IsFloat16Supported(),
+        .has_slow_dynamic_shuffle = is_apple_gpu,
         .support_compute_full_subgroups = device.IsComputeFullSubgroupsSupported(),
         .compute_subgroups_are_guest_warps = device.AreComputeSubgroupsGuestWarps(),
         .support_maximal_reconvergence = device.IsKhrShaderMaximalReconvergenceSupported(),
@@ -728,6 +729,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     };
     profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
+    if (profile.compute_subgroups_are_guest_warps && profile.support_compute_full_subgroups &&
+        device.AssumesAppleComputeSubgroupsAreGuestWarps()) {
+        // Nothing in Vulkan says so on an Apple GPU: check it once on the device.
+        profile.compute_subgroups_are_guest_warps = ProbeComputeSubgroupsAreGuestWarps(device);
+    }
     profile.support_cooperative_hmma_16x16x16 =
         !profile.support_cooperative_hmma && device.IsCooperativeHmma16x16x16Supported();
     if (profile.support_cooperative_hmma_16x16x16) {
