@@ -87,8 +87,9 @@ u64 FPToFixed(size_t ibits, FPT op, size_t fbits, bool unsigned_, FPCR fpcr, Rou
         return 0;
     }
 
-    // Detect Overflow
-    const int min_exponent_for_overflow = int(ibits) - int(mcl::bit::highest_set_bit(value.mantissa + (round_up ? Safe::LogicalShiftRight<u64>(1, exponent) : 0))) - (unsigned_ ? 0 : 1);
+    // Detect Overflow. Rounding up adds to a positive value's magnitude, but takes from a negative
+    // one's: -2147483647.5 towards zero is -2147483647, which fits 32 bits.
+    const int min_exponent_for_overflow = int(ibits) - int(mcl::bit::highest_set_bit(value.mantissa + (round_up && !sign ? Safe::LogicalShiftRight<u64>(1, exponent) : 0))) - (unsigned_ ? 0 : 1);
     if (exponent >= min_exponent_for_overflow) {
         // Positive overflow
         if (unsigned_ || !sign) {
