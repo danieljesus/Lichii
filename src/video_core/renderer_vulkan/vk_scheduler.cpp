@@ -193,6 +193,9 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
         CountRenderPassEnd(location.file_name(), location.line());
         TempEndSite("flush", location);
     }
+    temp_submit_why = "flush";
+    temp_submit_file = location.file_name();
+    temp_submit_line = location.line();
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
@@ -274,6 +277,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
         CountRenderPassEnd(location.file_name(), location.line());
         TempEndSite("finish", location);
     }
+    temp_submit_why = "finish";
+    temp_submit_file = location.file_name();
+    temp_submit_line = location.line();
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
@@ -1169,8 +1175,12 @@ void Scheduler::TraceGpuSubmission() {
         trace_pass_count = 0;
         trace_pass = {};
     }
-    current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *trace_query_pool,
-                                        trace_gpu_count * 2);
+    // TEMP: EDEN_TMP_BEGIN_STAMP_BOTTOM=1 stamps the submission's start at BOTTOM_OF_PIPE, after
+    // the work before it, instead of when the command processor reaches it.
+    static const bool temp_begin_bottom = std::getenv("EDEN_TMP_BEGIN_STAMP_BOTTOM") != nullptr;
+    current_upload_cmdbuf.WriteTimestamp(temp_begin_bottom ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                                                           : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                        *trace_query_pool, trace_gpu_count * 2);
     trace_gpu_recording = true;
 }
 
@@ -1187,7 +1197,14 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     InvalidateState();
 
     const u64 signal_value = master_semaphore->NextTick();
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+    const char* const temp_sub_why = temp_submit_why;
+    const char* const temp_sub_file = temp_submit_file;
+    const u32 temp_sub_line = temp_submit_line;
+    temp_submit_why = "-";
+    temp_submit_file = "";
+    temp_submit_line = 0;
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, temp_sub_why,
+                            temp_sub_file, temp_sub_line,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1205,6 +1222,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             trace_submissions[trace_gpu_count] = trace_work;
             if (trace_pass_pool) {
                 trace_pass.submission = trace_gpu_count;
+                trace_pass.end_why = temp_sub_why; // TEMP: the tail records what submitted
+                trace_pass.end_file = temp_sub_file;
+                trace_pass.end_line = temp_sub_line;
                 trace_pass_tails[trace_gpu_count] = trace_pass;
             }
             ++trace_gpu_count;
@@ -1350,7 +1370,12 @@ void Scheduler::EndRenderPass()
                         .subresourceRange = range,
                 };
             }
-            TracePassEnd(cmdbuf, render_area, temp_why, temp_file, temp_line, temp_fb, temp_clears, static_cast<u32>(num_images));
+            // TEMP: EDEN_TMP_PASS_STAMP_AFTER_BARRIER=1 stamps the pass after EndRenderPass and its
+            // barriers, so their cost is the pass's and not the next segment's.
+            static const bool temp_after = std::getenv("EDEN_TMP_PASS_STAMP_AFTER_BARRIER") != nullptr;
+            if (!temp_after) {
+                TracePassEnd(cmdbuf, render_area, temp_why, temp_file, temp_line, temp_fb, temp_clears, static_cast<u32>(num_images));
+            }
             cmdbuf.EndRenderPass();
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
@@ -1365,6 +1390,9 @@ void Scheduler::EndRenderPass()
                 cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT,
                                        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        0, XFB_OUTPUT_BARRIER);
+            }
+            if (temp_after) {
+                TracePassEnd(cmdbuf, render_area, temp_why, temp_file, temp_line, temp_fb, temp_clears, static_cast<u32>(num_images));
             }
         });
 
