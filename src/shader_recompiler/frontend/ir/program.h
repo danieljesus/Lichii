@@ -35,9 +35,11 @@ struct Program {
     /// What the HMMA paths need to know of the program's TensorMulAdds, found in one pass for each
     /// HMMA plan (PrepareHmma, EmitSPIRV)
     struct HmmaSummary {
-        bool any;          ///< It has a TensorMulAdd
+        size_t count;      ///< Its TensorMulAdds
         bool any_k16;      ///< One of them is HMMA.16816 (depth 16)
-        bool converged;    ///< All run where the whole warp does (HmmaInConvergedFlow)
+        /// All run where the whole warp does (HmmaInConvergedFlow), looked at only for the staged
+        /// exchange, which needs it
+        std::optional<bool> converged;
     };
     mutable std::optional<HmmaSummary> hmma_summary;
     /// PrepareHmma set the HMMA requirements in info: emitting checks them instead

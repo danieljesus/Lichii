@@ -69,6 +69,7 @@ struct TensorProgram {
         profile.supported_spirv = 0x00010500;
         profile.supported_subgroup_stages = 1U << static_cast<u32>(Stage::Compute);
         profile.max_subgroup_size = 32;
+        profile.support_float16 = true;
         IR::IREmitter ir{block};
         if (count == 0) {
             return;
@@ -1217,4 +1218,32 @@ TEST_CASE("Software HMMA's exchange asks for maximal reconvergence where it can"
     TensorProgram shuffled{1, 16};
     shuffled.profile.support_maximal_reconvergence = true;
     REQUIRE_FALSE(reconverges(shuffled.Emit()));
+}
+
+TEST_CASE("Software HMMA's exchange needs a workgroup of whole warps in every dimension",
+          "[video_core][tensor][ampere]") {
+    // A dimension of 0 makes no warp at all: no area, and no clamp that wraps.
+    TensorProgram fixture{1, 16};
+    SlowShuffles(fixture);
+    fixture.program.workgroup_size = {32, 0, 1};
+    REQUIRE(Shuffles(fixture.Emit()));
+    REQUIRE(fixture.program.shared_memory_size == 0);
+    REQUIRE_FALSE(fixture.program.info.requires_full_guest_warps);
+}
+
+TEST_CASE("Software HMMA's native rounding needs 16-bit floats",
+          "[video_core][tensor][ampere]") {
+    // Both ways of rounding natively, but no shaderFloat16: no f16 type at all.
+    TensorProgram fixture{1, 16};
+    fixture.profile.support_float16 = false;
+    fixture.profile.support_float_controls = true;
+    fixture.profile.fp16_conversion_rounds_rte_with_denorms = true;
+    fixture.profile.support_fp16_rounding_rte = true;
+    fixture.profile.support_fp16_denorm_preserve = true;
+    fixture.profile.fp16_float_controls_independent_of_fp32 = true;
+    fixture.profile.support_separate_denorm_behavior = true;
+    fixture.profile.support_separate_rounding_mode = true;
+    const auto code = fixture.Emit();
+    REQUIRE(Instructions(code, OpFConvert).empty());
+    REQUIRE_FALSE(HasCapability(code, 9)); // Float16
 }

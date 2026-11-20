@@ -244,16 +244,27 @@ const IR::Program::HmmaSummary& Summarize(const IR::Program& program) {
             }
         }
         program.hmma_summary = IR::Program::HmmaSummary{
-            .any = total != 0,
+            .count = total,
             .any_k16 = any_k16,
-            .converged = total != 0 && HmmaInConvergedFlow(program, total),
+            .converged = std::nullopt,
         };
     }
     return *program.hmma_summary;
 }
 
-u32 WorkgroupInvocations(const IR::Program& program) {
-    return program.workgroup_size[0] * program.workgroup_size[1] * program.workgroup_size[2];
+bool HmmaConverged(const IR::Program& program) {
+    const IR::Program::HmmaSummary& summary = Summarize(program);
+    if (!summary.converged) {
+        program.hmma_summary->converged =
+            summary.count != 0 && HmmaInConvergedFlow(program, summary.count);
+    }
+    return *program.hmma_summary->converged;
+}
+
+/// In 64 bits: a product of the three sizes can pass 32 bits.
+u64 WorkgroupInvocations(const IR::Program& program) {
+    return u64{program.workgroup_size[0]} * program.workgroup_size[1] *
+           program.workgroup_size[2];
 }
 
 /// Appends `words_per_warp` words of shared memory for each 32-lane warp after the program's own
@@ -264,7 +275,7 @@ u32 WorkgroupInvocations(const IR::Program& program) {
 std::optional<u32> ReserveHmmaScratch(const Profile& profile, IR::Program& program,
                                       u32 words_per_warp) {
     ReleaseHmmaScratch(program);
-    const u32 warps = WorkgroupInvocations(program) / GUEST_WARP_LANES;
+    const u32 warps = static_cast<u32>(WorkgroupInvocations(program) / GUEST_WARP_LANES);
     const u32 scratch_offset = (program.shared_memory_size + 15U) & ~15U;
     const u32 total = scratch_offset + warps * words_per_warp * 4U;
     if (profile.max_compute_shared_memory_size != 0 &&
@@ -291,7 +302,7 @@ void ReleaseHmmaScratch(IR::Program& program) {
 
 std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program) {
     if (!profile.support_cooperative_hmma_16x16x16 || !SupportsCooperativeHmma(program) ||
-        !Summarize(program).any) {
+        Summarize(program).count == 0) {
         return std::nullopt;
     }
     // A, B and C/D tiles of 16x16 fp16, 128 words each, for each subgroup.
@@ -314,8 +325,10 @@ std::optional<u32> ReserveSoftwareHmmaScratch(const Profile& profile, IR::Progra
     if (!profile.has_slow_dynamic_shuffle || program.stage != Stage::Compute ||
         !profile.support_compute_full_subgroups || !profile.compute_subgroups_are_guest_warps ||
         program.workgroup_size[0] == 0 || program.workgroup_size[0] % GUEST_WARP_LANES != 0 ||
+        WorkgroupInvocations(program) < GUEST_WARP_LANES ||
         WorkgroupInvocations(program) > SoftwareHmmaMaxInvocations ||
-        profile.max_subgroup_size != GUEST_WARP_LANES || !Summarize(program).converged) {
+        profile.max_subgroup_size != GUEST_WARP_LANES || Summarize(program).count == 0 ||
+        !HmmaConverged(program)) {
         return std::nullopt;
     }
     return ReserveHmmaScratch(profile, program, SoftwareHmmaWordsPerWarp);
@@ -331,6 +344,10 @@ bool ConversionRoundsHalfItself(const Profile& profile, const Info& info) {
 
 // Or the conversion rounds that way without any mode (ConversionRoundsHalfItself).
 bool CanRoundHalfNatively(const Profile& profile, const Info& info) {
+    // The f16 type the conversion needs.
+    if (!profile.support_float16) {
+        return false;
+    }
     if (ConversionRoundsHalfItself(profile, info)) {
         return true;
     }
@@ -475,7 +492,9 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         if (staged) {
             // Clamped to the workgroup's warps, so that a subgroup layout other than the one
             // measured stays within the area instead of reaching memory beyond it.
-            const u32 last_warp = WorkgroupInvocations(program) / GUEST_WARP_LANES - 1;
+            // At least one warp: ReserveSoftwareHmmaScratch takes 32 to 1024 invocations.
+            const u32 last_warp =
+                static_cast<u32>(WorkgroupInvocations(program) / GUEST_WARP_LANES) - 1;
             const Id warp = ctx.OpUMin(u32ty, ctx.OpLoad(u32ty, ctx.tensor_subgroup_id),
                                        imm(last_warp));
             warp_slots = add(imm(*ctx.software_hmma_scratch_word),

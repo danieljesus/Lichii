@@ -120,6 +120,9 @@ struct Profile {
     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
     bool has_broken_spirv_subgroup_shuffle{};
     bool has_broken_spirv_fragment_shuffle{};
+    /// 16-bit floats in shaders (shaderFloat16). The software HMMA rounds to fp16 with a native
+    /// conversion only with them; a profile without it rounds in software, to the same values.
+    bool support_float16{};
     /// Converting f32 to f16 rounds to nearest even and keeps f16 subnormals without any execution
     /// mode, whatever the device reports in its float controls (Apple GPUs: MoltenVK reports no
     /// fp16 denorm preservation, but Metal's conversion keeps them). Implies 16-bit floats.
