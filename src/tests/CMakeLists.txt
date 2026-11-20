@@ -429,12 +429,19 @@ add_test(NAME log_file_lock_live
     COMMAND log_file_lock_tests "A second Lichii leaves a log another one still writes")
 add_test(NAME log_file_lock_third
     COMMAND log_file_lock_tests "A third Lichii takes the next free log")
-# The live cases wait for child processes: fail instead of hanging the run if one never ends.
-# Catch2 exits with 4 when its only case skips (no posix_spawn on Windows): report it as skipped.
 add_test(NAME log_file_lock_full
     COMMAND log_file_lock_tests "A Lichii that finds every log held keeps no log file")
+# The live cases wait for child processes: fail instead of hanging the run if one never ends.
 set_tests_properties(log_file_lock_parents log_file_lock_live log_file_lock_third
-    log_file_lock_full PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 4)
+    log_file_lock_full PROPERTIES TIMEOUT 60)
+# Catch2 exits with 4 when its only case skips (no posix_spawn on Windows): report it as skipped.
+# Only from Catch2 3.7.1 on, where failed assertions exit with 42: before that the exit code was
+# their count, and four failures would have read as a skip. The bundled Catch2 defines no version
+# here and is newer; a system one says which it is.
+if (NOT DEFINED Catch2_VERSION OR NOT Catch2_VERSION VERSION_LESS 3.7.1)
+    set_tests_properties(log_file_lock_parents log_file_lock_live log_file_lock_third
+        log_file_lock_full PROPERTIES SKIP_RETURN_CODE 4)
+endif()
 
 if (TARGET SDL3::SDL3)
     add_executable(sdl_window_state_tests lichii_cmd/sdl_window_state.cpp)
