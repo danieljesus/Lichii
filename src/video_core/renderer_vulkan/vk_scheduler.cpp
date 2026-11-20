@@ -189,6 +189,7 @@ Scheduler::~Scheduler() {
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
+    flush_at_pass_boundary = false;
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
@@ -534,6 +535,21 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
+}
+
+bool Scheduler::FlushIfAtPassBoundary(const Framebuffer* framebuffer,
+                                      std::source_location location) {
+    if (!flush_at_pass_boundary || deferred_clear.framebuffer != nullptr) {
+        return false;
+    }
+    const VkExtent2D render_area = framebuffer->RenderArea();
+    if (state.renderpass && framebuffer->Handle() == state.framebuffer &&
+        render_area.width == state.render_area.width &&
+        render_area.height == state.render_area.height) {
+        return false;
+    }
+    Flush({}, {}, location);
+    return true;
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {

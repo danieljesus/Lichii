@@ -125,6 +125,19 @@ public:
     void RequestRenderpass(const Framebuffer* framebuffer,
                            std::source_location location = std::source_location::current());
 
+    /// Asks for a flush when a draw next does not continue the active render pass, instead of one
+    /// now that would split it (FlushIfAtPassBoundary). Any flush meets it.
+    void RequestFlushAtPassBoundary() noexcept {
+        flush_at_pass_boundary = true;
+    }
+
+    /// Flushes, if one was asked for at a pass boundary and a draw for `framebuffer` would not
+    /// continue the active pass: none is active, it is another framebuffer or area, and no clear
+    /// is deferred (flushing would make that clear its own pass). Returns whether it flushed: the
+    /// draw then binds its command buffer state again.
+    bool FlushIfAtPassBoundary(const Framebuffer* framebuffer,
+                               std::source_location location = std::source_location::current());
+
     /// Defers a full-attachment color clear so it becomes the next render pass.
     bool DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot, const VkClearValue& value);
 
@@ -613,6 +626,7 @@ private:
     vk::CommandBuffer current_upload_cmdbuf;
 
     DeferredClear deferred_clear;
+    bool flush_at_pass_boundary = false;
 
     std::unique_ptr<CommandChunk> chunk;
     std::function<void()> on_submit;

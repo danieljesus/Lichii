@@ -144,3 +144,31 @@ TEST_CASE("Changing the active native policy preserves recorded work",
     REQUIRE(Advance(counter, true, false) == Action::Dispatch);
     REQUIRE(counter == 32);
 }
+
+TEST_CASE("A budget flush inside a render pass waits for the pass to end",
+          "[video_core][submission_policy]") {
+    using Vulkan::SubmissionPolicy::FlushBeforeDraw;
+    // Inside a pass: it waits for the boundary.
+    REQUIRE_FALSE(FlushBeforeDraw(true, 0, 128));
+    REQUIRE_FALSE(FlushBeforeDraw(true, 127, 128));
+    // With no pass active it splits none.
+    REQUIRE(FlushBeforeDraw(false, 0, 128));
+    // A pass longer than the budget is still submitted, once the budget passes again.
+    REQUIRE(FlushBeforeDraw(true, 128, 128));
+}
+
+TEST_CASE("Waiting for a pass boundary keeps the draw budget's cadence",
+          "[video_core][submission_policy]") {
+    // The counter and budget are Advance's own, unchanged: on the legacy path it checks every 32
+    // draws, so a budget of 128 asks for a flush every 159.
+    u32 counter = 0;
+    std::vector<u32> asked;
+    for (u32 draw = 1; draw <= 477; ++draw) {
+        if (Vulkan::SubmissionPolicy::Advance(counter, false, false,
+                                              Vulkan::SubmissionPolicy::DefaultNativeBudget,
+                                              128) == Vulkan::SubmissionPolicy::Action::Flush) {
+            asked.push_back(draw);
+        }
+    }
+    REQUIRE(asked == std::vector<u32>{159, 318, 477});
+}

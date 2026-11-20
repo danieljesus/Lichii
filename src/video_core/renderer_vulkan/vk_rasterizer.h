@@ -324,6 +324,10 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    /// A flush the draw budget asked for inside a render pass, waiting for it to end: the tick it
+    /// was asked at, and the draws since (SubmissionPolicy::FlushBeforeDraw)
+    std::optional<u64> deferred_flush_tick;
+    u32 deferred_flush_draws = 0;
     std::optional<u64> oot_camera_sample_frame;
     /// Why this frame's largest scene-target draw with a camera buffer gave no camera.
     struct OcarinaCameraRefusal {

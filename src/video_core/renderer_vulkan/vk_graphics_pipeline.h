@@ -428,7 +428,7 @@ private:
                                 const std::array<bool, NUM_STAGES>& stages, size_t fragment_entry);
 
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
-                       const RenderAreaPushConstant& render_are);
+                       const RenderAreaPushConstant& render_are, bool is_indexed);
 
     void MakePipeline(VkRenderPass render_pass);
 

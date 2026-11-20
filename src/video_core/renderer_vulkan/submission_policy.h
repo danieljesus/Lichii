@@ -51,4 +51,12 @@ constexpr Action Advance(u32& counter, bool native, bool android,
     return Action::Flush;
 }
 
+/// Whether a flush the legacy budget asked for happens at the start of this draw rather than at
+/// the next render pass boundary (Scheduler::FlushIfAtPassBoundary): when no pass is active, so
+/// it splits none, or when it has waited `budget` draws already, so a long pass is still
+/// submitted.
+constexpr bool FlushBeforeDraw(bool render_pass_active, u32 deferred_draws, u32 budget) {
+    return !render_pass_active || deferred_draws >= budget;
+}
+
 } // namespace Vulkan::SubmissionPolicy
