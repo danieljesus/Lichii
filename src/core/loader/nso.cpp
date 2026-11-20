@@ -16,6 +16,8 @@
 #include "common/game_presets.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
+#include "common/npln_patch_catalog.h"
+#include "common/npln_patch_manifest.h"
 #include "common/lz4_compression.h"
 #include "common/zbic_compression.h"
 #include "common/settings.h"
@@ -237,6 +239,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Apply patches if necessary
     const auto name = nso_file.GetName();
+    bool frame_rate_unlocked = false;
     if (pm && (pm->HasNSOPatch(nso_header.build_id, name) || Settings::values.dump_nso)) {
         std::span<u8> patchable_section(codeset.memory.data() + module_start, codeset.memory.size() - module_start);
         std::vector<u8> pi_header(sizeof(NSOHeader) + patchable_section.size());
@@ -244,9 +247,21 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         std::memcpy(pi_header.data() + sizeof(NSOHeader), patchable_section.data(),
                     patchable_section.size());
 
-        pi_header = pm->PatchNSO(pi_header, name);
+        pi_header = pm->PatchNSO(pi_header, name, &frame_rate_unlocked);
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
+    }
+
+    // The signed Nextendo patch fixed for this launch, applied after mods as citron-nextendo does.
+    static_assert(sizeof(NSOHeader) == Common::NplnPatchCatalog::NsoHeaderSize);
+    if (pm) {
+        const auto build_id = Common::HexToString(nso_header.build_id);
+        if (const auto applied = Common::NplnPatchCatalog::Apply(
+                pm->GetTitleID(), build_id, name,
+                std::span(codeset.memory).subspan(module_start))) {
+            LOG_INFO(Loader, "Nextendo: NPLN patch {} v{} applied to {} build {}", applied->id,
+                     applied->version, name, build_id);
+        }
     }
 
     // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native
@@ -514,6 +529,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         process.SetMkwFrameModeAddress(
             mkw_mode_word_offset != 0 ? load_base + module_start + mkw_mode_word_offset : 0);
     }
+    if (frame_rate_unlocked) {
+        process.SetFrameRateUnlocked(true);
+    }
     if (frame_interval_offset != 0) {
         process.SetFrameIntervalAddresses(load_base + module_start + frame_interval_offset,
                                           load_base + module_start + frame_interval_source_offset);
@@ -544,6 +562,17 @@ AppLoader_NSO::LoadResult AppLoader_NSO::Load(Kernel::KProcess& process, Core::S
 
 ResultStatus AppLoader_NSO::ReadNSOModules(Modules& out_modules) {
     out_modules = this->modules;
+    return ResultStatus::Success;
+}
+
+ResultStatus AppLoader_NSO::ReadMainBuildId(Core::System& system,
+                                            std::array<u8, 0x20>& build_id) {
+    NSOHeader header{};
+    if (!file || file->ReadObject(&header) != sizeof(header) ||
+        header.magic != Common::MakeMagic('N', 'S', 'O', '0')) {
+        return ResultStatus::ErrorLoadingNSO;
+    }
+    build_id = header.build_id;
     return ResultStatus::Success;
 }
 

@@ -23,6 +23,7 @@
 #include "shader_recompiler/frontend/ampere/program_override.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
+#include "video_core/dlss_contract.h"
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/front_qmd.h"
 #include "video_core/nx2_profile.h"
@@ -31,6 +32,7 @@
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_list_macro_trace.h"
+#include "video_core/nx2_mme_capture.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/native_upscale.h"
@@ -43,6 +45,7 @@
 #include "video_core/macro_turing_jit.h"
 #endif
 #include "video_core/rasterizer_interface.h"
+#include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Engines {
@@ -903,8 +906,12 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (dlss_chain.output_pass) {
         return replacement && !recheck_after_dispatch && FinishDlssEvaluation();
     }
-    return DlssNetworkDroppedForGood() && !passes->IsPrepass(native_key) &&
-           dlss_chain.programs.contains(native_key);
+    // While the network can't be shown at all (turned off or replaced on request, resolution
+    // scaling, no support), its own passes are skipped like a network dropped for good: the
+    // replacement draws over their result anyway, and a pass that can't run (tensor operations
+    // unavailable) would drop the prepass's jitter, motion vectors and depth the replacement needs.
+    return (blocker != VideoCore::GameDlssReason::None || DlssNetworkDroppedForGood()) &&
+           !passes->IsPrepass(native_key) && dlss_chain.programs.contains(native_key);
 }
 
 // The game's own DLSS network (its translated programs) is shown once every pass of an
@@ -1234,8 +1241,8 @@ bool KeplerCompute::BypassOotBaseNetwork() {
     return false;
 }
 
-/// Replace a known output pass with a copy of the tonemapped image it samples, using scaling for
-/// the base game. The update's network passes may be skipped after a successful replacement.
+/// Replace a known output pass with a copy of the latest tonemapped image, using scaling for the
+/// base game. The update's network passes may be skipped after a successful replacement.
 bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     using namespace VideoCommon::OotNetwork;
     if (!BypassEnabled(program_id)) {
@@ -1285,38 +1292,55 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
         bypass->after_network.compare_exchange_strong(none, native_key, std::memory_order_relaxed);
         return false;
     }
-    // The base game can run its tonemap at a lower resolution than the output.
-    const auto tonemapped = ConstBuffer0Image(InputImageHandleOffset);
+    // The update's output pass samples the HDR scene the tonemap pass reads (B10G11R11 memory
+    // through an E5B9G9R9 descriptor, see TryOcarinaUpscale), so copying it would skip the
+    // tonemap. The copy reads the latest draw of the input's size since the last output pass
+    // instead: that is the tonemap, drawn after the scene, whichever shader draws it.
+    const auto input = ConstBuffer0Image(InputImageHandleOffset);
     const auto output = ConstBuffer0Image(OutputImageHandleOffset);
     const auto valid = [](const std::optional<Texture::TICEntry>& image) {
         return image && image->Address() != 0 && image->IsBlockLinear() && image->Width() != 0 &&
                image->Height() != 0;
     };
-    // The tonemap pass renders B10G11R11; the update's output pass samples that memory through an
-    // E5B9G9R9 descriptor (see TryOcarinaUpscale). The copy reads it as the tonemap rendered it.
+    Maxwell3D::Regs::RenderTargetConfig tonemapped{};
+    {
+        std::scoped_lock lock{bypass->mutex};
+        if (bypass->latest_address.exchange(0, std::memory_order_relaxed) != 0) {
+            tonemapped = bypass->latest_draw;
+        }
+    }
     const Texture::TextureFormat input_format =
-        tonemapped ? tonemapped->format.Value() : Texture::TextureFormat{};
-    if (!valid(tonemapped) || !valid(output) ||
-        (input_format != Texture::TextureFormat::B10G11R11 &&
-         input_format != Texture::TextureFormat::E5B9G9R9) ||
-        output->format != Texture::TextureFormat::B10G11R11 ||
-        output->Address() == tonemapped->Address() ||
-        (base_output
-             ? tonemapped->Width() > output->Width() || tonemapped->Height() > output->Height()
-             : tonemapped->Width() != output->Width() ||
-                   tonemapped->Height() != output->Height())) {
+        input ? input->format.Value() : Texture::TextureFormat{};
+    const bool images_valid = valid(input) && valid(output) &&
+                              (input_format == Texture::TextureFormat::B10G11R11 ||
+                               input_format == Texture::TextureFormat::E5B9G9R9) &&
+                              output->format == Texture::TextureFormat::B10G11R11;
+    // Draws are matched against the previous output pass's images, so the first one only learns
+    // them.
+    const bool learned = bypass->input_width.load(std::memory_order_relaxed) != 0;
+    if (images_valid) {
+        bypass->input_width.store(input->Width(), std::memory_order_relaxed);
+        bypass->input_height.store(input->Height(), std::memory_order_relaxed);
+        bypass->output_address.store(output->Address(), std::memory_order_relaxed);
+    }
+    // The base game can run its tonemap at a lower resolution than the output.
+    if (!images_valid || tonemapped.Address() == 0 || tonemapped.Address() == output->Address() ||
+        (base_output ? tonemapped.width > output->Width() || tonemapped.height > output->Height()
+                     : tonemapped.width != output->Width() ||
+                           tonemapped.height != output->Height())) {
         bypass->output_replaced.store(false, std::memory_order_relaxed);
         static bool warned = false;
-        if (!std::exchange(warned, true)) {
+        if ((learned || !images_valid) && !std::exchange(warned, true)) {
             const auto size = [](const std::optional<Texture::TICEntry>& image) {
                 return image ? fmt::format("{}x{} format {:#x}", image->Width(), image->Height(),
                                            static_cast<u32>(image->format.Value()))
                              : std::string{"unreadable"};
             };
             LOG_WARNING(HW_GPU,
-                        "Ocarina of Time: unexpected network images; not replaced (tonemapped {}, "
-                        "output {})",
-                        size(tonemapped), size(output));
+                        "Ocarina of Time: unexpected network images; not replaced (tonemapped "
+                        "{:#x} {}x{}, input {}, output {})",
+                        tonemapped.Address(), tonemapped.width, tonemapped.height, size(input),
+                        size(output));
         }
         return false;
     }
@@ -1332,13 +1356,13 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     destination.addr_upper = static_cast<u32>(output->Address() >> 32);
     destination.addr_lower = static_cast<u32>(output->Address());
     Fermi2D::Surface source = destination;
-    source.width = tonemapped->Width();
-    source.height = tonemapped->Height();
-    source.block_width.Assign(tonemapped->block_width);
-    source.block_height.Assign(tonemapped->block_height);
-    source.block_depth.Assign(tonemapped->block_depth);
-    source.addr_upper = static_cast<u32>(tonemapped->Address() >> 32);
-    source.addr_lower = static_cast<u32>(tonemapped->Address());
+    source.width = tonemapped.width;
+    source.height = tonemapped.height;
+    source.block_width.Assign(tonemapped.tile_mode.block_width);
+    source.block_height.Assign(tonemapped.tile_mode.block_height);
+    source.block_depth.Assign(tonemapped.tile_mode.block_depth);
+    source.addr_upper = tonemapped.address_high;
+    source.addr_lower = tonemapped.address_low;
     const s32 width = static_cast<s32>(output->Width());
     const s32 height = static_cast<s32>(output->Height());
     const Fermi2D::Config config{
@@ -1361,9 +1385,9 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (!std::exchange(logged, true)) {
         LOG_INFO(HW_GPU,
                  "Ocarina of Time: anti-aliasing network bypassed ({}): "
-                 "shader {:016x}, {:#x} {}x{} (format {:#x}) -> {:#x} {}x{}",
+                 "shader {:016x}, {:#x} {}x{} (input {:#x}) -> {:#x} {}x{}",
                  copied ? "copy of the tonemapped image" : "copy failed", native_key,
-                 tonemapped->Address(), source.width, source.height, static_cast<u32>(input_format),
+                 tonemapped.Address(), source.width, source.height, input->Address(),
                  output->Address(), width, height);
     }
     return copied;
@@ -1466,11 +1490,16 @@ void KeplerCompute::RememberDlssMotionVectors() {
     dlss_motion_color = color->Address();
     const u32 depth_offset = dlss_chain.render_region ? 0x288 : 0x298;
     const auto depth = cbuf.size.Value() >= 0x29c ? image(depth_offset) : std::nullopt;
-    if (depth && depth->format == Texture::TextureFormat::Z32 && depth->Address() != 0 &&
-        same_grid(*depth) && depth->IsBlockLinear()) {
+    if (!depth || depth->Address() == 0 || !same_grid(*depth) || !depth->IsBlockLinear()) {
+        return;
+    }
+    // The texture cache's mapping for this TIC, so both accept the same depths. The TIC comes from
+    // the guest, so an unknown tuple is skipped instead of asserting.
+    const auto depth_format = VideoCommon::TryPixelFormatFromTextureInfo(
+        depth->format, depth->r_type, depth->g_type, depth->b_type, depth->a_type,
+        depth->srgb_conversion != 0);
+    if (depth_format && VideoCommon::DlssContract::IsUpscalerDepthFormat(*depth_format)) {
         dlss_depth = *depth;
-    } else {
-        dlss_depth.reset();
     }
 }
 
@@ -1591,22 +1620,35 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
     // Without this evaluation's jitter or usable motion vectors (a rejected pass clears them), the
     // region is still scaled, without history, rather than leaving the network's output.
     const bool use_history = jitter && motion && width <= motion->Width() &&
-                             height <= motion->Height() &&
-                             (!depth || (width <= depth->Width() && height <= depth->Height()));
+                             height <= motion->Height();
+    // A depth too small for the region is left out; history still runs (on the stand-in).
+    const bool depth_fits = depth && width <= depth->Width() && height <= depth->Height();
     Fermi2D::Surface motion_surface{};
     if (use_history) {
         motion_surface = surface(*motion);
         motion_surface.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
     }
-    // The game's motion vectors point from the previous position to the current one (a rightward
-    // pan gives negative x while the scene moves left), the reverse of what the upscale expects.
+    // Measured: the vectors at cb0+0x290 are in output pixels and point to the previous position
+    // (prev = cur + mv); the raw cb0+0x284 buffer has the opposite sign (the prepass scales it by -1080).
     const std::array<f32, 2> motion_scale =
-        use_history ? std::array{-1.0f, -1.0f} : std::array{0.0f, 0.0f};
-    const bool done = rasterizer->AccelerateTemporalUpscale(
-        surface(*input), surface(*output), motion_surface,
-        use_history && depth ? &*depth : nullptr,
-        jitter ? jitter->offset : std::array{0.0f, 0.0f}, motion_scale, use_history,
-        std::array{width, height});
+        use_history ? std::array{1.0f / static_cast<f32>(output->Width()),
+                                 1.0f / static_cast<f32>(output->Height())}
+                    : std::array{0.0f, 0.0f};
+    const auto upscale = [&](bool history, const Texture::TICEntry* upscale_depth) {
+        return rasterizer->AccelerateTemporalUpscale(
+            surface(*input), surface(*output), history ? motion_surface : Fermi2D::Surface{},
+            upscale_depth, jitter ? jitter->offset : std::array{0.0f, 0.0f},
+            history ? motion_scale : std::array{0.0f, 0.0f}, history, std::array{width, height});
+    };
+    // Each refusal drops one input: the depth (it can be refused after it was prepared), then the
+    // history, which leaves the spatial draw the region always had.
+    bool done = use_history && depth_fits && upscale(true, &*depth);
+    if (!done && use_history) {
+        done = upscale(true, nullptr);
+    }
+    if (!done) {
+        done = upscale(false, nullptr);
+    }
     static u32 last_width{};
     if (width != last_width) {
         last_width = width;
@@ -1619,22 +1661,23 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
 
 bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     using namespace VideoCommon::FireEmblemUpscale;
-    static const bool requested_history = [] {
+    // Temporal by default: a spatial upscale of the jittered input crawls from frame to frame.
+    // EDEN_NX2_DLSS_REPLACEMENT=spatial keeps the spatial de-jitter for comparisons.
+    static const bool spatial_requested = [] {
         const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return option && (std::string_view{option} == "fsr" || std::string_view{option} == "dlss");
+        return option && std::string_view{option} == "spatial";
     }();
-    const bool use_history = allow_history && requested_history;
     const size_t game_index = dlss_chain.spatial_only ? 1 : 0;
     const char* const game = dlss_chain.spatial_only ? "Star Fox" : "Fire Emblem";
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
-    if (!dlss_chain.render_region && (!jitter || (use_history && (!motion || !depth)))) {
+    if (!dlss_chain.render_region && !jitter) {
         static std::array<bool, 2> reported{};
         if (!reported[game_index]) {
             reported[game_index] = true;
-            LOG_WARNING(HW_GPU, "{} replacement lacks current inputs: jitter={} motion={} depth={} temporal={}; retaining native dispatch",
-                        game, jitter.has_value(), motion.has_value(), depth.has_value(), use_history);
+            LOG_WARNING(HW_GPU, "{} replacement lacks this frame's jitter; retaining native dispatch",
+                        game);
         }
         return false;
     }
@@ -1658,10 +1701,14 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         return ScaleDlssRenderRegion(address, input, output, jitter, motion, depth);
     }
     if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
-        jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
-        jitter->width != input->Width() || jitter->height != input->Height()) {
+        jitter->color != input->Address() || jitter->width != input->Width() ||
+        jitter->height != input->Height()) {
         return false;
     }
+    // A frame without matching motion vectors and depth is scaled spatially, as is one the
+    // temporal upscale turns down; never left to the native pass.
+    bool use_history = allow_history && !spatial_requested && motion && depth &&
+                       dlss_motion_color == input->Address();
     const auto surface = [](const Texture::TICEntry& tic, Tegra::RenderTargetFormat format) {
         Fermi2D::Surface result{};
         result.format = format;
@@ -1680,11 +1727,18 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
                                                      : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     const auto output_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
                                                       : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
-    const bool done = rasterizer->AccelerateTemporalUpscale(
-        surface(*input, input_format), surface(*output, output_format),
-        use_history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
-        use_history ? &*depth : nullptr, jitter->offset,
-        use_history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, use_history);
+    const auto upscale = [&](bool history) {
+        return rasterizer->AccelerateTemporalUpscale(
+            surface(*input, input_format), surface(*output, output_format),
+            history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
+            history ? &*depth : nullptr, jitter->offset,
+            history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, history);
+    };
+    bool done = upscale(use_history);
+    if (!done && use_history) {
+        use_history = false;
+        done = upscale(false);
+    }
     static std::array<u32, 2> logged{};
     if (logged[game_index]++ < 8) {
         LOG_INFO(HW_GPU, "{} DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",
@@ -1944,10 +1998,16 @@ void KeplerCompute::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: compute macros back on the engine");
 }
 
-void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
+void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument, bool from_macro) {
     // As ProcessNativeMethod does with the macro code and bindings.
     if (method == 0x45 || method == 0x47) {
         fs.compute_uploaded = true;
+    }
+    if (VideoCommon::MmeCapture::active && method - 0x45 < 4) {
+        VideoCommon::MmeCapture::RecordWrite(
+            memory_manager.GetID(), this, from_macro ? "compute macro" : "compute dma",
+            !native_context ? "standalone" : fs.compute_uploaded ? "compute" : "3d",
+            method, argument, FrontMacroEngine(fs).native_write_offset, fs.bind_pointer);
     }
     Nx2ListIndirect::NoteUploadMethod(fs.upload, method, argument, [&fs](u32 reg) {
         return fs.registers[reg];
@@ -2255,9 +2315,11 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                                   FrontState& fs) {
     const auto positions = FrontMacroPositions(fs);
     const u32 method = *fs.executing_macro;
-    const u32 start = positions[((method - 0xe00) / 2) % positions.size()];
+    const u32 slot = static_cast<u32>(((method - 0xe00) / 2) % positions.size());
+    const u32 start = positions[slot];
     fs.executing_macro.reset();
     auto& macro = FrontMacroEngine(fs);
+    const bool use_compute_bank = fs.compute_uploaded;
     if (native_data_ram) {
         macro.native_interpreter.active_dram = native_data_ram;
     }
@@ -2280,7 +2342,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             return false;
         }
         ListTrace::NoteWrite(trace, address, value);
-        FrontApply(fs, address, value);
+        FrontApply(fs, address, value, true);
         if (IsQmdMethod(address)) {
             GetFrontQmd().MaybeTakeOver(split, native_qmd);
         }
@@ -2321,17 +2383,19 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             Nx2ListIndirect::Stats::NoteConcretized(reason);
         }
     }
+    u32 last_pc = ~0U;
 #ifdef ARCHITECTURE_x86_64
     if (!macro.native_jit) {
         macro.native_jit = std::make_shared<TuringMacroJit>();
     }
-    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
+    const bool capture_pc = VideoCommon::MmeCapture::active;
+    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation, capture_pc);
     const auto result =
         trace != nullptr && trace->data_ram
             ? macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit)
             : macro.native_jit->Execute(start, fs.parameters,
                                         std::span<u32>{*macro.native_interpreter.active_dram},
-                                        read, emit);
+                                        read, emit, capture_pc ? &last_pc : nullptr);
 #else
     const auto result =
         macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit);
@@ -2340,6 +2404,12 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         macro.native_execution_failed = true;
         LOG_ERROR(HW_GPU, "Native MME (split front) failed: compute start={:#x}, consumed={}, error={}",
                   start, result.consumed, result.error);
+        if (VideoCommon::MmeCapture::active) {
+            VideoCommon::MmeCapture::Fail(
+                memory_manager.GetID(), this,
+                !native_context ? "standalone" : use_compute_bank ? "compute" : "3d",
+                method, slot, start, result, last_pc, macro.native_code, fs.parameters);
+        }
     }
     if (trace != nullptr) {
         ListTrace::EndCall(*trace, false, macro.native_interpreter.data_ram_reads,
