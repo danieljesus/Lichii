@@ -194,39 +194,156 @@ bool UsesCooperativeHmma(const Profile& profile, const IR::Program& program) {
     return false;
 }
 
-std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program) {
-    if (!profile.support_cooperative_hmma_16x16x16 || !SupportsCooperativeHmma(program)) {
-        return std::nullopt;
-    }
-    bool has_hmma{};
-    for (const auto* block : program.blocks) {
-        for (const auto& inst : block->Instructions()) {
-            has_hmma |= inst.GetOpcode() == IR::Opcode::TensorMulAdd;
+namespace {
+using HmmaScratchKind = IR::Program::HmmaScratch::Kind;
+
+/// Whether every HMMA runs where the whole warp does, as far as the structure shows: outside any
+/// if and any loop (whose breaks or repeat condition may differ between lanes), and after no
+/// return inside an if or a loop (lanes that left early). The staged exchange's subgroup barriers need that;
+/// hardware HMMA needs it too, but a shuffle from an inactive lane only gives an undefined value
+/// where a barrier can hang.
+bool HmmaInConvergedFlow(const IR::Program& program) {
+    u32 if_depth = 0;
+    u32 loop_depth = 0;
+    size_t seen = 0;
+    bool returned_early = false;
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        switch (node.type) {
+        case IR::AbstractSyntaxNode::Type::If:
+            ++if_depth;
+            break;
+        case IR::AbstractSyntaxNode::Type::EndIf:
+            if_depth -= if_depth != 0 ? 1 : 0;
+            break;
+        case IR::AbstractSyntaxNode::Type::Loop:
+            ++loop_depth;
+            break;
+        case IR::AbstractSyntaxNode::Type::Repeat:
+            loop_depth -= loop_depth != 0 ? 1 : 0;
+            break;
+        case IR::AbstractSyntaxNode::Type::Return:
+        case IR::AbstractSyntaxNode::Type::Unreachable:
+            // Inside an if or a loop, some lanes may leave while others go on.
+            returned_early |= if_depth != 0 || loop_depth != 0;
+            break;
+        case IR::AbstractSyntaxNode::Type::Block:
+            for (const auto& inst : node.data.block->Instructions()) {
+                if (inst.GetOpcode() != IR::Opcode::TensorMulAdd) {
+                    continue;
+                }
+                if (if_depth != 0 || loop_depth != 0 || returned_early) {
+                    return false;
+                }
+                ++seen;
+            }
+            break;
+        default:
+            break;
         }
     }
-    if (!has_hmma) {
-        return std::nullopt;
+    // Every HMMA of the program has to have been seen through the structure.
+    size_t total = 0;
+    for (const auto* block : program.blocks) {
+        for (const auto& inst : block->Instructions()) {
+            total += inst.GetOpcode() == IR::Opcode::TensorMulAdd ? 1 : 0;
+        }
     }
+    return seen == total;
+}
+
+bool HasHmma(const IR::Program& program) {
+    for (const auto* block : program.blocks) {
+        for (const auto& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::TensorMulAdd) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Appends `words_per_warp` words of shared memory for each 32-lane warp after the program's own
+/// (16-byte aligned) and returns the word where they start. Once: emitting the same program again
+/// gives the same area, not a second one, and another kind replaces it. None past the device's
+/// limit, where the pipeline would not build.
+std::optional<u32> ReserveHmmaScratch(const Profile& profile, IR::Program& program,
+                                      HmmaScratchKind kind, u32 words_per_warp) {
+    // Reserved again from the program's own size each time: the same kind finds the same word,
+    // and the limit is checked under this profile.
+    ReleaseHmmaScratch(program);
     const u32 invocations = program.workgroup_size[0] * program.workgroup_size[1] *
                             program.workgroup_size[2];
-    const u32 subgroups = invocations / GUEST_WARP_LANES;
+    const u32 warps = invocations / GUEST_WARP_LANES;
     const u32 scratch_offset = (program.shared_memory_size + 15U) & ~15U;
-    const u32 total = scratch_offset + subgroups * 384U * 4U;
-    // Past the device limit the pipeline would fail to build: keep the emulation.
+    const u32 total = scratch_offset + warps * words_per_warp * 4U;
     if (profile.max_compute_shared_memory_size != 0 &&
         total > profile.max_compute_shared_memory_size) {
         return std::nullopt;
     }
+    program.hmma_scratch = IR::Program::HmmaScratch{
+        .kind = kind,
+        .word = scratch_offset / 4U,
+        .program_bytes = program.shared_memory_size,
+    };
     program.shared_memory_size = total;
     return scratch_offset / 4U;
+}
+} // Anonymous namespace
+
+void ReleaseHmmaScratch(IR::Program& program) {
+    if (program.hmma_scratch) {
+        program.shared_memory_size = program.hmma_scratch->program_bytes;
+        program.hmma_scratch.reset();
+    }
+}
+
+std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program) {
+    if (!profile.support_cooperative_hmma_16x16x16 || !SupportsCooperativeHmma(program) ||
+        !HasHmma(program)) {
+        return std::nullopt;
+    }
+    // A, B and C/D tiles of 16x16 fp16, 128 words each, for each subgroup.
+    return ReserveHmmaScratch(profile, program, HmmaScratchKind::Cooperative16x16x16, 384U);
+}
+
+// The software HMMA's fragment exchange: each lane of a warp writes its six A and B words here, and
+// reads the words of the lanes it needs back, in place of subgroup shuffles with a per-lane index.
+// Slot-major: word `slot` of lane `lane` is at slot * 32 + lane, so the 32 lanes storing a slot,
+// or reading one, hit 32 different banks.
+constexpr u32 SoftwareHmmaWordsPerLane = 6;
+constexpr u32 SoftwareHmmaWordsPerWarp = GUEST_WARP_LANES * SoftwareHmmaWordsPerLane;
+
+std::optional<u32> ReserveSoftwareHmmaScratch(const Profile& profile, IR::Program& program) {
+    // Slots are per subgroup (SubgroupId) and per lane: subgroups must be whole 32-lane warps, which
+    // the pipeline requires (REQUIRE_FULL_SUBGROUPS, requires_full_guest_warps) and the device must
+    // run, or the areas of two subgroups overlap and lanes read past theirs.
+    if (!profile.has_slow_dynamic_shuffle || program.stage != Stage::Compute ||
+        !profile.support_compute_full_subgroups || !profile.compute_subgroups_are_guest_warps ||
+        program.workgroup_size[0] == 0 || program.workgroup_size[0] % GUEST_WARP_LANES != 0 ||
+        profile.max_subgroup_size != GUEST_WARP_LANES || !HasHmma(program) ||
+        !HmmaInConvergedFlow(program)) {
+        return std::nullopt;
+    }
+    return ReserveHmmaScratch(profile, program, HmmaScratchKind::SoftwareExchange,
+                              SoftwareHmmaWordsPerWarp);
 }
 
 namespace {
 // Whether the entry point can request fp16 round-to-nearest-even and denorm preserve, so that an
 // fp32 -> fp16 -> fp32 conversion rounds like the software rounding below. The two agree for
 // every non-NaN fp32 input; a NaN stays a NaN.
+bool ConversionRoundsHalfItself(const Profile& profile, const Info& info) {
+    return profile.support_float16 && profile.fp16_conversion_rounds_rte_with_denorms &&
+           !info.uses_fp16_denorms_flush;
+}
+
+// Or the conversion rounds that way without any mode (ConversionRoundsHalfItself).
 bool CanRoundHalfNatively(const Profile& profile, const Info& info) {
-    if (!profile.support_float_controls || profile.has_broken_fp16_float_controls ||
+    if (ConversionRoundsHalfItself(profile, info)) {
+        return true;
+    }
+    if (!profile.support_float16 || !profile.support_float_controls ||
+        profile.has_broken_fp16_float_controls ||
         !profile.support_fp16_rounding_rte || !profile.support_fp16_denorm_preserve ||
         !profile.fp16_float_controls_independent_of_fp32 || info.uses_fp16_denorms_flush) {
         return false;
@@ -240,15 +357,22 @@ bool CanRoundHalfNatively(const Profile& profile, const Info& info) {
 }
 } // Anonymous namespace
 
+namespace {
+/// The SubgroupId input that names a warp's area of shared memory.
+void DefineTensorSubgroupId(EmitContext& ctx) {
+    ctx.AddCapability(spv::Capability::GroupNonUniform);
+    const Id input_u32 = ctx.TypePointer(spv::StorageClass::Input, ctx.U32[1]);
+    ctx.tensor_subgroup_id = ctx.AddGlobalVariable(input_u32, spv::StorageClass::Input);
+    ctx.Decorate(ctx.tensor_subgroup_id, spv::Decoration::BuiltIn, spv::BuiltIn::SubgroupId);
+    ctx.interfaces.push_back(ctx.tensor_subgroup_id);
+}
+} // Anonymous namespace
+
 void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program) {
     if (ctx.tensor_scratch_word) {
         ctx.cooperative_hmma =
             DefineCooperativeHmmaTypes(ctx, ctx.U32[1], 16, ctx.profile.supported_spirv);
-        ctx.AddCapability(spv::Capability::GroupNonUniform);
-        const Id input_u32 = ctx.TypePointer(spv::StorageClass::Input, ctx.U32[1]);
-        ctx.tensor_subgroup_id = ctx.AddGlobalVariable(input_u32, spv::StorageClass::Input);
-        ctx.Decorate(ctx.tensor_subgroup_id, spv::Decoration::BuiltIn, spv::BuiltIn::SubgroupId);
-        ctx.interfaces.push_back(ctx.tensor_subgroup_id);
+        DefineTensorSubgroupId(ctx);
         return;
     }
     if (UsesCooperativeHmma(ctx.profile, program)) {
@@ -265,15 +389,25 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
             needed[depth == 16] = true;
         }
     }
+    const bool staged = ctx.software_hmma_scratch_word.has_value();
+    if (staged && (needed[0] || needed[1])) {
+        DefineTensorSubgroupId(ctx);
+    }
     for (u32 variant = 0; variant < 2; ++variant) {
         if (!needed[variant]) continue;
         ctx.AddCapability(spv::Capability::GroupNonUniform);
-        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+        if (!staged) {
+            ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+        }
         if (!ctx.SupportsSubgroups() ||
-            ctx.profile.has_broken_spirv_subgroup_shuffle)
+            (!staged && ctx.profile.has_broken_spirv_subgroup_shuffle))
             throw NotImplementedException("Software HMMA requires subgroup shuffle support");
         const Id u32ty = ctx.U32[1], f32ty = ctx.F32[1];
         ctx.native_half_rounding = CanRoundHalfNatively(ctx.profile, program.info);
+        // Where the conversion rounds that way by itself, no execution mode is declared: the
+        // device reports them unsupported (VUID-RuntimeSpirv-shaderDenormPreserveFloat16-06296).
+        ctx.native_half_rounding_modes =
+            ctx.native_half_rounding && !ConversionRoundsHalfItself(ctx.profile, program.info);
         const Id f16ty = ctx.native_half_rounding ? ctx.TypeFloat(16) : Id{};
         if (ctx.native_half_rounding) {
             ctx.AddCapability(spv::Capability::Float16);
@@ -341,19 +475,44 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         const Id col_base = ctx.OpShiftLeftLogical(u32ty, and_(lane, 3), imm(3));
         const Id a_base = add(warp_base, row_base);
         const Id b_base = add(warp_base, col_base);
+        // Staged: this lane's A and B words go to its warp's slots, and the words of other lanes
+        // are read from there. Lane indices stay within the warp (32 lanes, SubgroupId = warp).
+        // The subgroup barriers assume what hardware HMMA requires too: the whole warp executes
+        // it together, from uniform control flow (HmmaInConvergedFlow).
+        Id warp_slots{};
+        if (staged) {
+            warp_slots = add(imm(*ctx.software_hmma_scratch_word),
+                             ctx.OpIMul(u32ty, ctx.OpLoad(u32ty, ctx.tensor_subgroup_id),
+                                        imm(SoftwareHmmaWordsPerWarp)));
+            const Id own = add(warp_slots, and_(lane, 31));
+            for (u32 i = 0; i < SoftwareHmmaWordsPerLane; ++i) {
+                ctx.StoreShared(SharedWord(ctx, add(own, imm(i * GUEST_WARP_LANES))), inputs[i]);
+            }
+            SubgroupBarrier(ctx);
+        }
+        // Word `slot` (0-3 A, 4-5 B) of lane `source`, as a shuffle or from the staged slots,
+        // where `slot_offset` is slot * 32.
+        const auto fetch = [&](Id value, Id slot_offset, Id source) {
+            if (!staged) {
+                return ctx.OpGroupNonUniformShuffle(u32ty, imm(3), value, source);
+            }
+            const Id word = add(add(warp_slots, slot_offset), and_(source, 31));
+            return ctx.LoadShared(u32ty, SharedWord(ctx, word));
+        };
         // Unrolling a K=8 group lets its shuffles overlap, which latency-bound small dispatches
         // need; unrolling all of K=16 raises register pressure and slows large dispatches.
         const auto emit_group = [&](auto pick) {
             for (u32 component = 0; component < 4; ++component) {
                 const Id b = pick(inputs[4], inputs[5]);
+                const Id b_slot = pick(imm(4 * GUEST_WARP_LANES), imm(5 * GUEST_WARP_LANES));
                 std::array<Id, 2> bs;
                 for (u32 col = 0; col < 2; ++col)
-                    bs[col] = unpack(ctx.OpGroupNonUniformShuffle(
-                        u32ty, imm(3), b, add(b_base, imm(component + col * 4))));
+                    bs[col] = unpack(fetch(b, b_slot, add(b_base, imm(component + col * 4))));
                 for (u32 row = 0; row < 2; ++row) {
-                    const Id as = unpack(ctx.OpGroupNonUniformShuffle(
-                        u32ty, imm(3), pick(inputs[row], inputs[row + 2]),
-                        add(a_base, imm(component))));
+                    const Id as = unpack(fetch(pick(inputs[row], inputs[row + 2]),
+                                               pick(imm(row * GUEST_WARP_LANES),
+                                                    imm((row + 2) * GUEST_WARP_LANES)),
+                                               add(a_base, imm(component))));
                     for (u32 col = 0; col < 2; ++col) {
                         Id value = ctx.OpLoad(f32ty, accumulators[row * 2 + col]);
                         for (u32 half = 0; half < 2; ++half) {
@@ -388,6 +547,10 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
             ctx.OpStore(counter, add(group, imm(1)));
             ctx.OpBranch(header);
             ctx.AddLabel(end);
+        }
+        if (staged) {
+            // The next HMMA of the warp writes the slots again.
+            SubgroupBarrier(ctx);
         }
         std::array<Id, 2> packed;
         for (u32 row = 0; row < 2; ++row)
