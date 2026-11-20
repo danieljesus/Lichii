@@ -16,3 +16,4 @@ Log lines:
     EDEN_TMP_PASS_STAMP_AFTER_BARRIER=1      stamp each pass after EndRenderPass and its barriers (their cost moves into the pass)
     EDEN_TMP_BEGIN_STAMP_BOTTOM=1            stamp each submission start at BOTTOM_OF_PIPE instead of TOP_OF_PIPE
 A tail line now has end=flush|finish at=<site that submitted it>.
+    python3 gaps.py eden_log.txt [min_s]    # GPU span/busy/idle a frame; idle between submissions by what submitted (run with EDEN_TMP_BEGIN_STAMP_BOTTOM=1)
