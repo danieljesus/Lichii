@@ -3501,27 +3501,30 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     const u64 trace_faults = tc_trace ? Common::GetProcessPageFaults() : 0;
     auto trace_staged = trace_begin;
     upload_trace = {};
-    const bool chunked = UploadInChunks(image);
-    if (!chunked) {
-        auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
-        if (tc_trace) {
-            trace_staged = TraceClock::now();
-        }
-        try {
-            UploadImageContents(image, staging);
-        } catch (const std::bad_alloc&) {
-            image.flags |= ImageFlagBits::CpuModified;
-            image.load_tick = previous_load_tick;
-            image.storage_written_levels = previous_storage_written_levels;
-            if (False(image.flags & ImageFlagBits::Sparse) ||
-                True(image.flags & ImageFlagBits::Registered)) {
-                UntrackImage(image, image_id);
+    bool chunked{};
+    try {
+        // The chunks read guest memory into a buffer of their own (ExecuteUnswizzlePlan), which
+        // can fail as the whole upload's scratch does; chunks already uploaded are uploaded again.
+        chunked = UploadInChunks(image);
+        if (!chunked) {
+            auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+            if (tc_trace) {
+                trace_staged = TraceClock::now();
             }
-            NoteHostOutOfMemory("upload", image);
-            runtime.TransitionImageLayout(image);
-            return;
+            UploadImageContents(image, staging);
+            runtime.InsertUploadMemoryBarrier();
         }
-        runtime.InsertUploadMemoryBarrier();
+    } catch (const std::bad_alloc&) {
+        image.flags |= ImageFlagBits::CpuModified;
+        image.load_tick = previous_load_tick;
+        image.storage_written_levels = previous_storage_written_levels;
+        if (False(image.flags & ImageFlagBits::Sparse) ||
+            True(image.flags & ImageFlagBits::Registered)) {
+            UntrackImage(image, image_id);
+        }
+        NoteHostOutOfMemory("upload", image);
+        runtime.TransitionImageLayout(image);
+        return;
     }
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
