@@ -2148,7 +2148,7 @@ bool TextureCache<P>::RescaleRenderTargets() {
 }
 
 template <class P>
-void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
+void TextureCache<P>::UpdateRenderTargets(bool is_clear, u32 bounding_scissors) {
     using namespace VideoCommon::Dirty;
     struct ClearingScope {
         bool& clearing;
@@ -2162,6 +2162,17 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     drawing_render_targets = !is_clear;
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
+        if (rt_active_mask == 0) {
+            // The scissors bound a pass without attachments, and they change without the targets.
+            const auto& resolution = Settings::values.resolution_info;
+            const Extent2D size =
+                RenderTargetsSize(is_rescaling ? resolution.up_scale : 1,
+                                  is_rescaling ? resolution.down_shift : 0, bounding_scissors);
+            if (size != render_targets.size) {
+                render_targets.size = size;
+                ++render_targets_serial;
+            }
+        }
         for (size_t index = 0; index < NUM_RT; ++index) {
             ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
             PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
@@ -2217,10 +2228,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         up_scale = Settings::values.resolution_info.up_scale;
         down_shift = Settings::values.resolution_info.down_shift;
     }
-    render_targets.size = Extent2D{
-        (maxwell3d->regs.surface_clip.width * up_scale) >> down_shift,
-        (maxwell3d->regs.surface_clip.height * up_scale) >> down_shift,
-    };
+    render_targets.size = RenderTargetsSize(up_scale, down_shift, bounding_scissors);
     render_targets.is_rescaled = is_rescaling;
 
     if (render_targets != previous_render_targets) {
@@ -2228,6 +2236,29 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
+}
+
+template <class P>
+Extent2D TextureCache<P>::RenderTargetsSize(u32 up_scale, u32 down_shift,
+                                            u32 bounding_scissors) const {
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    const Regs& regs = maxwell3d->regs;
+    const Extent2D size{
+        (regs.surface_clip.width * up_scale) >> down_shift,
+        (regs.surface_clip.height * up_scale) >> down_shift,
+    };
+    if (rt_active_mask != 0 || bounding_scissors == 0) {
+        return size;
+    }
+    std::array<GuestScissor, Regs::NumViewports> scissors;
+    const size_t count = (std::min)(size_t{bounding_scissors}, scissors.size());
+    for (size_t index = 0; index < count; ++index) {
+        const auto& scissor = regs.scissor_test[index];
+        scissors[index] = {scissor.enable != 0, scissor.max_x.Value(), scissor.max_y.Value()};
+    }
+    const bool lower_left = regs.window_origin.mode != Regs::WindowOrigin::Mode::UpperLeft;
+    return AttachmentlessRenderArea(size, lower_left, std::span{scissors}.first(count), up_scale,
+                                    down_shift);
 }
 
 template <class P>
