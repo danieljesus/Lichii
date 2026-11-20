@@ -126,6 +126,28 @@ TEST_CASE("FPToFixed scales by the fraction bits before it rounds a negative val
     }
 }
 
+TEST_CASE("FPToFixed does not take a negative value rounded up for an overflow",
+          "[jit][fp_to_fixed]") {
+    // -2147483647.5 and -32767.5 towards zero or plus infinity are -2147483647 and -32767, which
+    // fit; the overflow check added the round-up to their magnitude.
+    const FPCR fpcr;
+    for (const auto mode : {RoundingMode::TowardsZero, RoundingMode::TowardsPlusInfinity}) {
+        FPSR fpsr;
+        CHECK(Dynarmic::FP::FPToFixed<u64>(32, 0xC1DFFFFFFFE00000, 0, false, fpcr, mode, fpsr) ==
+              0x80000001);
+        CHECK(fpsr.Value() == IXC);
+        FPSR fpsr16;
+        CHECK(Dynarmic::FP::FPToFixed<u32>(16, 0xC6FFFF00, 0, false, fpcr, mode, fpsr16) ==
+              0x8001);
+        CHECK(fpsr16.Value() == IXC);
+    }
+    // Below the range they still overflow.
+    FPSR fpsr;
+    CHECK(Dynarmic::FP::FPToFixed<u64>(32, 0xC1E0000000200000, 0, false, fpcr,
+                                       RoundingMode::TowardsPlusInfinity, fpsr) == 0x80000000);
+    CHECK(fpsr.Value() == IOC);
+}
+
 namespace {
 
 constexpr u64 CodeBase = 0x1000;
