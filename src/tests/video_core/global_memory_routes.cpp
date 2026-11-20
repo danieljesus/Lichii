@@ -109,6 +109,30 @@ std::vector<std::pair<u32, std::set<u32>>> NotInlinedCallers(const std::vector<u
     return result;
 }
 
+// OpSelect instructions whose result is a pointer, and whether the module declares
+// VariablePointers
+std::pair<size_t, bool> PointerSelects(const std::vector<u32>& code) {
+    static constexpr u32 op_capability{17};
+    static constexpr u32 op_type_pointer{32};
+    static constexpr u32 op_select{169};
+    static constexpr u32 variable_pointers{4442};
+    std::set<u32> pointer_types;
+    size_t selects{};
+    bool declared{};
+    for (size_t i = 5; i < code.size(); i += code[i] >> 16) {
+        REQUIRE((code[i] >> 16) > 0);
+        const u32 opcode{code[i] & 0xffff};
+        if (opcode == op_capability && code[i + 1] == variable_pointers) {
+            declared = true;
+        } else if (opcode == op_type_pointer) {
+            pointer_types.insert(code[i + 1]);
+        } else if (opcode == op_select && pointer_types.contains(code[i + 1])) {
+            ++selects;
+        }
+    }
+    return {selects, declared};
+}
+
 // Three pointers in constant buffer 0. "routed" is built from the first or the second one,
 // "fallback" from the first, the second or a value the pointer search does not follow, and
 // "tracked" from the third alone.
@@ -203,12 +227,37 @@ TEST_CASE("Selecting the buffer routes every access among all bound buffers",
     const size_t routed{
         SelectionsPerFunction(Backend::SPIRV::EmitSPIRV(profile, fixture.program)).size()};
     profile.select_global_memory_buffer = true;
+    profile.support_variable_pointers = true;
     const auto selections{
         SelectionsPerFunction(Backend::SPIRV::EmitSPIRV(profile, fixture.program))};
     // The buffer search, the 32, 64 and 128-bit load and store through every buffer, and the entry
     // point: the routed load and store add none
     CHECK(selections.size() == 8);
     CHECK(routed == 9);
+}
+
+TEST_CASE("A pointer selected among the buffers declares the VariablePointers capability",
+          "[shader][global_memory_routes]") {
+    // VariablePointersStorageBuffer keeps a variable pointer within one buffer; the select path
+    // picks among different buffers, which spirv-val rejected ("Variable pointers must point into
+    // the same structure") in OoT's modules.
+    Fixture fixture;
+    Profile profile{};
+    profile.supported_spirv = 0x00010300;
+    profile.support_int64 = true;
+    profile.support_descriptor_aliasing = true;
+    profile.unified_descriptor_binding = true;
+    profile.min_ssbo_alignment = 16;
+    profile.support_variable_pointers = true;
+    const auto branches{PointerSelects(Backend::SPIRV::EmitSPIRV(profile, fixture.program))};
+    CHECK(branches.first == 0);
+    CHECK_FALSE(branches.second);
+    profile.select_global_memory_buffer = true;
+    const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
+    Dump(code, "variable_pointers");
+    const auto selected{PointerSelects(code)};
+    CHECK(selected.first > 0);
+    CHECK(selected.second);
 }
 
 TEST_CASE("Selecting the buffer searches the bound buffers in one function that is not inlined",
@@ -223,6 +272,7 @@ TEST_CASE("Selecting the buffer searches the bound buffers in one function that 
     profile.min_ssbo_alignment = 16;
     CHECK(NotInlinedCallers(Backend::SPIRV::EmitSPIRV(profile, fixture.program)).empty());
     profile.select_global_memory_buffer = true;
+    profile.support_variable_pointers = true;
     const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
     Dump(code, "select");
     const auto searches{NotInlinedCallers(code)};
@@ -245,6 +295,7 @@ TEST_CASE("Task and mesh programs search the bound buffers inline",
     profile.unified_descriptor_binding = true;
     profile.min_ssbo_alignment = 16;
     profile.select_global_memory_buffer = true;
+    profile.support_variable_pointers = true;
     const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
     Dump(code, stage == Stage::Task ? "select_task" : "select_mesh");
     CHECK(NotInlinedCallers(code).empty());
