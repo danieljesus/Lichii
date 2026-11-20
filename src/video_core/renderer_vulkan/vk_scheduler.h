@@ -588,6 +588,9 @@ private:
     const char* temp_end_file = "";
     u32 temp_end_line = 0;
     u32 temp_begin_clears = 0;
+    const char* temp_submit_why = "-"; // TEMP: what submitted this command buffer
+    const char* temp_submit_file = "";
+    u32 temp_submit_line = 0;
     void TempEndSite(const char* why, const std::source_location& location) {
         temp_end_why = why;
         temp_end_file = location.file_name();

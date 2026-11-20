@@ -12,3 +12,7 @@ TEMP switches (environment):
 Log lines:
     "TEMP seg ..."          every DKB-timed segment of a sampled frame, with what ended its pass
     "TEMP frametimes n=300 p50= p95= p99= max="   interval between Composite calls, every 300 frames
+    python3 tails.py eden_log.txt           # tails by kind; pass-less submissions by what submitted them
+    EDEN_TMP_PASS_STAMP_AFTER_BARRIER=1      stamp each pass after EndRenderPass and its barriers (their cost moves into the pass)
+    EDEN_TMP_BEGIN_STAMP_BOTTOM=1            stamp each submission start at BOTTOM_OF_PIPE instead of TOP_OF_PIPE
+A tail line now has end=flush|finish at=<site that submitted it>.
