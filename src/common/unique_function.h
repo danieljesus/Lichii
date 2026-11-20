@@ -13,7 +13,7 @@ namespace Common {
 /// Unlike std::function, the captured values don't have to be copyable.
 /// This class can be moved but not copied.
 /// It owns its callable: one given as an lvalue is copied, never referred to, so the function
-/// can outlive the scope it was made in.
+/// can outlive the scope it was made in. Pass std::ref to share a callable with the caller.
 template <typename ResultType, typename... Args>
 class UniqueFunction {
     class CallableBase {
@@ -26,7 +26,7 @@ class UniqueFunction {
     class Callable final : public CallableBase {
     public:
         template <typename Arg>
-        explicit Callable(Arg&& functor_) : functor{std::forward<Arg>(functor_)} {}
+        explicit Callable(Arg&& functor_) : functor(std::forward<Arg>(functor_)) {}
         ~Callable() override = default;
 
         ResultType operator()(Args&&... args) override {
@@ -41,7 +41,9 @@ public:
     UniqueFunction() = default;
 
     template <typename Functor>
-        requires(!std::same_as<std::remove_cvref_t<Functor>, UniqueFunction>)
+        requires(!std::same_as<std::remove_cvref_t<Functor>, UniqueFunction> &&
+                 std::constructible_from<std::decay_t<Functor>, Functor> &&
+                 std::is_invocable_r_v<ResultType, std::decay_t<Functor>&, Args...>)
     UniqueFunction(Functor&& functor)
         : callable{std::make_unique<Callable<std::decay_t<Functor>>>(
               std::forward<Functor>(functor))} {}
