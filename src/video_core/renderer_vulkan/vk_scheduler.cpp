@@ -833,6 +833,21 @@ void Scheduler::ReportPassTimes(const std::vector<u64>& submission_begin,
                  pass->end_why ? pass->end_why : "-", file, pass->end_line, pass->framebuffer,
                  pass->clears, pass->images, pass->num_shaders ? pass->shaders[0].hash : 0);
     }
+    // TEMP: the GPU's idle time between this frame's submissions, after what submitted each
+    for (u32 submission = 0; submission + 1 < submission_end.size(); ++submission) {
+        const PassTrace& tail = trace_pass_tails[submission];
+        std::string_view file{tail.end_file ? tail.end_file : ""};
+        if (const auto slash = file.find_last_of('/'); slash != std::string_view::npos) {
+            file.remove_prefix(slash + 1);
+        }
+        const double gap =
+            static_cast<double>(static_cast<s64>(submission_begin[submission + 1] -
+                                                 submission_end[submission])) *
+            trace_timestamp_period / 1e6;
+        LOG_INFO(Render_Vulkan, "TEMP gap frame={} sub={} {:.4f}ms after={} at={}:{}",
+                 trace_sample_frame, submission, gap, tail.end_why ? tail.end_why : "-", file,
+                 tail.end_line);
+    }
     std::ranges::sort(segments, std::greater<>{}, &Segment::ms);
     LOG_INFO(Render_Vulkan, "DKB gpu_passes renderer_frame={} passes={}{} timed_ms={:.3f}",
              trace_sample_frame, count, count == TraceMaxPasses ? " (full)" : "", total_ms);
