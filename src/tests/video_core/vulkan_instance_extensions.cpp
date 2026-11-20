@@ -3,20 +3,15 @@
 
 #include <algorithm>
 #include <cstring>
-#include <filesystem>
-#include <random>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
-#include "tests/common/restore_eden_path.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 
 namespace {
@@ -43,18 +38,8 @@ TEST_CASE("Optional instance extensions a driver lacks are left out without an e
     // The headless surface, debug utils and (on macOS) portability enumeration probes used the
     // required extensions' check, which logs "Required instance extension ... is not available"
     // at error level for each one the driver lacks.
-    // Initialize opens the log file in LogDir on first use and moves the previous log aside:
-    // point it at a folder of the test's own so the user's log is left alone.
-    const auto original_log_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir);
-    const auto log_dir = std::filesystem::temp_directory_path() /
-                         ("lichii-vulkan-log-" + std::to_string(std::random_device{}()));
-    REQUIRE(std::filesystem::create_directory(log_dir));
-    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, log_dir);
-    SCOPE_EXIT {
-        Tests::RestoreEdenPath(Common::FS::EdenPath::LogDir, original_log_dir);
-        std::error_code error;
-        std::filesystem::remove_all(log_dir, error);
-    };
+    // The log file stays where the first test to initialize the log put it: other tests read it
+    // back through Log::FilePath, so this one doesn't move or remove it.
     Common::Log::Initialize();
     // Every class at every level, so a missing error line cannot be a filtered one. The ring has
     // no getter for its capacity, so it is turned off afterwards, as the other ring tests do.

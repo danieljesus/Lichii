@@ -623,18 +623,8 @@ TEST_CASE("A fresh config keeps the data paths without an error", "[config]") {
     // dump, TAS and screenshot paths at every start.
     using Common::FS::EdenPath;
     ConfigDirectory directory;
-    // Initialize opens the log file in LogDir on first use and moves the previous log aside:
-    // point it at a folder of the test's own so the user's log is left alone.
-    const auto original_log_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir);
-    const auto log_dir = std::filesystem::temp_directory_path() /
-                         ("lichii-config-log-" + std::to_string(std::random_device{}()));
-    REQUIRE(std::filesystem::create_directory(log_dir));
-    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, log_dir);
-    SCOPE_EXIT {
-        Tests::RestoreEdenPath(Common::FS::EdenPath::LogDir, original_log_dir);
-        std::error_code error;
-        std::filesystem::remove_all(log_dir, error);
-    };
+    // The log file stays where the first test to initialize the log put it: other tests read it
+    // back through Log::FilePath, so this one doesn't move or remove it.
     Common::Log::Initialize();
     // Every class at every level, so a missing error line cannot be a filtered one. The ring has
     // no getter for its capacity, so it is turned off afterwards, as the other ring tests do.
