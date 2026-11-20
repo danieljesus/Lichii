@@ -25,6 +25,10 @@ struct Noisy {
 
     std::string state;
 };
+
+int Add(int a, int b) {
+    return a + b;
+}
 } // Anonymous namespace
 
 TEST_CASE("UniqueFunction", "[common]") {
@@ -104,5 +108,34 @@ TEST_CASE("UniqueFunction", "[common]") {
             REQUIRE(num_destroyed == 0);
         }
         REQUIRE(num_destroyed == 1);
+    }
+    SECTION("Owns a callable given as a const lvalue") {
+        // A worker thread was handed a const lambda by name and ran it after the function that
+        // held it had returned: the wrapper kept a reference, and the lambda's captures were gone.
+        struct Setter {
+            void operator()() const {
+                *out = value;
+            }
+            mutable int value;
+            int* out;
+        };
+        int result = 0;
+        const Setter setter{5, &result};
+        Common::UniqueFunction<void> func{setter};
+        // The wrapper holds its own copy: what happens to the original no longer reaches it.
+        setter.value = 6;
+        func();
+        REQUIRE(result == 5);
+    }
+    SECTION("Copies a callable given as a non-const lvalue") {
+        Noisy noisy;
+        auto named = [noisy] { return noisy.state; };
+        Common::UniqueFunction<std::string> func{named};
+        REQUIRE(named() == "Copied constructed");
+        REQUIRE(func() == "Copied constructed");
+    }
+    SECTION("Takes a function by name") {
+        Common::UniqueFunction<int, int, int> func{Add};
+        REQUIRE(func(5, 4) == 9);
     }
 }
