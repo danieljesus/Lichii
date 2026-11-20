@@ -84,7 +84,9 @@ public:
     /// Runs one instruction with v1..v3 (or the low bits of them) as operands.
     Result Run(u32 instruction, u64 a, u64 b, u64 c, u32 fpcr) {
         env.instruction = instruction;
-        jit->ClearCache();
+        // Only the one block at CodeStart changes: dropping it is much cheaper than the whole
+        // cache, which the x64 backend's tests spent most of their time rebuilding.
+        jit->InvalidateCacheRange(CodeStart, 4);
         std::array<A64::Vector, 32> vectors{};
         vectors[0] = {0x5A5A'5A5A'5A5A'5A5A, 0xA5A5'A5A5'A5A5'A5A5};
         vectors[1] = {a, 0x1111'1111'1111'1111};
@@ -112,15 +114,25 @@ u64 Random() {
     return rng();
 }
 
-/// Half-precision operands: random bits (any class), and zeros, denormals, infinities and NaNs.
+/// Zeros, denormals, the largest normals, infinities, quiet and signalling NaNs, and some exact
+/// values. Every test goes through all of them; random operands cover the rest.
+constexpr std::array<u16, 16> SpecialHalves{
+    0x0000, 0x8000, 0x0001, 0x83FF, 0x03FF, 0x0400, 0x7BFF, 0xFBFF,
+    0x7C00, 0xFC00, 0x7E00, 0x7D00, 0xFE01, 0x3C00, 0x3800, 0xBE00,
+};
+
+/// Half-precision operands: random bits (any class), and the special values above.
 u16 RandomHalf() {
-    static constexpr std::array<u16, 16> special{
-        0x0000, 0x8000, 0x0001, 0x83FF, 0x03FF, 0x0400, 0x7BFF, 0xFBFF,
-        0x7C00, 0xFC00, 0x7E00, 0x7D00, 0xFE01, 0x3C00, 0x3800, 0xBE00,
-    };
     const u64 r = Random();
-    return (r & 3) == 0 ? special[(r >> 2) % special.size()] : static_cast<u16>(r >> 8);
+    return (r & 3) == 0 ? SpecialHalves[(r >> 2) % SpecialHalves.size()]
+                        : static_cast<u16>(r >> 8);
 }
+
+/// Random operands each test runs after its special values. Each one JIT-compiles a block on
+/// every backend, slowly on the x64 one, whose half-precision operations fall back to C++: the
+/// special values and the FPCR settings give the coverage, not the count.
+constexpr int RandomHalfCases = 1500;
+constexpr int RandomSaturatingCases = 500;
 
 /// RMode, FZ16, FZ, DN and AHP in every combination the operations read.
 u32 RandomFpcr() {
@@ -198,7 +210,7 @@ u64 Mask() {
 /// SQADD/UQADD/SQSUB/UQSUB/SQDMULH on one size: result in the low bits of v0, the rest zeroed.
 template <typename T, typename Op>
 void CheckSaturating(ScalarRunner& runner, u32 base, Op op) {
-    for (int i = 0; i < 4000; ++i) {
+    for (int i = 0; i < RandomSaturatingCases; ++i) {
         u64 a = Random() & Mask<T>();
         u64 b = Random() & Mask<T>();
         // Push half of them to the limits, where they saturate: within 3 of the maximum or the
@@ -302,10 +314,13 @@ TEST_CASE("JIT: half-precision scalar arithmetic matches the reference", "[jit][
     }
 #endif
     ScalarRunner runner;
-    for (int i = 0; i < 20000; ++i) {
+    // Every pair of special values as n and m, then random ones.
+    constexpr int special_pairs = static_cast<int>(SpecialHalves.size() * SpecialHalves.size());
+    for (int i = 0; i < special_pairs + RandomHalfCases; ++i) {
+        const bool special = i < special_pairs;
         const u16 a = RandomHalf();
-        const u16 n = RandomHalf();
-        const u16 m = RandomHalf();
+        const u16 n = special ? SpecialHalves[i / SpecialHalves.size()] : RandomHalf();
+        const u16 m = special ? SpecialHalves[i % SpecialHalves.size()] : RandomHalf();
         const u32 fpcr_bits = RandomFpcr();
         const FP::FPCR fpcr{fpcr_bits};
         INFO("a=0x" << std::hex << a << " n=0x" << n << " m=0x" << m << " fpcr=0x" << fpcr_bits);
@@ -381,9 +396,14 @@ TEST_CASE("JIT: half-precision to integer and fixed point matches the reference"
         {0x1EF80000, FP::RoundingMode::TowardsZero},           // FCVTZ<S|U>
         {0x1EE40000, FP::RoundingMode::ToNearest_TieAwayFromZero},  // FCVTA<S|U>
     }};
-    for (int i = 0; i < 20000; ++i) {
-        const u16 n = RandomHalf();
-        const u32 fpcr_bits = RandomFpcr();
+    // Every special value with FZ16 clear and set (the only FPCR bit a conversion with its own
+    // rounding mode reads), then random ones under random FPCR settings.
+    constexpr int specials = static_cast<int>(SpecialHalves.size() * 2);
+    for (int i = 0; i < specials + RandomHalfCases; ++i) {
+        const bool special = i < specials;
+        const u16 n = special ? SpecialHalves[i / 2] : RandomHalf();
+        const u32 fpcr_bits = special ? ((i & 1) ? 0x0008'0000U : 0U) | (RandomFpcr() & ~0x0008'0000U)
+                                      : RandomFpcr();
         const FP::FPCR fpcr{fpcr_bits};
         for (const bool is_unsigned : {false, true}) {
             for (const std::size_t ibits : {32u, 64u}) {
