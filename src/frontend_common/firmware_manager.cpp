@@ -114,8 +114,9 @@ FirmwareManager::InstallKeys(std::string location, std::string extension) {
     }
 #endif
 
-    // Reinitialize the key manager
-    Core::Crypto::KeyManager::Instance().ReloadKeys();
+    // Read the keys folder again from scratch: ReloadKeys only adds, so keys the old files had
+    // and the new ones lack stayed loaded. The frontends install keys only with no game running.
+    Core::Crypto::KeyManager::Instance().ResetKeys();
 
     if (ContentManager::AreKeysPresent()) {
         return Success;

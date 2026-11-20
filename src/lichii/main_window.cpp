@@ -622,7 +622,8 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     QtCommon::Content::FixProfiles();
 
     if (Settings::values.use_dev_keys.GetValue()) {
-        Core::Crypto::KeyManager::Instance().ReloadKeys();
+        // The KeyManager may have read the prod keys before the configuration was loaded.
+        Core::Crypto::KeyManager::Instance().ResetKeys();
     }
     game_list->PopulateAsync(UISettings::values.game_dirs);
 

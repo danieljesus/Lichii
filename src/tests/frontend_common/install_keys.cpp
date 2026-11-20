@@ -128,3 +128,28 @@ TEST_CASE("A keys test leaves the key manager as it found it", "[frontend_common
     CHECK(keys.HasKey(S256KeyType::Header) == had_header);
     CHECK(keys.GetKey(S256KeyType::Header) == header_before);
 }
+
+TEST_CASE("Installing keys forgets the keys only the old files had",
+          "[frontend_common][install_keys]") {
+    using namespace Core::Crypto;
+    const KeysDirectory directory;
+    KeyManager& keys = KeyManager::Instance();
+    WriteFile(directory.keys / "prod.keys",
+              fmt::format("header_key = {}\ntitlekek_source = {}\n", std::string(64, '4'),
+                          std::string(32, '5'))
+                  .c_str());
+    keys.ResetKeys();
+    REQUIRE(keys.HasKey(S128KeyType::Source, static_cast<u64>(SourceKeyType::Titlekek)));
+
+    const auto source = directory.root / "dump";
+    REQUIRE(std::filesystem::create_directory(source));
+    WriteFile(source / "prod.keys", fmt::format("header_key = {}\n", std::string(64, '6')).c_str());
+    REQUIRE(FirmwareManager::InstallKeys((source / "prod.keys").string(), "keys") !=
+            FirmwareManager::ErrorFailedCopy);
+
+    Key256 header;
+    header.fill(0x66);
+    CHECK(keys.GetKey(S256KeyType::Header) == header);
+    // ReloadKeys kept titlekek_source from the replaced file until a restart.
+    CHECK_FALSE(keys.HasKey(S128KeyType::Source, static_cast<u64>(SourceKeyType::Titlekek)));
+}
