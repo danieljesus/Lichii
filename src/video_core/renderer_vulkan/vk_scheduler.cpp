@@ -191,6 +191,7 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                      std::source_location location) {
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
+        TempEndSite("flush", location);
     }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
@@ -271,6 +272,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                        std::source_location location) {
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
+        TempEndSite("finish", location);
     }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
@@ -393,6 +395,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     ++render_pass_serial;
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
+    temp_begin_clears = clear_value_count;
     state.render_area = render_area;
 
     if (GPU::Logging::IsActive() && Settings::values.gpu_log_vulkan_calls.GetValue()) {
@@ -530,6 +533,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     }
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
+        TempEndSite("switch", location);
     }
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
@@ -539,6 +543,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
+        TempEndSite("outside", location);
     }
     EndRenderPass();
 }
@@ -741,12 +746,19 @@ void Scheduler::TracePassShaders(u64 hash, u32 stage, u64 fragment_hash) {
     trace_pass.shaders[trace_pass.num_shaders++] = {hash, fragment_hash, stage};
 }
 
-void Scheduler::TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent) {
+void Scheduler::TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent, const char* why,
+                             const char* file, u32 line, u64 framebuffer, u32 clears, u32 images) {
     if (!trace_gpu_recording || !trace_pass_pool || trace_pass_count == TraceMaxPasses) {
         return;
     }
     trace_pass.submission = trace_gpu_count;
     trace_pass.extent = extent;
+    trace_pass.end_why = why;
+    trace_pass.end_file = file;
+    trace_pass.end_line = line;
+    trace_pass.framebuffer = framebuffer;
+    trace_pass.clears = clears;
+    trace_pass.images = images;
     trace_pass_items[trace_pass_count] = trace_pass;
     cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_pass_pool,
                           trace_pass_count);
@@ -800,6 +812,20 @@ void Scheduler::ReportPassTimes(const std::vector<u64>& submission_begin,
         const double ms = to_ms(previous, submission_end[submission]);
         segments.push_back({ms, &trace_pass_tails[submission], true});
         total_ms += ms;
+    }
+    for (size_t i = 0; i < segments.size(); ++i) { // TEMP: every segment in order
+        const auto& [ms, pass, tail] = segments[i];
+        std::string_view file{pass->end_file ? pass->end_file : ""};
+        if (const auto slash = file.find_last_of('/'); slash != std::string_view::npos) {
+            file.remove_prefix(slash + 1);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "TEMP seg {} {:.4f}ms sub={} {} {}x{} draws={} disp={} end={} at={}:{} fb={:x} "
+                 "clears={} images={} s0={:016x}",
+                 i, ms, pass->submission, tail ? "tail" : "pass", pass->extent.width,
+                 pass->extent.height, pass->draws, pass->dispatches,
+                 pass->end_why ? pass->end_why : "-", file, pass->end_line, pass->framebuffer,
+                 pass->clears, pass->images, pass->num_shaders ? pass->shaders[0].hash : 0);
     }
     std::ranges::sort(segments, std::greater<>{}, &Segment::ms);
     LOG_INFO(Render_Vulkan, "DKB gpu_passes renderer_frame={} passes={}{} timed_ms={:.3f}",
@@ -1276,7 +1302,15 @@ void Scheduler::EndRenderPass()
         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
         query_cache->NotifySegment(false);
 
-        Record([this, render_area = state.render_area, num_images = num_renderpass_images,
+        const char* const temp_why = temp_end_why;
+        const char* const temp_file = temp_end_file;
+        const u32 temp_line = temp_end_line;
+        const u64 temp_fb = reinterpret_cast<u64>(state.framebuffer);
+        const u32 temp_clears = temp_begin_clears;
+        temp_end_why = "other";
+        temp_end_file = "";
+        temp_end_line = 0;
+        Record([this, temp_why, temp_file, temp_line, temp_fb, temp_clears, render_area = state.render_area, num_images = num_renderpass_images,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
                        has_transform_feedback = device.IsExtTransformFeedbackSupported()](
@@ -1316,7 +1350,7 @@ void Scheduler::EndRenderPass()
                         .subresourceRange = range,
                 };
             }
-            TracePassEnd(cmdbuf, render_area);
+            TracePassEnd(cmdbuf, render_area, temp_why, temp_file, temp_line, temp_fb, temp_clears, static_cast<u32>(num_images));
             cmdbuf.EndRenderPass();
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
