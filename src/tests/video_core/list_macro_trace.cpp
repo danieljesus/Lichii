@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <fmt/format.h>
 
+#include "common/scope_exit.h"
 #include "tests/common/temp_dir.h"
 #include "video_core/macro_turing.h"
 #include "video_core/nx2_list_macro_trace.h"
@@ -24,6 +25,15 @@ void SetDebugDir(const std::filesystem::path& directory) {
     _putenv_s("EDEN_NX2_DEBUG_DIR", directory.string().c_str());
 #else
     setenv("EDEN_NX2_DEBUG_DIR", directory.string().c_str(), 1);
+#endif
+}
+
+// Without this a later dump in the same process would make the removed folder again.
+void ClearDebugDir() {
+#ifdef _WIN32
+    _putenv_s("EDEN_NX2_DEBUG_DIR", "");
+#else
+    unsetenv("EDEN_NX2_DEBUG_DIR");
 #endif
 }
 
@@ -44,6 +54,9 @@ TEST_CASE("ListMacroTrace: a macro call is noted only when a GPU-written entry f
     namespace Trace = VideoCommon::ListMacroTrace;
     const Tests::TempDir directory{"lichii-list-macro-trace"};
     SetDebugDir(directory.Path());
+    SCOPE_EXIT {
+        ClearDebugDir();
+    };
     const std::vector<u32> code(9, 0);
     const std::vector<u32> parameters{7, 8, 9};
     const std::vector<u32> data_ram(0xc00);
@@ -100,6 +113,9 @@ TEST_CASE("ListMacroTrace: what reads the data RAM words a GPU-written entry's c
     namespace Trace = VideoCommon::ListMacroTrace;
     const Tests::TempDir directory{"lichii-list-macro-reader"};
     SetDebugDir(directory.Path());
+    SCOPE_EXIT {
+        ClearDebugDir();
+    };
     // Compute macro 055743923e135e09 (method 0xe74): data RAM 0x20-0x22 = its three parameters.
     const std::vector<u32> store{0x00000087, 0xb9c7c008, 0x399c7f01,
                                  0x00000003, 0x18c00008, 0xb99c7f00};
