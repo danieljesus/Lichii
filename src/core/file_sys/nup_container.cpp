@@ -8,10 +8,12 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <span>
 #include <string_view>
@@ -1235,36 +1237,66 @@ VirtualDir NupContainer::MergeShadowDirs(const VirtualDir& base, const VirtualDi
                                                 base->GetName());
 }
 
-std::vector<u8> NupContainer::ReadExtentRaw(const FileNode& node) const {
-    return file->ReadBytes(static_cast<std::size_t>(node.extent_size),
-                           static_cast<std::size_t>(node.extent_offset));
-}
-
 Loader::ResultStatus NupContainer::VerifyIntegrity(
     std::function<bool(std::size_t, std::size_t)> progress_callback) const {
-    const std::size_t total = files.size();
-    for (std::size_t i = 0; i < total; ++i) {
+    // Each member is hashed a chunk at a time, so verifying needs no buffer of a member's size
+    // (the size a record declares, which a damaged file can set to anything). A chunk no larger
+    // than NearDecode lets a compressed member decode one chunk ahead of the hash.
+    constexpr std::size_t VerifyChunk = static_cast<std::size_t>(NearDecode);
+    std::size_t total_bytes = 0;
+    for (const FileNode& node : files) {
+        total_bytes = node.size > std::numeric_limits<std::size_t>::max() - total_bytes
+                          ? std::numeric_limits<std::size_t>::max()
+                          : total_bytes + static_cast<std::size_t>(node.size);
+    }
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx{EVP_MD_CTX_new(),
+                                                                &EVP_MD_CTX_free};
+    if (!ctx) {
+        return Loader::ResultStatus::ErrorNotInitialized;
+    }
+    std::vector<u8> buffer(VerifyChunk);
+    std::size_t done_bytes = 0;
+    for (std::size_t i = 0; i < files.size(); ++i) {
         const FileNode& node = files[i];
-        std::vector<u8> content;
-        if (node.size == 0) {
-            content = ReadExtentRaw(node);
-        } else if (node.codec == CodecRaw) {
-            content = ReadExtentRaw(node);
-        } else {
-            NupVfsFile view(file, node.extent_offset, node.extent_size, node.size, node.name,
-                            cache, i);
-            content = view.ReadAllBytes();
-        }
-        if (content.size() != node.size) {
+        // A stored member is its extent; a compressed one is read through its decoder.
+        std::optional<NupVfsFile> view;
+        if (node.size != 0 && node.codec != CodecRaw) {
+            view.emplace(file, node.extent_offset, node.extent_size, node.size, node.name, cache, i);
+        } else if (node.extent_size != node.size) {
             LOG_ERROR(Loader, "NUP integrity check failed for {}: short read", node.name);
             return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
+        if (!EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr)) {
+            return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
+        }
+        for (u64 offset = 0; offset < node.size;) {
+            const auto length =
+                static_cast<std::size_t>(std::min<u64>(VerifyChunk, node.size - offset));
+            const std::size_t read =
+                view ? view->Read(buffer.data(), length, static_cast<std::size_t>(offset))
+                     : file->Read(buffer.data(), length,
+                                  static_cast<std::size_t>(node.extent_offset + offset));
+            if (read != length) {
+                LOG_ERROR(Loader, "NUP integrity check failed for {}: short read", node.name);
+                return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
+            }
+            if (!EVP_DigestUpdate(ctx.get(), buffer.data(), read)) {
+                return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
+            }
+            offset += read;
+            done_bytes = std::min(total_bytes, done_bytes + read);
+            if (progress_callback && !progress_callback(done_bytes, total_bytes)) {
+                return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
+            }
+        }
         std::array<u8, 0x20> hash{};
-        if (!Sha256(content.data(), content.size(), hash) || hash != node.sha256) {
+        unsigned int length = 0;
+        if (!EVP_DigestFinal_ex(ctx.get(), hash.data(), &length) || length != hash.size() ||
+            hash != node.sha256) {
             LOG_ERROR(Loader, "NUP integrity check failed for {}: SHA-256 mismatch", node.name);
             return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
-        if (progress_callback && !progress_callback(i + 1, total)) {
+        if (node.size == 0 && progress_callback && !progress_callback(done_bytes, total_bytes)) {
             return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
     }

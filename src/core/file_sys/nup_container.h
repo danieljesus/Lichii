@@ -114,7 +114,8 @@ public:
     VirtualDir GetPackageDir(std::size_t package_index);
     VirtualDir GetPackageSubdirectory(std::size_t package_index, std::string_view path);
 
-    /// Stream-hashes every member file against its stored SHA-256.
+    /// Hashes every member file against its stored SHA-256, a chunk at a time; progress is in
+    /// bytes of the members' recorded sizes.
     Loader::ResultStatus VerifyIntegrity(
         std::function<bool(std::size_t, std::size_t)> progress_callback) const;
 
@@ -155,7 +156,6 @@ private:
     std::optional<std::size_t> FindStandIn(std::size_t damaged,
                                            std::span<const std::size_t> siblings) const;
     VirtualDir BuildPackageDir(u32 dir_index, bool serve_stand_ins);
-    std::vector<u8> ReadExtentRaw(const FileNode& node) const;
 
     VirtualFile file;
     Loader::ResultStatus status{Loader::ResultStatus::ErrorNullFile};
