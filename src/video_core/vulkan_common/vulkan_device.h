@@ -597,6 +597,11 @@ FN_MAX_LIMIT_LIST
         return properties.subgroup_properties.supportedStages;
     }
 
+    /// The smallest subgroup size compute may run with, or 0 where the device does not say.
+    u32 GetMinSubgroupSize() const {
+        return properties.subgroup_size_control.minSubgroupSize;
+    }
+
     u32 GetMaxSubgroupSize() const {
         return (std::max)(properties.subgroup_properties.subgroupSize,
                           properties.subgroup_size_control.maxSubgroupSize);
@@ -871,6 +876,18 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports VK_EXT_subgroup_size_control.
     bool IsExtSubgroupSizeControlSupported() const {
         return extensions.subgroup_size_control;
+    }
+
+    /// Whether a pipeline can require a subgroup size (the subgroupSizeControl feature).
+    bool IsSubgroupSizeControlSupported() const {
+        return extensions.subgroup_size_control &&
+               features.subgroup_size_control.subgroupSizeControl;
+    }
+
+    /// Whether a compute pipeline can require full subgroups (REQUIRE_FULL_SUBGROUPS).
+    bool IsComputeFullSubgroupsSupported() const {
+        return extensions.subgroup_size_control &&
+               features.subgroup_size_control.computeFullSubgroups;
     }
 
     /// Returns true if vkResetQueryPool (host-side query reset) is supported.
