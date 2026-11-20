@@ -211,6 +211,30 @@ bool WaitFor(Predicate predicate, std::chrono::milliseconds deadline = Deadline)
     return true;
 }
 
+/// Queue blocks as the audio renderer does, paced by whatever consumes the stream, until the stream
+/// is paused; then a fixed batch: enough to fill the queue and wait, were nothing to release it,
+/// and far fewer than the queue holds. Paused, nothing paces the renderer, so it must not keep
+/// queueing: a full queue blocks AppendBuffer with no way to stop it.
+/// `started` is set once a block has been queued while the stream played: close only after it.
+std::jthread RenderUntilPausedThenBatch(LosableStream& stream, std::atomic<bool>& started,
+                                        std::atomic<bool>& finished) {
+    return std::jthread([&stream, &started, &finished](std::stop_token stop_token) {
+        SinkBuffer block{240, 0, 0, false};
+        std::array<s16, 480> samples{};
+        int after_pause = 0;
+        while (after_pause < 32 && !stop_token.stop_requested()) {
+            stream.AppendBuffer(block, samples);
+            stream.WaitFreeSpace(stop_token);
+            if (stream.IsPaused()) {
+                ++after_pause;
+            } else {
+                started = true;
+            }
+        }
+        finished = !stop_token.stop_requested();
+    });
+}
+
 /// Run an owner call on a thread of its own. False if it is still waiting after a deadline, as it
 /// would on a blocked open: blocked opens are then let through, so that it and the test end.
 bool ReturnsWhileOpenBlocks(LosableStream& stream, const std::function<void()>& call) {
@@ -389,26 +413,12 @@ TEST_CASE("Closing a stream that stands in releases a renderer waiting on it",
     stream.Start();
     stream.failures_left = 1000;
     stream.ReportLost();
-    // Renders until told how many blocks are left, then that many: after the close, enough to
-    // fill the queue and wait were nothing to release it, far fewer than the queue holds.
-    std::atomic<int> left{-1};
+    std::atomic<bool> started{};
     std::atomic<bool> finished{};
-    std::jthread renderer([&](std::stop_token stop_token) {
-        SinkBuffer block{240, 0, 0, false};
-        std::array<s16, 480> samples{};
-        while (left != 0 && !stop_token.stop_requested()) {
-            stream.AppendBuffer(block, samples);
-            stream.WaitFreeSpace(stop_token);
-            if (left > 0) {
-                --left;
-            }
-        }
-        finished = !stop_token.stop_requested();
-    });
-    std::this_thread::sleep_for(50ms);
+    std::jthread renderer = RenderUntilPausedThenBatch(stream, started, finished);
+    REQUIRE(WaitFor([&] { return started.load(); }));
     // With the stand-in stopped nothing frees queue space: only the pause lets the renderer on.
     stream.Finalize();
-    left = 32;
     const bool released = WaitFor([&] { return finished.load(); });
     renderer.request_stop();
     renderer.join();
@@ -570,43 +580,26 @@ TEST_CASE("Closing a stream while a reopen is opening releases its renderer befo
     stream.hold_open = true;
     stream.ReportLost();
     REQUIRE(WaitFor([&] { return stream.opening.load(); }));
-    // As in the close test above: after the close, enough blocks to fill the queue and wait.
-    std::atomic<int> left{-1};
+    // As in the close test above: once paused, a batch of blocks that only the pause lets through.
+    std::atomic<bool> started{};
     std::atomic<bool> finished{};
-    std::jthread renderer([&](std::stop_token stop_token) {
-        SinkBuffer block{240, 0, 0, false};
-        std::array<s16, 480> samples{};
-        while (left != 0 && !stop_token.stop_requested()) {
-            stream.AppendBuffer(block, samples);
-            stream.WaitFreeSpace(stop_token);
-            if (left > 0) {
-                --left;
-            }
-        }
-        finished = !stop_token.stop_requested();
-    });
-    std::this_thread::sleep_for(50ms);
+    std::jthread renderer = RenderUntilPausedThenBatch(stream, started, finished);
+    REQUIRE(WaitFor([&] { return started.load(); }));
     // The close waits for the open, which cannot be cancelled; the renderer must not. It is
-    // paused while the open still blocks, and only then renders its last blocks: the stand-in,
+    // paused while the open still blocks, and then renders its last blocks: the stand-in,
     // stopped by the close, frees no queue space for them.
     std::atomic<bool> closed{};
     std::jthread closer([&] {
         stream.Finalize();
         closed = true;
     });
-    const bool paused_during_open = WaitFor([&] { return stream.IsPaused(); });
-    bool released{};
-    if (paused_during_open) {
-        left = 32;
-        released = WaitFor([&] { return finished.load(); });
-    }
+    const bool released = WaitFor([&] { return finished.load(); });
     const bool closed_before_open_ended = closed.load();
     const bool still_opening = stream.opening.load();
     stream.hold_open = false;
     closer.join();
     renderer.request_stop();
     renderer.join();
-    CHECK(paused_during_open);
     CHECK(released);
     CHECK(still_opening);
     CHECK_FALSE(closed_before_open_ended);
@@ -759,4 +752,59 @@ TEST_CASE("A backend's callback plays the stream only once the backend is publis
     std::array<s16, 480> output{};
     CHECK(stream.RenderFromBackend(stream.Only(), output, 240));
     CHECK(stream.GetQueueSize() == queued - 1);
+}
+
+TEST_CASE("An error during a backend's open is handled by exactly one of the open and the callback",
+          "[audio_core][stream_standby]") {
+    using AudioCore::Sink::BackendOpenState;
+    SECTION("before the open returns") {
+        BackendOpenState state;
+        CHECK_FALSE(state.ReportError());
+        // A second error of the same open, as one from the failed open's cleanup, is its too.
+        CHECK_FALSE(state.ReportError());
+        CHECK_FALSE(state.FinishOpen());
+        CHECK_FALSE(state.ReportError());
+        CHECK_FALSE(state.Lost());
+    }
+    SECTION("after the open returned") {
+        BackendOpenState state;
+        CHECK(state.FinishOpen());
+        CHECK(state.ReportError());
+        CHECK(state.Lost());
+        // A later error is a loss again.
+        CHECK(state.ReportError());
+    }
+    SECTION("racing") {
+        // Whichever comes first, the open drops the backend exactly when the callback does not
+        // report a loss.
+        int handled_by_open = 0;
+        int handled_by_callback = 0;
+        // Few enough rounds, and waits that yield, for a loaded two-core runner: a pure spin waits
+        // a whole time slice for the other side whenever both are not on a core.
+        for (int i = 0; i < 200; ++i) {
+            BackendOpenState state;
+            // Both sides wait for each other, then go at once.
+            std::atomic<int> ready{};
+            bool reported{};
+            std::thread callback([&] {
+                ++ready;
+                while (ready.load() < 2) {
+                    std::this_thread::yield();
+                }
+                reported = state.ReportError();
+            });
+            ++ready;
+            while (ready.load() < 2) {
+                std::this_thread::yield();
+            }
+            const bool opened = state.FinishOpen();
+            callback.join();
+            INFO("iteration " << i);
+            REQUIRE(opened == reported);
+            (opened ? handled_by_callback : handled_by_open) += 1;
+        }
+        // Which side wins depends on the scheduler: reported, not required.
+        UNSCOPED_INFO("handled by the open " << handled_by_open << ", by the callback "
+                                             << handled_by_callback);
+    }
 }

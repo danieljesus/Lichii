@@ -21,6 +21,44 @@ class System;
 namespace AudioCore::Sink {
 
 /**
+ * Who handles an error a backend reports while its open may still be running, as PulseAudio's can:
+ * exactly one of the opener, which then drops the backend as a failed open, and the error
+ * callback, which then reports a loss of the stream. Each side makes one atomic transition, so an
+ * error can never be handled by both or by neither.
+ */
+class BackendOpenState {
+public:
+    /// The opener, once the open returned. False if an error came first: drop the backend.
+    bool FinishOpen() {
+        Phase expected = Phase::Opening;
+        return phase.compare_exchange_strong(expected, Phase::Open, std::memory_order_acq_rel);
+    }
+
+    /// The error callback. True if the open had finished: report a loss of the stream. Every
+    /// error of an open that failed, however many, is the opener's.
+    bool ReportError() {
+        Phase current = phase.load(std::memory_order_acquire);
+        while (true) {
+            const Phase next = current == Phase::Opening ? Phase::FailedOpening
+                               : current == Phase::FailedOpening ? Phase::FailedOpening
+                                                                  : Phase::Lost;
+            if (phase.compare_exchange_weak(current, next, std::memory_order_acq_rel)) {
+                return next == Phase::Lost;
+            }
+        }
+    }
+
+    /// Reported an error after its open finished.
+    bool Lost() const {
+        return phase.load(std::memory_order_acquire) == Phase::Lost;
+    }
+
+private:
+    enum class Phase : u8 { Opening, Open, FailedOpening, Lost };
+    std::atomic<Phase> phase{Phase::Opening};
+};
+
+/**
  * A sink stream whose backend can lose its device, such as a headset behind a switch that went to
  * another computer while Windows had no default device to move the stream to. Backends that give
  * up on a lost device, as cubeb does, implement the hooks below.
