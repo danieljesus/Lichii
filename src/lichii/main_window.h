@@ -8,6 +8,8 @@
 
 #include <memory>
 #include <optional>
+#include <string>
+#include <utility>
 
 #include <filesystem>
 #include <QElapsedTimer>
@@ -21,6 +23,8 @@
 #include <qaction.h>
 
 #include "common/common_types.h"
+#include "common/nextendo.h"
+#include "common/nextendo_game_catalog.h"
 #include "common/settings_enums.h"
 #include "core/file_sys/nup_writer.h"
 #include "frontend_common/content_manager.h"
@@ -241,6 +245,7 @@ signals:
 public slots:
     void OnLoadComplete();
     void OnExecuteProgram(std::size_t program_index);
+    void OnLaunchInNewSession(u64 program_id);
     void OnExit();
     void OnSaveConfig();
     void AmiiboSettingsShowDialog(const Core::Frontend::CabinetParameters& parameters,
@@ -387,7 +392,7 @@ private slots:
     void OnGameListOpenDirectory(const QString& directory);
     void OnGameListAddDirectory();
     void OnGameListShowList(bool show);
-    void OnGameListOpenPerGameProperties(const std::string& file);
+    void OnGameListOpenPerGameProperties(u64 title_id, const std::string& file);
     void OnLinkToRyujinx(const u64& program_id);
     void OnMenuLoadFile();
     void OnMenuLoadFolder();
@@ -476,6 +481,16 @@ private slots:
     void OnEmulatorUpdateAvailable();
 #endif
     void KeepNextendoSessionAlive();
+    // When a game boots with online play on: says why nextendo.network refuses it, if it does.
+    void CheckNextendoOnlineStatus();
+    // When a game boots with online play on: says when the signed game catalogue doesn't accept
+    // its version.
+    void CheckNextendoGameVersion(u64 title_id, std::string version);
+    // While a game runs: refreshes the friend list the friend service reads and sends presence.
+    void UpdateNextendoSocial();
+    // Pulls the Nextendo nickname and picture into the current user. Not while a game runs, as
+    // the guest reads the profile.
+    void SyncNextendoProfile(bool force);
 
 private:
     void OnGameListNxTool(const std::string& game_path, void (NxTools::*tool)(const std::string&));
@@ -561,7 +576,18 @@ private:
     QElapsedTimer emu_force_stop_clock;
     u64 shutdown_progress_seen{};
     QTimer nextendo_session_timer;
-    QFutureWatcher<bool> nextendo_session_watcher;
+    QFutureWatcher<Common::Nextendo::SignOutReason> nextendo_session_watcher;
+    QFutureWatcher<std::optional<Common::Nextendo::OnlineStatus>> nextendo_status_watcher;
+    // The profile nextendo_status_watcher checks.
+    Common::UUID nextendo_status_profile;
+    QFutureWatcher<std::optional<Common::Nextendo::GameCatalog>> nextendo_catalog_watcher;
+    std::optional<std::pair<u64, std::string>> nextendo_version_check;
+    QTimer nextendo_social_timer;
+    QFutureWatcher<void> nextendo_social_watcher;
+    QFutureWatcher<std::optional<Common::Nextendo::ProfilePull>> nextendo_profile_watcher;
+    Common::UUID nextendo_profile_user;
+    // A forced pull that has to wait for the game to stop or for the running pull.
+    bool nextendo_profile_force{};
     OverlayDialog* shutdown_dialog{};
     BugReportDialog* bug_report_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;
@@ -613,6 +639,7 @@ private:
     bool emulation_running = false;
     std::optional<CompatibilityReporting::Session> report_session;
     bool boot_in_progress = false;
+    QMetaObject::Connection startup_qlaunch_connection;
     bool close_pending = false;
     // The path to the game currently running
     QString current_game_path;
