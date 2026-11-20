@@ -19,6 +19,9 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/engines/puller.h"
+#include <array>
+#include <chrono>
+#include <string>
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
@@ -50,6 +53,40 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
         return guest;
     }
     return Nx2MirrorShadow::Get().Read(*device, guest).value_or(guest);
+}
+
+// TEMP: acquire drains on the trigger path, by the word's kind (0 syncpoint shim, 1 mirror shadow,
+// 2 other): how many, the time the drain took, and whether the acquire was met before the drain,
+// whether the word changed across it, and whether it was met after. Logged every 10 s.
+struct TempDrainKind {
+    std::atomic<u64> count, ns, met_before, changed, met_after, changed_and_met, waited_ns;
+};
+std::array<TempDrainKind, 3> g_temp_drains{};
+void TempNoteAcquireDrain(size_t kind, u64 ns, bool met_before, bool changed, bool met_after) {
+    auto& k = g_temp_drains[kind];
+    k.count.fetch_add(1, std::memory_order_relaxed);
+    k.ns.fetch_add(ns, std::memory_order_relaxed);
+    if (met_before) k.met_before.fetch_add(1, std::memory_order_relaxed);
+    if (changed) k.changed.fetch_add(1, std::memory_order_relaxed);
+    if (met_after) k.met_after.fetch_add(1, std::memory_order_relaxed);
+    if (changed && met_after && !met_before) k.changed_and_met.fetch_add(1, std::memory_order_relaxed);
+    if (ns > 2000) k.waited_ns.fetch_add(ns, std::memory_order_relaxed);
+    static auto next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    if (std::chrono::steady_clock::now() < next) {
+        return;
+    }
+    next = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    static constexpr std::array names{"shim", "shadow", "other"};
+    std::string line;
+    for (size_t i = 0; i < 3; ++i) {
+        auto& d = g_temp_drains[i];
+        line += fmt::format(" | {} n={} ms={:.1f} met_before={} changed={} met_after={} "
+                            "met_by_queued_work={} ms_over_2us={:.1f}",
+                            names[i], d.count.exchange(0), d.ns.exchange(0) / 1e6,
+                            d.met_before.exchange(0), d.changed.exchange(0), d.met_after.exchange(0),
+                            d.changed_and_met.exchange(0), d.waited_ns.exchange(0) / 1e6);
+    }
+    LOG_INFO(HW_GPU, "TEMP acquire drains in 10 s (trigger path){}", line);
 }
 
 // With the GPU thread split (gpu_split.h) the rasterizer belongs to the back thread: work that
@@ -521,8 +558,27 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             VideoCommon::Count(stats.trigger_not_met);
         }
         VideoCommon::Count(stats.drained);
+        // TEMP: what the drain waited for. The word is read before it as ReadSemaphoreWord reads
+        // it but without the buffer cache flush (the back's state): the shim from the syncpoints,
+        // the shadow under its lock.
+        const auto temp_device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        const bool temp_shim =
+            dma_pusher.memory_manager.OverlapsSyncpointShim(acquire.address, sizeof(u32));
+        const bool temp_shadow = !temp_shim && temp_device && Nx2MirrorShadow::Get().Diverts(*temp_device);
+        const u32 temp_guest = dma_pusher.memory_manager.Read<u32>(acquire.address);
+        const u32 temp_before =
+            temp_device ? Nx2MirrorShadow::Get().Read(*temp_device, temp_guest).value_or(temp_guest)
+                        : temp_guest;
+        const auto temp_start = std::chrono::steady_clock::now();
         DrainBack();
-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        const u64 temp_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now() - temp_start)
+                                                 .count());
+        const u32 temp_after = ReadSemaphoreWord(dma_pusher, acquire.address);
+        TempNoteAcquireDrain(temp_shim ? 0 : (temp_shadow ? 1 : 2), temp_ns,
+                             acquire.Matches(temp_before), temp_after != temp_before,
+                             acquire.Matches(temp_after));
+        if (acquire.Matches(temp_after)) {
             VideoCommon::Nx2FastDraw::NoteSync();
             return;
         }
