@@ -745,6 +745,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     if (profile.support_cooperative_hmma_16x16x16) {
         LOG_INFO(Render_Vulkan, "Guest tensor operations run on 16x16x16 cooperative matrices");
     }
+    profile.support_cooperative_hmma_8x8x8 = !profile.support_cooperative_hmma &&
+                                             !profile.support_cooperative_hmma_16x16x16 &&
+                                             device.IsCooperativeHmma8x8x8Supported();
+    if (profile.support_cooperative_hmma_8x8x8) {
+        LOG_INFO(Render_Vulkan, "Guest tensor operations run on 8x8x8 cooperative matrices");
+    }
     if (profile.has_broken_mesh_user_sgprs) {
         LOG_INFO(Render_Vulkan, "RADV before 26.2.5: native mesh shaders read the grid size to "
                                 "avoid the stale mesh user SGPR hang");
