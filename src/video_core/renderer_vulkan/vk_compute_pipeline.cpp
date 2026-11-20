@@ -291,8 +291,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .flags = flags,
             .stage{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
-                                 device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
+                .pNext = uses_warp_ops && device.CanRequireComputeGuestWarpSize()
                              ? &subgroup_size_ci
                              : nullptr,
                 .flags = info.uses_cooperative_matrix || info.requires_full_guest_warps

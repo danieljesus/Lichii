@@ -678,6 +678,8 @@ struct HmmaPlan {
 };
 
 HmmaPlan PlanHmma(const Profile& profile, IR::Program& program) {
+    // Looked at again for each plan, in case the IR changed since the last one.
+    program.hmma_summary.reset();
     const std::optional<u32> tensor_scratch_word{ReserveCooperativeHmmaScratch(profile, program)};
     const bool cooperative_hmma{tensor_scratch_word.has_value() ||
                                 UsesCooperativeHmma(profile, program)};
@@ -724,6 +726,13 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program, ctx, main);
+    if (software_hmma_scratch_word && profile.support_maximal_reconvergence) {
+        // The staged HMMA exchange waits on subgroup barriers: lanes that took different paths
+        // through the ifs and loops before it meet again there (HmmaInConvergedFlow keeps every
+        // HMMA itself out of them).
+        ctx.AddExtension("SPV_KHR_maximal_reconvergence");
+        ctx.AddExecutionMode(main, spv::ExecutionMode::MaximallyReconvergesKHR);
+    }
     if (profile.support_float_controls) {
         ctx.AddExtension("SPV_KHR_float_controls");
         SetupDenormControl(profile, program, ctx, main);

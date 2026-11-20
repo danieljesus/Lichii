@@ -708,16 +708,13 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
         .has_broken_spirv_fragment_shuffle = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY,
-        .support_float16 = device.IsFloat16Supported(),
         // Measured on Apple GPUs only (an M6): Intel and AMD Macs keep the default paths.
-        .fp16_conversion_rounds_rte_with_denorms = device.IsMoltenVK() && is_apple_gpu,
+        .fp16_conversion_rounds_rte_with_denorms =
+            device.IsMoltenVK() && is_apple_gpu && device.IsFloat16Supported(),
         .has_slow_dynamic_shuffle = device.IsMoltenVK() && is_apple_gpu,
         .support_compute_full_subgroups = device.IsComputeFullSubgroupsSupported(),
-        .compute_subgroups_are_guest_warps =
-            (device.IsSubgroupSizeControlSupported() &&
-             device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)) ||
-            (device.GetMinSubgroupSize() == 32 && device.GetMaxSubgroupSize() == 32) ||
-            (device.IsMoltenVK() && is_apple_gpu && device.GetMaxSubgroupSize() == 32),
+        .compute_subgroups_are_guest_warps = device.AreComputeSubgroupsGuestWarps(),
+        .support_maximal_reconvergence = device.IsKhrShaderMaximalReconvergenceSupported(),
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,

@@ -180,29 +180,14 @@ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& typ
 }
 } // Anonymous namespace
 
-bool UsesCooperativeHmma(const Profile& profile, const IR::Program& program) {
-    if (!profile.support_cooperative_hmma || !SupportsCooperativeHmma(program)) {
-        return false;
-    }
-    for (const auto* block : program.blocks) {
-        for (const auto& inst : block->Instructions()) {
-            if (inst.GetOpcode() == IR::Opcode::TensorMulAdd && inst.Flags<u32>() == 16) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 namespace {
-using HmmaScratchKind = IR::Program::HmmaScratch::Kind;
-
 /// Whether every HMMA runs where the whole warp does, as far as the structure shows: outside any
 /// if and any loop (whose breaks or repeat condition may differ between lanes), and after no
-/// return inside an if or a loop (lanes that left early). The staged exchange's subgroup barriers need that;
-/// hardware HMMA needs it too, but a shuffle from an inactive lane only gives an undefined value
-/// where a barrier can hang.
-bool HmmaInConvergedFlow(const IR::Program& program) {
+/// return inside an if or a loop (lanes that left early). The staged exchange's subgroup barriers
+/// need that; hardware HMMA needs it too, but a shuffle from an inactive lane only gives an
+/// undefined value where a barrier can hang. With maximal reconvergence (EmitSPIRV asks for it
+/// where the device has it) the lanes also meet again after the ifs and loops before it.
+bool HmmaInConvergedFlow(const IR::Program& program, size_t total) {
     u32 if_depth = 0;
     u32 loop_depth = 0;
     size_t seen = 0;
@@ -242,68 +227,75 @@ bool HmmaInConvergedFlow(const IR::Program& program) {
         }
     }
     // Every HMMA of the program has to have been seen through the structure.
-    size_t total = 0;
-    for (const auto* block : program.blocks) {
-        for (const auto& inst : block->Instructions()) {
-            total += inst.GetOpcode() == IR::Opcode::TensorMulAdd ? 1 : 0;
-        }
-    }
     return seen == total;
 }
 
-bool HasHmma(const IR::Program& program) {
-    for (const auto* block : program.blocks) {
-        for (const auto& inst : block->Instructions()) {
-            if (inst.GetOpcode() == IR::Opcode::TensorMulAdd) {
-                return true;
+/// The program's TensorMulAdds, looked at once and kept in the program.
+const IR::Program::HmmaSummary& Summarize(const IR::Program& program) {
+    if (!program.hmma_summary) {
+        size_t total = 0;
+        bool any_k16 = false;
+        for (const auto* block : program.blocks) {
+            for (const auto& inst : block->Instructions()) {
+                if (inst.GetOpcode() == IR::Opcode::TensorMulAdd) {
+                    ++total;
+                    any_k16 |= inst.Flags<u32>() == 16;
+                }
             }
         }
+        program.hmma_summary = IR::Program::HmmaSummary{
+            .any = total != 0,
+            .any_k16 = any_k16,
+            .converged = total != 0 && HmmaInConvergedFlow(program, total),
+        };
     }
-    return false;
+    return *program.hmma_summary;
+}
+
+u32 WorkgroupInvocations(const IR::Program& program) {
+    return program.workgroup_size[0] * program.workgroup_size[1] * program.workgroup_size[2];
 }
 
 /// Appends `words_per_warp` words of shared memory for each 32-lane warp after the program's own
-/// (16-byte aligned) and returns the word where they start. Once: emitting the same program again
-/// gives the same area, not a second one, and another kind replaces it. None past the device's
-/// limit, where the pipeline would not build.
+/// (16-byte aligned) and returns the word where they start. Each emission gives the area back and
+/// reserves it again, under the profile it is emitted with: the same path finds the same word,
+/// and the device's limit is checked again. None past that limit, where the pipeline would not
+/// build.
 std::optional<u32> ReserveHmmaScratch(const Profile& profile, IR::Program& program,
-                                      HmmaScratchKind kind, u32 words_per_warp) {
-    // Reserved again from the program's own size each time: the same kind finds the same word,
-    // and the limit is checked under this profile.
+                                      u32 words_per_warp) {
     ReleaseHmmaScratch(program);
-    const u32 invocations = program.workgroup_size[0] * program.workgroup_size[1] *
-                            program.workgroup_size[2];
-    const u32 warps = invocations / GUEST_WARP_LANES;
+    const u32 warps = WorkgroupInvocations(program) / GUEST_WARP_LANES;
     const u32 scratch_offset = (program.shared_memory_size + 15U) & ~15U;
     const u32 total = scratch_offset + warps * words_per_warp * 4U;
     if (profile.max_compute_shared_memory_size != 0 &&
         total > profile.max_compute_shared_memory_size) {
         return std::nullopt;
     }
-    program.hmma_scratch = IR::Program::HmmaScratch{
-        .kind = kind,
-        .word = scratch_offset / 4U,
-        .program_bytes = program.shared_memory_size,
-    };
+    program.hmma_program_shared_bytes = program.shared_memory_size;
     program.shared_memory_size = total;
     return scratch_offset / 4U;
 }
 } // Anonymous namespace
 
+bool UsesCooperativeHmma(const Profile& profile, const IR::Program& program) {
+    return profile.support_cooperative_hmma && SupportsCooperativeHmma(program) &&
+           Summarize(program).any_k16;
+}
+
 void ReleaseHmmaScratch(IR::Program& program) {
-    if (program.hmma_scratch) {
-        program.shared_memory_size = program.hmma_scratch->program_bytes;
-        program.hmma_scratch.reset();
+    if (program.hmma_program_shared_bytes) {
+        program.shared_memory_size = *program.hmma_program_shared_bytes;
+        program.hmma_program_shared_bytes.reset();
     }
 }
 
 std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program) {
     if (!profile.support_cooperative_hmma_16x16x16 || !SupportsCooperativeHmma(program) ||
-        !HasHmma(program)) {
+        !Summarize(program).any) {
         return std::nullopt;
     }
     // A, B and C/D tiles of 16x16 fp16, 128 words each, for each subgroup.
-    return ReserveHmmaScratch(profile, program, HmmaScratchKind::Cooperative16x16x16, 384U);
+    return ReserveHmmaScratch(profile, program, 384U);
 }
 
 // The software HMMA's fragment exchange: each lane of a warp writes its six A and B words here, and
@@ -312,20 +304,21 @@ std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Pro
 // or reading one, hit 32 different banks.
 constexpr u32 SoftwareHmmaWordsPerLane = 6;
 constexpr u32 SoftwareHmmaWordsPerWarp = GUEST_WARP_LANES * SoftwareHmmaWordsPerLane;
+/// The largest workgroup whose SIMD groups were measured as warps (an M6: up to its limit, 1024)
+constexpr u32 SoftwareHmmaMaxInvocations = 1024;
 
 std::optional<u32> ReserveSoftwareHmmaScratch(const Profile& profile, IR::Program& program) {
     // Slots are per subgroup (SubgroupId) and per lane: subgroups must be whole 32-lane warps, which
     // the pipeline requires (REQUIRE_FULL_SUBGROUPS, requires_full_guest_warps) and the device must
-    // run, or the areas of two subgroups overlap and lanes read past theirs.
+    // run, or the areas of two subgroups overlap. The index is also clamped to the area.
     if (!profile.has_slow_dynamic_shuffle || program.stage != Stage::Compute ||
         !profile.support_compute_full_subgroups || !profile.compute_subgroups_are_guest_warps ||
         program.workgroup_size[0] == 0 || program.workgroup_size[0] % GUEST_WARP_LANES != 0 ||
-        profile.max_subgroup_size != GUEST_WARP_LANES || !HasHmma(program) ||
-        !HmmaInConvergedFlow(program)) {
+        WorkgroupInvocations(program) > SoftwareHmmaMaxInvocations ||
+        profile.max_subgroup_size != GUEST_WARP_LANES || !Summarize(program).converged) {
         return std::nullopt;
     }
-    return ReserveHmmaScratch(profile, program, HmmaScratchKind::SoftwareExchange,
-                              SoftwareHmmaWordsPerWarp);
+    return ReserveHmmaScratch(profile, program, SoftwareHmmaWordsPerWarp);
 }
 
 namespace {
@@ -333,8 +326,7 @@ namespace {
 // fp32 -> fp16 -> fp32 conversion rounds like the software rounding below. The two agree for
 // every non-NaN fp32 input; a NaN stays a NaN.
 bool ConversionRoundsHalfItself(const Profile& profile, const Info& info) {
-    return profile.support_float16 && profile.fp16_conversion_rounds_rte_with_denorms &&
-           !info.uses_fp16_denorms_flush;
+    return profile.fp16_conversion_rounds_rte_with_denorms && !info.uses_fp16_denorms_flush;
 }
 
 // Or the conversion rounds that way without any mode (ConversionRoundsHalfItself).
@@ -342,8 +334,8 @@ bool CanRoundHalfNatively(const Profile& profile, const Info& info) {
     if (ConversionRoundsHalfItself(profile, info)) {
         return true;
     }
-    if (!profile.support_float16 || !profile.support_float_controls ||
-        profile.has_broken_fp16_float_controls ||
+    // support_fp16_rounding_rte includes shaderFloat16, which the f16 type needs.
+    if (!profile.support_float_controls || profile.has_broken_fp16_float_controls ||
         !profile.support_fp16_rounding_rte || !profile.support_fp16_denorm_preserve ||
         !profile.fp16_float_controls_independent_of_fp32 || info.uses_fp16_denorms_flush) {
         return false;
@@ -481,9 +473,13 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         // it together, from uniform control flow (HmmaInConvergedFlow).
         Id warp_slots{};
         if (staged) {
+            // Clamped to the workgroup's warps, so that a subgroup layout other than the one
+            // measured stays within the area instead of reaching memory beyond it.
+            const u32 last_warp = WorkgroupInvocations(program) / GUEST_WARP_LANES - 1;
+            const Id warp = ctx.OpUMin(u32ty, ctx.OpLoad(u32ty, ctx.tensor_subgroup_id),
+                                       imm(last_warp));
             warp_slots = add(imm(*ctx.software_hmma_scratch_word),
-                             ctx.OpIMul(u32ty, ctx.OpLoad(u32ty, ctx.tensor_subgroup_id),
-                                        imm(SoftwareHmmaWordsPerWarp)));
+                             ctx.OpIMul(u32ty, warp, imm(SoftwareHmmaWordsPerWarp)));
             const Id own = add(warp_slots, and_(lane, 31));
             for (u32 i = 0; i < SoftwareHmmaWordsPerLane; ++i) {
                 ctx.StoreShared(SharedWord(ctx, add(own, imm(i * GUEST_WARP_LANES))), inputs[i]);

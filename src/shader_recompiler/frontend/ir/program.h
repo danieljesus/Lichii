@@ -28,15 +28,18 @@ struct Program {
     u32 invocations{};
     u32 local_memory_size{};
     u32 shared_memory_size{};
-    /// Shared memory an HMMA path appended after the program's own, once: emitting the program
-    /// again (Nx2Perf::Verify emits twice) finds it here instead of appending another
-    struct HmmaScratch {
-        enum class Kind { Cooperative16x16x16, SoftwareExchange };
-        Kind kind;
-        u32 word;                ///< Where it starts
-        u32 program_bytes;       ///< The program's own shared memory, before it
+    /// The program's own shared memory while an HMMA path has appended an area after it: each
+    /// emission gives that area back and reserves again, so emitting twice (Nx2Perf::Verify)
+    /// does not append a second one
+    std::optional<u32> hmma_program_shared_bytes;
+    /// What the HMMA paths need to know of the program's TensorMulAdds, found in one pass for each
+    /// HMMA plan (PrepareHmma, EmitSPIRV)
+    struct HmmaSummary {
+        bool any;          ///< It has a TensorMulAdd
+        bool any_k16;      ///< One of them is HMMA.16816 (depth 16)
+        bool converged;    ///< All run where the whole warp does (HmmaInConvergedFlow)
     };
-    std::optional<HmmaScratch> hmma_scratch;
+    mutable std::optional<HmmaSummary> hmma_summary;
     /// PrepareHmma set the HMMA requirements in info: emitting checks them instead
     bool hmma_prepared{};
     bool is_geometry_passthrough{};

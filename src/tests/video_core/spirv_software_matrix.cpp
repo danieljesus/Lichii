@@ -69,7 +69,6 @@ struct TensorProgram {
         profile.supported_spirv = 0x00010500;
         profile.supported_subgroup_stages = 1U << static_cast<u32>(Stage::Compute);
         profile.max_subgroup_size = 32;
-        profile.support_float16 = true;
         IR::IREmitter ir{block};
         if (count == 0) {
             return;
@@ -956,8 +955,7 @@ TEST_CASE("Software HMMA's exchange goes after the program's own shared memory",
     const auto code = fixture.Emit();
     REQUIRE_FALSE(Shuffles(code));
     // 1000 bytes rounded up to 16, then the exchange: no word of the program's is reused.
-    REQUIRE(fixture.program.hmma_scratch.has_value());
-    REQUIRE(fixture.program.hmma_scratch->word == 1008 / 4);
+    REQUIRE(fixture.program.hmma_program_shared_bytes == 1000U);
     REQUIRE(fixture.program.shared_memory_size == 1008 + StagedBytes);
 }
 
@@ -1068,15 +1066,14 @@ TEST_CASE("An HMMA reservation of another kind gives the program its memory back
     const auto code = fixture.Emit();
     REQUIRE_FALSE(Shuffles(code));
     REQUIRE(fixture.program.shared_memory_size == 64 + StagedBytes);
-    REQUIRE(fixture.program.hmma_scratch->word == 64 / 4);
+    REQUIRE(fixture.program.hmma_program_shared_bytes == 64U);
 }
 
-TEST_CASE("Software HMMA rounds in software without 16-bit floats",
+TEST_CASE("Software HMMA rounds in software without a conversion that rounds by itself",
           "[video_core][tensor][ampere]") {
+    // Float controls, but neither the fp16 modes nor a conversion that keeps fp16 subnormals.
     TensorProgram fixture{1, 16};
     fixture.profile.support_float_controls = true;
-    fixture.profile.fp16_conversion_rounds_rte_with_denorms = true;
-    fixture.profile.support_float16 = false;
     const auto code = fixture.Emit();
     REQUIRE(Instructions(code, OpFConvert).empty());
     REQUIRE_FALSE(HasCapability(code, 9)); // Float16
@@ -1092,7 +1089,7 @@ TEST_CASE("An HMMA reservation no path uses any more is given back",
     fixture.profile.has_slow_dynamic_shuffle = false;
     REQUIRE(Shuffles(fixture.Emit()));
     REQUIRE(fixture.program.shared_memory_size == 64);
-    REQUIRE_FALSE(fixture.program.hmma_scratch.has_value());
+    REQUIRE_FALSE(fixture.program.hmma_program_shared_bytes.has_value());
     REQUIRE_FALSE(fixture.program.info.requires_full_guest_warps);
 }
 
@@ -1169,4 +1166,55 @@ TEST_CASE("An HMMA reservation is checked against the limit of the profile it is
     fixture.profile.max_compute_shared_memory_size = 32768;
     REQUIRE(Shuffles(fixture.Emit()));
     REQUIRE(fixture.program.shared_memory_size == 31500);
+}
+
+TEST_CASE("Software HMMA's exchange stays within the workgroups measured as warps",
+          "[video_core][tensor][ampere]") {
+    // An M6 forms 32-wide SIMD groups, numbered tid / 32, for threadgroups of 32 to 1024.
+    TensorProgram fixture{1, 16};
+    SlowShuffles(fixture);
+    fixture.program.workgroup_size = {32, 64, 1};
+    REQUIRE(Shuffles(fixture.Emit()));
+    REQUIRE(fixture.program.shared_memory_size == 0);
+}
+
+TEST_CASE("Software HMMA clamps its warp index to its area", "[video_core][tensor][ampere]") {
+    constexpr u32 OpExtInst = 12;
+    constexpr u32 OpConstant = 43;
+    constexpr u32 GlslUMin = 38;
+    // 160 invocations: five warps, the last one 4, a constant nothing else in the program uses.
+    TensorProgram fixture{1, 16};
+    SlowShuffles(fixture);
+    fixture.program.workgroup_size = {160, 1, 1};
+    const auto code = fixture.Emit();
+    const auto constants = Instructions(code, OpConstant);
+    const auto is_four = [&](u32 id) {
+        return std::ranges::any_of(constants, [&](const auto& words) {
+            return words.size() == 3 && words[1] == id && words[2] == 4;
+        });
+    };
+    REQUIRE(std::ranges::any_of(Instructions(code, OpExtInst), [&](const auto& words) {
+        return words.size() == 6 && words[3] == GlslUMin && is_four(words[5]);
+    }));
+}
+
+TEST_CASE("Software HMMA's exchange asks for maximal reconvergence where it can",
+          "[video_core][tensor][ampere]") {
+    constexpr u32 ExecutionModeMaximallyReconverges = 6023;
+    const auto reconverges = [](const std::vector<u32>& code) {
+        return std::ranges::any_of(Instructions(code, OpExecutionMode), [](const auto& words) {
+            return words.size() == 2 && words[1] == ExecutionModeMaximallyReconverges;
+        });
+    };
+    TensorProgram supported{1, 16};
+    SlowShuffles(supported);
+    supported.profile.support_maximal_reconvergence = true;
+    REQUIRE(reconverges(supported.Emit()));
+    TensorProgram unsupported{1, 16};
+    SlowShuffles(unsupported);
+    REQUIRE_FALSE(reconverges(unsupported.Emit()));
+    // Shuffles need no barrier, so no mode.
+    TensorProgram shuffled{1, 16};
+    shuffled.profile.support_maximal_reconvergence = true;
+    REQUIRE_FALSE(reconverges(shuffled.Emit()));
 }
