@@ -1414,10 +1414,39 @@ void TextureCache<P>::TickFrame() {
                     // The device's budget is not all the room there is: see HostCriticalMemory.
                     // The usage is the driver's, which still counts images waiting to be freed.
                     const std::optional<u64> commit_room = Common::GetSystemCommitRoom();
-                    const u64 host_critical =
+                    u64 host_critical =
                         commit_room
                             ? HostCriticalMemory(runtime.GetDeviceMemoryUsage(), *commit_room)
                             : (std::numeric_limits<u64>::max)();
+                    // macOS: the system's memory pressure caps it (HostPressureLimit).
+                    if (const Common::MemoryPressure pressure = Common::GetMemoryPressure();
+                        pressure != Common::MemoryPressure::Unknown) {
+                        u64 image_bytes = 0;
+                        if (pressure == Common::MemoryPressure::Critical ||
+                            pressure_limit.Level() == Common::MemoryPressure::Critical) {
+                            for (const auto [image_id, image] : slot_images) {
+                                image_bytes += ImageAllocationBytes(*image);
+                                if (image->HasScaled()) {
+                                    image_bytes += GetScaledImageSizeBytes(*image);
+                                }
+                            }
+                        }
+                        const std::optional<u64> cap =
+                            pressure_limit.Update(pressure, std::chrono::steady_clock::now(),
+                                                  total_used_memory, image_bytes);
+                        if (cap) {
+                            host_critical = (std::min)(host_critical, *cap);
+                        }
+                        if (pressure_limit.Level() != logged_pressure) {
+                            logged_pressure = pressure_limit.Level();
+                            constexpr std::array<const char*, 4> names{"unknown", "normal",
+                                                                       "warning", "critical"};
+                            LOG_INFO(HW_GPU, "Host memory pressure {}: {}",
+                                     names[static_cast<size_t>(logged_pressure)],
+                                     cap ? fmt::format("texture cache capped at {} MiB", *cap >> 20)
+                                         : std::string{"no cap"});
+                        }
+                    }
                     critical_memory = (std::min)(critical_memory, host_critical);
                     retention_budget = RetentionBudget(retention_budget, budget);
                     const u64 room_margin =

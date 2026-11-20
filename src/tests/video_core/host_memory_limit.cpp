@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <chrono>
 #include <limits>
 #include <optional>
 
@@ -60,4 +61,68 @@ TEST_CASE("The system's commit room is reported where there is a commit limit",
 #else
     REQUIRE_FALSE(room.has_value());
 #endif
+}
+
+TEST_CASE("Memory pressure caps the texture cache only while it lasts",
+          "[video_core][texture_cache][host_memory_limit]") {
+    using Common::MemoryPressure;
+    using VideoCommon::HostPressureLimit;
+    using Clock = HostPressureLimit::Clock;
+    const Clock::time_point t0{std::chrono::seconds{1000}};
+    HostPressureLimit limit;
+    // Normal, or a host that does not say: Metal's budget applies as before.
+    REQUIRE_FALSE(limit.Update(MemoryPressure::Normal, t0, 6 * GiB, 4 * GiB).has_value());
+    REQUIRE_FALSE(limit.Update(MemoryPressure::Unknown, t0, 6 * GiB, 4 * GiB).has_value());
+    // Warning: the cache does not grow past what is in use when it came...
+    REQUIRE(limit.Update(MemoryPressure::Warning, t0, 6 * GiB, 4 * GiB) == 6 * GiB);
+    REQUIRE(limit.Update(MemoryPressure::Warning, t0, 7 * GiB, 4 * GiB) == 6 * GiB);
+    // ...and does not follow it down as the cache frees images (that would ratchet to the floor).
+    REQUIRE(limit.Update(MemoryPressure::Warning, t0, 5 * GiB, 3 * GiB) == 6 * GiB);
+    // Normal again: the cap holds until that lasted PressureSettle.
+    REQUIRE(limit.Update(MemoryPressure::Normal, t0, 4 * GiB, 3 * GiB) == 6 * GiB);
+    REQUIRE(limit.Update(MemoryPressure::Normal, t0 + VideoCommon::PressureSettle -
+                                                     std::chrono::seconds{1},
+                         4 * GiB, 3 * GiB) == 6 * GiB);
+    REQUIRE_FALSE(limit.Update(MemoryPressure::Normal, t0 + VideoCommon::PressureSettle, 4 * GiB,
+                               3 * GiB)
+                      .has_value());
+}
+
+TEST_CASE("Critical memory pressure collects an eighth of the images at a time",
+          "[video_core][texture_cache][host_memory_limit]") {
+    using Common::MemoryPressure;
+    using VideoCommon::HostPressureLimit;
+    const HostPressureLimit::Clock::time_point t0{std::chrono::seconds{1000}};
+    HostPressureLimit limit;
+    // 8 GiB in use, 4 GiB of it images: an eighth of them goes.
+    REQUIRE(limit.Update(MemoryPressure::Critical, t0, 8 * GiB, 4 * GiB) == 7 * GiB + 512 * MiB);
+    // At the next check, after collecting, another eighth.
+    REQUIRE(limit.Update(MemoryPressure::Critical, t0, 7 * GiB + 512 * MiB, 3 * GiB + 512 * MiB) ==
+            7 * GiB + 64 * MiB);
+    // Never under everything else plus the images a scene needs.
+    REQUIRE(limit.Update(MemoryPressure::Critical, t0, 5 * GiB, 1 * GiB) ==
+            4 * GiB + VideoCommon::MinPressureImageMemory);
+    // A warning while critical settles keeps the lower cap.
+    REQUIRE(limit.Update(MemoryPressure::Warning, t0, 6 * GiB, 2 * GiB) ==
+            4 * GiB + VideoCommon::MinPressureImageMemory);
+    REQUIRE(limit.Level() == MemoryPressure::Critical);
+}
+
+TEST_CASE("The host's memory pressure is read where the host says it",
+          "[video_core][texture_cache][host_memory_limit]") {
+#ifdef __APPLE__
+    REQUIRE(Common::GetMemoryPressure() != Common::MemoryPressure::Unknown);
+#else
+    REQUIRE(Common::GetMemoryPressure() == Common::MemoryPressure::Unknown);
+#endif
+}
+
+TEST_CASE("A memory pressure warning leaves the cache what a scene needs",
+          "[video_core][texture_cache][host_memory_limit]") {
+    using Common::MemoryPressure;
+    const VideoCommon::HostPressureLimit::Clock::time_point t0{std::chrono::seconds{1000}};
+    VideoCommon::HostPressureLimit limit;
+    // 2.9 GiB in use when the warning comes: the cap is the floor, not that.
+    REQUIRE(limit.Update(MemoryPressure::Warning, t0, 2 * GiB + 900 * MiB, 1 * GiB) ==
+            VideoCommon::MinHostCriticalMemory);
 }

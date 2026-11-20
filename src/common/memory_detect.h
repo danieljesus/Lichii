@@ -73,4 +73,16 @@ struct ProcessMemoryUsage {
 /// IsLowOnMemory for this host, read again at most once a second.
 [[nodiscard]] bool IsHostLowOnMemory();
 
+/// How short of memory the system says it is.
+enum class MemoryPressure : u8 {
+    Unknown,  ///< The host does not say (anything but macOS)
+    Normal,
+    Warning,  ///< macOS compresses and swaps, and asks applications to free memory
+    Critical, ///< macOS is about to terminate processes
+};
+
+/// The kernel's memory pressure level (kern.memorystatus_vm_pressure_level on macOS, the level
+/// Activity Monitor's memory pressure follows). Unknown elsewhere.
+[[nodiscard]] MemoryPressure GetMemoryPressure();
+
 } // namespace Common

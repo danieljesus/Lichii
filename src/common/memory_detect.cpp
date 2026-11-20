@@ -262,6 +262,29 @@ u64 GetAvailablePhysicalMemory() {
 #endif
 }
 
+MemoryPressure GetMemoryPressure() {
+#ifdef __APPLE__
+    // 1, 2 and 4: kVMPressureNormal, kVMPressureWarning and kVMPressureCritical.
+    int level = 0;
+    size_t size = sizeof(level);
+    if (sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &size, nullptr, 0) != 0) {
+        return MemoryPressure::Unknown;
+    }
+    switch (level) {
+    case 1:
+        return MemoryPressure::Normal;
+    case 2:
+        return MemoryPressure::Warning;
+    case 4:
+        return MemoryPressure::Critical;
+    default:
+        return MemoryPressure::Unknown;
+    }
+#else
+    return MemoryPressure::Unknown;
+#endif
+}
+
 bool IsHostLowOnMemory() {
     using Clock = std::chrono::steady_clock;
     static std::atomic<Clock::rep> checked_at{};
