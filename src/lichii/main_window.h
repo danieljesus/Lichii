@@ -379,11 +379,16 @@ private slots:
     void OnGameListRemovePlayTimeData(u64 program_id);
     void OnGameListSetPlayTime(u64 program_id);
     void OnGameListDumpRomFS(u64 program_id, const std::string& game_path, DumpRomFSTarget target);
+    void OnGameListBuildPrecompiledFromPlay(u64 program_id, const std::string& game_path);
     void OnGameListVerifyIntegrity(const std::string& game_path);
     void OnGameListConvertToNup(const std::string& game_path);
     void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);
     void OnGameListDeleteShaderWarm(u64 program_id);
     void PrepareShaderPrecache(u64 title_id, const std::filesystem::path& game_path);
+    /// Builds the game's precompiled file from its recorded shader cache and its files, with a
+    /// progress window. True when it was built.
+    bool BuildPrecompiledFromPlay(u64 program_id, const std::string& game_path, bool at_launch);
+    void OfferPrecompiledBuild(u64 title_id, const std::string& game_path);
     void OnGameListExtractNup(const std::string& game_path);
     void OnGameListEditNupMetadata(const std::string& game_path);
     void OnGameListCopyTID(u64 program_id);
@@ -602,6 +607,7 @@ private:
     // Status bar elements
     QLabel* message_label = nullptr;
     QLabel* shader_building_label = nullptr;
+    QLabel* shader_prepare_label = nullptr;
     QLabel* res_scale_label = nullptr;
     QLabel* emu_speed_label = nullptr;
     QLabel* game_fps_label = nullptr;
@@ -699,6 +705,9 @@ private:
 
     // True if TAS recording dialog is visible
     bool is_tas_recording_dialog_active{};
+
+    // True while a precompiled shader build's worker runs (a cancelled one included)
+    bool is_precompiled_build_active{};
 
 #ifdef __unix__
     QSocketNotifier* sig_interrupt_notifier;

@@ -3,8 +3,14 @@
 
 #include "qt_common/util/game.h"
 
+#include <algorithm>
+#include <array>
+#include <filesystem>
+#include <memory>
+#include <vector>
 #include <fmt/format.h>
 
+#include "common/fs/file_lock.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "core/file_sys/savedata_factory.h"
@@ -334,6 +340,103 @@ void RemoveAllTransferableShaderCaches(u64 program_id) {
 
             tr("Error Removing Transferable Shader Caches"),
             tr("Failed to remove the transferable shader cache directory."));
+    }
+}
+
+void RemoveShaderPreparation(u64 program_id) {
+    const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
+    const auto dir = shader_cache_dir / fmt::format("{:016x}", program_id);
+    // The store (precompiled_kept*) and the files of the format before it, for any cache version
+    // (PipelineCache::PreparePrecompiled). Not the precompiled file (precompiled.fork-v<N>.nx2prep)
+    // or what the game list knows of building it (precompiled_from_play*).
+    constexpr std::array<std::string_view, 4> Prefixes{
+        "precompiled_kept", "precompiled_infos", "precompiled_prepared", "precompiled_progress"};
+    std::vector<std::filesystem::path> files;
+    std::error_code error;
+    // Non-throwing iteration: a range-for's increment throws, and this runs in a Qt slot.
+    // A missing folder is an empty one, but only when it can't be opened: an error while
+    // listing it leaves the list incomplete.
+    bool listed = true;
+    std::filesystem::directory_iterator it(dir, error);
+    if (error) {
+        listed = error == std::errc::no_such_file_or_directory;
+        it = {};
+        error.clear();
+    }
+    for (; !error && it != std::filesystem::directory_iterator{}; it.increment(error)) {
+        const std::string name = Common::FS::PathToUTF8String(it->path().filename());
+        // Store lock files stay: one held by another emulator must keep its identity, or a
+        // later launch could take a new lock beside it (PipelineCache::PreparePrecompiled).
+        if (name.find(".fork-v") == std::string::npos || name.ends_with(".lock") ||
+            !std::ranges::any_of(
+                Prefixes, [&](std::string_view prefix) { return name.starts_with(prefix); })) {
+            continue;
+        }
+        std::error_code status_error;
+        const bool regular = it->is_regular_file(status_error);
+        if (status_error) {
+            listed = false;
+            continue;
+        }
+        if (regular) {
+            files.push_back(it->path());
+        }
+    }
+    if (error) {
+        listed = false;
+    }
+    if (!listed) {
+        QtCommon::Frontend::Warning(tr("Error Removing Shader Preparation"),
+                                    tr("Failed to read this game's shader cache directory."));
+        return;
+    }
+    if (files.empty()) {
+        QtCommon::Frontend::Warning(tr("Error Removing Shader Preparation"),
+                                    tr("This game's precompiled shaders have not been prepared."));
+        return;
+    }
+    // Each store's lock, held while its files go: another emulator preparing this game has them
+    // open, so they are left alone while it runs. The lock is beside the index, named from the
+    // data file too: a store being started has its data file before its index.
+    constexpr std::string_view DataPrefix = "precompiled_kept.";
+    constexpr std::string_view IndexPrefix = "precompiled_kept_index.";
+    std::vector<std::filesystem::path> lock_paths;
+    for (const auto& file : files) {
+        std::string name = Common::FS::PathToUTF8String(file.filename());
+        if (name.starts_with(DataPrefix)) {
+            name = std::string{IndexPrefix} + name.substr(DataPrefix.size());
+        } else if (!name.starts_with(IndexPrefix)) {
+            continue;
+        }
+        auto lock_path = file.parent_path() / Common::FS::ToU8String(name + ".lock");
+        if (std::ranges::find(lock_paths, lock_path) == lock_paths.end()) {
+            lock_paths.push_back(std::move(lock_path));
+        }
+    }
+    std::vector<std::unique_ptr<Common::FS::FileLock>> locks;
+    for (const auto& lock_path : lock_paths) {
+        auto& lock = locks.emplace_back(std::make_unique<Common::FS::FileLock>(lock_path));
+        if (!lock->Held()) {
+            QtCommon::Frontend::Warning(
+                tr("Error Removing Shader Preparation"),
+                lock->Busy() ? tr("Another emulator is preparing this game's precompiled "
+                                  "shaders. Close it, then remove them again.")
+                             : tr("Failed to lock the shader preparation for removal."));
+            return;
+        }
+    }
+    bool removed = true;
+    for (const auto& file : files) {
+        removed &= std::filesystem::remove(file, error) && !error;
+    }
+    if (removed) {
+        QtCommon::Frontend::Information(
+            tr("Successfully Removed"),
+            tr("Successfully removed the shader preparation. The precompiled shaders are "
+               "prepared again at the game's next launch."));
+    } else {
+        QtCommon::Frontend::Warning(tr("Error Removing Shader Preparation"),
+                                    tr("Failed to remove the shader preparation."));
     }
 }
 

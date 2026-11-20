@@ -47,6 +47,8 @@
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
+#include "shader_recompiler/byte_addressed_image.h"
+#include "video_core/surface.h"
 
 namespace VideoCommon {
 
@@ -343,11 +345,40 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 }
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
-    // The read properties and the null texture marker are two more constant buffer values.
+    // The read properties, the null texture marker and the handle word markers are more constant
+    // buffer values.
     return !has_unbound_instructions &&
-           std::max({texture_types.size(), texture_pixel_formats.size(), cbuf_values.size() + 2,
+           std::max({texture_types.size(), texture_pixel_formats.size(),
+                     cbuf_values.size() + 2 + HandleOnlyWords().size(),
                      storage_pointer_types.size(), cbuf_replacements.size()}) <=
                MAX_RECORDED_VALUES;
+}
+
+u32 GenericEnvironment::ReadCbufHandleWord(u32 cbuf_index, u32 cbuf_offset) {
+    reading_handle_word = true;
+    const u32 value = ReadCbufValue(cbuf_index, cbuf_offset);
+    reading_handle_word = false;
+    return value;
+}
+
+void GenericEnvironment::RecordCbufValue(u32 index, u32 offset, u32 value) {
+    const u64 key = MakeCbufKey(index, offset);
+    cbuf_values.emplace(key, value);
+    cbuf_reads[key] |= reading_handle_word ? CbufReadHandle : CbufReadValue;
+}
+
+std::vector<u64> GenericEnvironment::HandleOnlyWords() const {
+    std::vector<u64> markers;
+    for (const auto& [key, reads] : cbuf_reads) {
+        if (reads != CbufReadHandle) {
+            continue;
+        }
+        if (const auto marker =
+                CbufHandleWordKey(static_cast<u32>(key >> 32), static_cast<u32>(key))) {
+            markers.push_back(*marker);
+        }
+    }
+    return markers;
 }
 
 bool GenericEnvironment::HasNativeInstructions() const {
@@ -373,7 +404,8 @@ void GenericEnvironment::Serialize(std::ostream& file, u32 read_properties) cons
     const u64 code_size{static_cast<u64>(CachedSizeBytes())};
     const u64 num_texture_types{static_cast<u64>(texture_types.size())};
     const u64 num_texture_pixel_formats{static_cast<u64>(texture_pixel_formats.size())};
-    const u64 num_cbuf_values{static_cast<u64>(cbuf_values.size()) + 2};
+    const std::vector<u64> handle_words{HandleOnlyWords()};
+    const u64 num_cbuf_values{static_cast<u64>(cbuf_values.size()) + 2 + handle_words.size()};
     const u64 num_storage_pointer_types{static_cast<u64>(storage_pointer_types.size())};
     const u64 num_cbuf_replacement_values{static_cast<u64>(cbuf_replacements.size())};
 
@@ -412,6 +444,11 @@ void GenericEnvironment::Serialize(std::ostream& file, u32 read_properties) cons
         .write(reinterpret_cast<const char*>(&read_properties), sizeof(read_properties))
         .write(reinterpret_cast<const char*>(&NULL_TEXTURE_2D_KEY), sizeof(NULL_TEXTURE_2D_KEY))
         .write(reinterpret_cast<const char*>(&null_texture_2d), sizeof(null_texture_2d));
+    for (const u64 marker : handle_words) {
+        constexpr u32 unused{};
+        file.write(reinterpret_cast<const char*>(&marker), sizeof(marker))
+            .write(reinterpret_cast<const char*>(&unused), sizeof(unused));
+    }
     for (const auto& [key, type] : storage_pointer_types) {
         file.write(reinterpret_cast<const char*>(&key), sizeof(key))
             .write(reinterpret_cast<const char*>(&type), sizeof(type));
@@ -1013,7 +1050,7 @@ u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     if (cbuf_offset < cbuf.size) {
         value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
     }
-    cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
+    RecordCbufValue(cbuf_index, cbuf_offset, value);
     return value;
 }
 
@@ -1127,7 +1164,7 @@ u32 ComputeEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     if (cbuf_offset < cbuf.size) {
         value = gpu_memory->Read<u32>(cbuf.Address() + cbuf_offset);
     }
-    cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
+    RecordCbufValue(cbuf_index, cbuf_offset, value);
     return value;
 }
 
@@ -1267,6 +1304,13 @@ void FileEnvironment::Deserialize(std::istream& file, std::streampos end) {
         u32 value;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&value), sizeof(value));
+        if (const auto word = CbufHandleWordFromKey(key)) {
+            cbuf_handle_words.emplace(*word, u8{1});
+            continue;
+        }
+        if (IsRetiredCbufHandleWordKey(key)) {
+            continue;
+        }
         cbuf_values.emplace(key, value);
     }
     if (const auto it{cbuf_values.find(READ_PROPERTIES_KEY)}; it != cbuf_values.end()) {
@@ -1328,7 +1372,123 @@ size_t FileEnvironment::MemorySize() const {
     };
     return sizeof(*this) + code.capacity() * sizeof(u64) + map_bytes(texture_types) +
            map_bytes(texture_pixel_formats) + map_bytes(cbuf_values) +
-           map_bytes(storage_pointer_types) + map_bytes(cbuf_replacements);
+           map_bytes(storage_pointer_types) + map_bytes(cbuf_replacements) +
+           map_bytes(cbuf_handle_words);
+}
+
+namespace {
+/// What translation uses of a pixel format (texture_pass.cpp): whether it is an integer format,
+/// R16_FLOAT and the byte-addressed 32-bit color formats (byte-addressed image stores), the snorm
+/// formats (texel fetch patching without snorm render buffers).
+u32 PixelFormatTraits(Shader::TexturePixelFormat format) {
+    using F = Shader::TexturePixelFormat;
+    const bool snorm = format == F::A8B8G8R8_SNORM || format == F::R8G8_SNORM ||
+                       format == F::R8_SNORM || format == F::R16G16B16A16_SNORM ||
+                       format == F::R16G16_SNORM || format == F::R16_SNORM;
+    return (VideoCore::Surface::IsPixelFormatInteger(
+                static_cast<VideoCore::Surface::PixelFormat>(format))
+                ? 1U
+                : 0U) |
+           (format == F::R16_FLOAT ? 2U : 0U) |
+           (Shader::IsByteAddressed32BitColorFormat(format) ? 4U : 0U) | (snorm ? 8U : 0U);
+}
+} // Anonymous namespace
+
+bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why,
+                                     u32 format_traits) {
+    const auto fail = [why](const char* reason) {
+        if (why) {
+            *why = reason;
+        }
+        return false;
+    };
+    if (live.ShaderStage() != stage || live.StartAddress() != start_address ||
+        live.LocalMemorySize() != local_memory_size) {
+        return fail("program");
+    }
+    // Only a vertex program asks (PositionPass).
+    if (stage == Shader::Stage::VertexB &&
+        live.ReadViewportTransformState() != viewport_transform_state) {
+        return fail("viewport transform");
+    }
+    // Handles of non-bindless textures are read from this constant buffer.
+    if (live.TextureBoundBuffer() != texture_bound) {
+        return fail("texture bound buffer");
+    }
+    // A passthrough geometry program passes the attributes this mask does not skip.
+    if (stage == Shader::Stage::Geometry && live.GpPassthroughMask() != gp_passthrough_mask) {
+        return fail("geometry passthrough mask");
+    }
+    // HLE replacements are asked for every constant buffer read when there are any.
+    if (live.HasHLEMacroState() || HasHLEMacroState()) {
+        return fail("HLE constant replacements");
+    }
+    const auto is_pointer_word = [&](u64 key) {
+        const u32 index = static_cast<u32>(key >> 32);
+        const u32 offset = static_cast<u32>(key);
+        return storage_pointer_types.contains(MakeCbufKey(index, offset)) ||
+               (offset >= 4 && storage_pointer_types.contains(MakeCbufKey(index, offset - 4)));
+    };
+    std::vector<u32> handles_read;
+    for (const auto& [key, value] : cbuf_values) {
+        const u32 index = static_cast<u32>(key >> 32);
+        const u32 offset = static_cast<u32>(key);
+        // Only words the record marks were read as handles alone: a value that merely equals a
+        // handle may have been folded into the code (driver constants, branch tables).
+        const bool handle_word = cbuf_handle_words.contains(key);
+        const u32 live_value = handle_word ? live.ReadCbufHandleWord(index, offset)
+                                           : live.ReadCbufValue(index, offset);
+        const auto type = handle_word ? texture_types.find(value) : texture_types.end();
+        const auto format =
+            handle_word ? texture_pixel_formats.find(value) : texture_pixel_formats.end();
+        if (type != texture_types.end() || format != texture_pixel_formats.end()) {
+            // A texture handle. Asked of `live` even when it is the same value, so `live` holds
+            // the answers its translation would have asked for (it is what the disk cache keeps).
+            if (type != texture_types.end() && live.ReadTextureType(live_value) != type->second) {
+                return fail("texture type");
+            }
+            if (format != texture_pixel_formats.end() &&
+                ((PixelFormatTraits(live.ReadTexturePixelFormat(live_value)) ^
+                  PixelFormatTraits(format->second)) &
+                 format_traits) != 0) {
+                return fail("texture pixel format");
+            }
+            handles_read.push_back(value);
+            continue;
+        }
+        if (live_value != value && !is_pointer_word(key)) {
+            return fail("constant buffer value");
+        }
+    }
+    const auto read_from_cbuf = [&](u32 handle) {
+        return std::ranges::find(handles_read, handle) != handles_read.end();
+    };
+    // Handles not read from a constant buffer (or built from several words): asked as they are.
+    for (const auto& [handle, type] : texture_types) {
+        if (!read_from_cbuf(handle) && live.ReadTextureType(handle) != type) {
+            return fail("texture type");
+        }
+    }
+    for (const auto& [handle, format] : texture_pixel_formats) {
+        if (!read_from_cbuf(handle) &&
+            ((PixelFormatTraits(live.ReadTexturePixelFormat(handle)) ^ PixelFormatTraits(format)) &
+             format_traits) != 0) {
+            return fail("texture pixel format");
+        }
+    }
+    for (const auto& [key, mapped] : storage_pointer_types) {
+        const u32 index = static_cast<u32>((key >> 32) & ((key >> 63) != 0 ? 0xff : 0xffffffff));
+        const u32 offset = static_cast<u32>(key);
+        const bool live_mapped =
+            (key >> 63) != 0
+                ? live.IsCbufIndirectStorageBufferPointer(index, offset,
+                                                          static_cast<u32>((key >> 40) & 0x3fffff))
+                : live.IsCbufStorageBufferPointer(index, offset);
+        if (live_mapped != (mapped != 0)) {
+            return fail("storage buffer pointer");
+        }
+    }
+    return true;
 }
 
 void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {

@@ -50,6 +50,21 @@ SPH_SIZE = 80
 MAX_RECORDED_VALUES = 1 << 16
 READ_PROPERTIES_KEY = 0xFFFFFFFF << 32
 NULL_TEXTURE_2D_KEY = (0xFFFFFFFF << 32) | 1
+# Markers of the words translation read only as texture handles (pipeline_cache_files.h); those
+# of the retired layout are dropped.
+HANDLE_WORD_MARK = 0xC0000000
+HANDLE_WORD_MARK_RETIRED = 0x80000000
+
+
+def handle_word(key):
+    """The word a handle word marker names, or None for another key."""
+    if key >> 32 != 0xFFFFFFFF or key & 0xC0000000 != HANDLE_WORD_MARK:
+        return None
+    return (((key >> 16) & 0x3FFF) << 32) | (key & 0xFFFF)
+
+
+def retired_handle_word(key):
+    return key >> 32 == 0xFFFFFFFF and key & 0xC0000000 == HANDLE_WORD_MARK_RETIRED
 
 
 class Damaged(Exception):
@@ -116,6 +131,9 @@ def read_environment(reader):
     reader.pairs(num_texture_types, "<II")
     reader.pairs(num_pixel_formats, "<Ii")
     cbuf_values = dict(reader.pairs(num_cbuf_values, "<QI"))
+    handle_words = sorted(word for word in map(handle_word, cbuf_values) if word is not None)
+    cbuf_values = {k: v for k, v in cbuf_values.items()
+                   if handle_word(k) is None and not retired_handle_word(k)}
     pointer_types = dict(reader.pairs(num_pointer_types, "<QB"))
     reader.pairs(num_replacements, "<QI")
     if stage == STAGE_COMPUTE:
@@ -132,6 +150,7 @@ def read_environment(reader):
         "read_properties": cbuf_values.pop(READ_PROPERTIES_KEY, None),
         "null_texture_2d": cbuf_values.pop(NULL_TEXTURE_2D_KEY, None) is not None,
         "cbuf_values": cbuf_values,
+        "handle_words": [slot_name(word) for word in handle_words],
         "pointer_types": pointer_types,
     }
 

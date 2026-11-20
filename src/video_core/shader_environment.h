@@ -58,6 +58,9 @@ public:
 
     [[nodiscard]] bool IsNativeProgram() const override;
 
+    /// Reads the word as ReadCbufValue does, noting it as a texture handle word.
+    [[nodiscard]] u32 ReadCbufHandleWord(u32 cbuf_index, u32 cbuf_offset) final;
+
     [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
     [[nodiscard]] bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset,
@@ -136,6 +139,9 @@ protected:
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                              bool via_header_index, u32 raw);
 
+    /// Records a constant buffer word ReadCbufValue read, and how it was read.
+    void RecordCbufValue(u32 index, u32 offset, u32 value);
+
     Tegra::MemoryManager* gpu_memory{};
     GPUVAddr program_base{};
 
@@ -143,6 +149,8 @@ protected:
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
+    /// How each word of cbuf_values was read: CbufReadValue, CbufReadHandle or both
+    ::Common::unordered_map<u64, u8> cbuf_reads;
     ::Common::unordered_map<u64, u8> storage_pointer_types; ///< IsCbufStorageBufferPointer answers
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
 
@@ -163,6 +171,13 @@ protected:
     bool has_unbound_instructions = false;
     bool has_hle_engine_state = false;
     bool texture_pool_flushed = false;
+
+private:
+    static constexpr u8 CbufReadValue = 1;
+    static constexpr u8 CbufReadHandle = 2;
+    /// The words recorded as read only as texture handles
+    [[nodiscard]] std::vector<u64> HandleOnlyWords() const;
+    bool reading_handle_word = false;
 };
 
 class GraphicsEnvironment final : public GenericEnvironment {
@@ -315,6 +330,27 @@ public:
                (!recorded_read_properties || *recorded_read_properties == read_properties);
     }
 
+    /// Whether translating this recorded environment gives what translating `live`, the same
+    /// program as the game draws it now, would (the same code is assumed: the pipeline keys
+    /// match). Translation is decided by the answers to its questions, so each recorded question
+    /// is asked of `live`: a constant buffer value must be the same, unless it was only used as a
+    /// texture handle, as the record marks it (then the texture it names now must have the same
+    /// type and the same pixel format traits as the recorded one) or as a storage buffer pointer
+    /// word (then its classification must be the same); texture questions, storage pointer
+    /// classifications and the other recorded answers must be the same. Sets `why` to the first
+    /// answer that differs. `format_traits` limits the pixel format traits compared to those the
+    /// program's translation used (PixelFormatTraits bits; see PipelineCache's precompiled
+    /// pipelines).
+    [[nodiscard]] bool AnswersHoldFor(Shader::Environment& live, const char** why = nullptr,
+                                      u32 format_traits = ~0U);
+
+    /// Pixel format traits translation uses: integer formats (sampled textures).
+    static constexpr u32 FormatTraitInteger = 1;
+    /// R16_FLOAT and the byte-addressed 32-bit color formats (byte-addressed image stores).
+    static constexpr u32 FormatTraitByteAddressed = 2 | 4;
+    /// Snorm formats (buffer texel fetches on hosts without snorm render buffers).
+    static constexpr u32 FormatTraitSnorm = 8;
+
 private:
     std::vector<u64> code;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
@@ -322,6 +358,8 @@ private:
     ::Common::unordered_map<u64, u32> cbuf_values;
     ::Common::unordered_map<u64, u8> storage_pointer_types;
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
+    /// The constant buffer words the record marks as read only as texture handles
+    ::Common::unordered_map<u64, u8> cbuf_handle_words;
     std::array<u32, 3> workgroup_size{};
     u32 local_memory_size{};
     u32 shared_memory_size{};

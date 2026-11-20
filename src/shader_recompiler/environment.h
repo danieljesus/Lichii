@@ -105,6 +105,13 @@ public:
 
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
 
+    /// A constant buffer word read as (part of) a texture handle. Environments that record their
+    /// answers note it: the translation depends only on the texture such a word names, not on
+    /// its value, unless the word is also read as an ordinary value.
+    [[nodiscard]] virtual u32 ReadCbufHandleWord(u32 cbuf_index, u32 cbuf_offset) {
+        return ReadCbufValue(cbuf_index, cbuf_offset);
+    }
+
     [[nodiscard]] virtual TextureType ReadTextureType(u32 raw_handle) = 0;
 
     [[nodiscard]] virtual TexturePixelFormat ReadTexturePixelFormat(u32 raw_handle) = 0;

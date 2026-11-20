@@ -507,6 +507,21 @@ static inline u32 ReadCbufCached(Environment& env, u32 index, u32 offset) {
     return v;
 }
 
+// The handle a texture instruction names. Only a word that is the whole handle is read as a handle
+// word: the record checks such a word by the texture its live value names. The parts of a handle
+// assembled from shifted or several words keep their values, as only the assembled handle names a
+// texture.
+static u32 ReadTextureHandleWords(Environment& env, const ConstBufferAddr& cbuf) {
+    const u32 sec_idx = cbuf.has_secondary ? cbuf.secondary_index : cbuf.index;
+    const u32 sec_off = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
+    if (!cbuf.has_secondary && cbuf.shift_left == 0 && cbuf.secondary_shift_left == 0) {
+        return env.ReadCbufHandleWord(cbuf.index, cbuf.offset);
+    }
+    const u32 lhs = env.ReadCbufValue(cbuf.index, cbuf.offset) << cbuf.shift_left;
+    const u32 rhs = env.ReadCbufValue(sec_idx, sec_off) << cbuf.secondary_shift_left;
+    return lhs | rhs;
+}
+
 static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr& cbuf) {
     // Must all be uniquely different variables
     // If has secondary, then it will be cbuf.secondary_{index|offset}, else its 0.
@@ -515,11 +530,8 @@ static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr
     const HandleKey hk{cbuf.index, cbuf.offset, cbuf.shift_left, cbuf.secondary_index, cbuf.secondary_offset, cbuf.secondary_shift_left, cbuf.count, cbuf.has_secondary};
     if (auto it = env.handle_cache.find(hk); it != env.handle_cache.end())
         return it->second;
-    const u32 sec_idx = cbuf.has_secondary ? cbuf.secondary_index  : cbuf.index;
-    const u32 sec_off = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
-    const u32 lhs = ReadCbufCached(env, cbuf.index, cbuf.offset) << cbuf.shift_left;
-    const u32 rhs = ReadCbufCached(env, sec_idx, sec_off) << cbuf.secondary_shift_left;
-    const u32 handle = lhs | rhs;
+    // Not through the word cache: the environment notes a lone handle word as one.
+    const u32 handle = ReadTextureHandleWords(env, cbuf);
     env.handle_cache.emplace(hk, handle);
     return handle;
 }
@@ -1437,12 +1449,7 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
 }
 
 u32 GetTextureHandle(Environment& env, const ConstBufferAddr& cbuf) {
-    const u32 secondary_index{cbuf.has_secondary ? cbuf.secondary_index : cbuf.index};
-    const u32 secondary_offset{cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset};
-    const u32 lhs_raw{env.ReadCbufValue(cbuf.index, cbuf.offset) << cbuf.shift_left};
-    const u32 rhs_raw{env.ReadCbufValue(secondary_index, secondary_offset)
-                      << cbuf.secondary_shift_left};
-    return lhs_raw | rhs_raw;
+    return ReadTextureHandleWords(env, cbuf);
 }
 
 [[maybe_unused]] TextureType ReadTextureType(Environment& env, const ConstBufferAddr& cbuf) {

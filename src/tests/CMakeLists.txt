@@ -89,6 +89,7 @@ add_executable(tests
     video_core/fast_fusion_surface_store.cpp
     video_core/fast_fusion_byte_store.cpp
     video_core/vk_byte_addressed_shadow.cpp
+    video_core/canonical_native_key.cpp
     video_core/global_memory_coherence.cpp
     video_core/storage_buffer_pointer_tracking.cpp
     video_core/storage_write_extent.cpp
@@ -186,6 +187,7 @@ add_executable(tests
     video_core/ampere_tennis_tessellation.cpp
     video_core/ampere_stage_buffer_output.cpp
     video_core/pipeline_cache_files.cpp
+    video_core/cbuf_handle_words.cpp
     video_core/shader_cache_v2.cpp
     video_core/evicted_pointer_slots.cpp
     video_core/shader_cache_v2_programs.cpp
@@ -195,6 +197,8 @@ add_executable(tests
     video_core/vulkan_instance_extensions.cpp
     video_core/pipeline_layout_cache.cpp
     video_core/shader_precache.cpp
+    video_core/precompiled_store.cpp
+    video_core/nx2_precompile_build.cpp
     video_core/shader_object_pool.cpp
     video_core/storage_binding_capacity.cpp
     video_core/native_indirect_reset.cpp
