@@ -60,6 +60,8 @@ TEST_CASE("Nx2Sampler ends a stack walk at generated code", "[common][nx2_sample
     functions[1].UnwindData = 0x108;
     REQUIRE(RtlAddFunctionTable(functions, 2, base));
 
+    // Made before the thread starts: this can throw, and a joinable thread must not be unwound.
+    const Tests::TempDir directory{"lichii-nx2-sampler-test"};
     std::atomic<unsigned char> stop{0};
     std::atomic<bool> started{false};
     std::thread thread{[&] {
@@ -70,7 +72,6 @@ TEST_CASE("Nx2Sampler ends a stack walk at generated code", "[common][nx2_sample
     while (!started) {
         std::this_thread::yield();
     }
-    const Tests::TempDir directory{"lichii-nx2-sampler-test"};
     const auto out = directory / "nx2_sampler_test.txt";
     const std::string report = Nx2Sampler::Sample("Nx2SamplerTest", 0.2, out.string());
     stop = 1;
