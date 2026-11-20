@@ -491,7 +491,8 @@ private:
     void TracePassShaders(u64 hash, u32 stage, u64 fragment_hash);
     /// Worker thread, just before a render pass of a sampled submission ends: timestamps it and
     /// keeps what was recorded since the previous pass ended.
-    void TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent);
+    void TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent, const char* why = nullptr,
+                      const char* file = nullptr, u32 line = 0, u64 framebuffer = 0, u32 clears = 0, u32 images = 0);
     /// Logs the sampled frame's GPU time by render pass (the 16 most expensive). Each pass is
     /// timed from the end of the one before it, so compute and copies between them count with it.
     /// MoltenVK samples timestamps only at Metal encoder boundaries, so this is the finest split
@@ -576,7 +577,22 @@ private:
         u32 num_shaders{};
         u32 untracked_uses{};
         std::array<Shaders, 4> shaders{};
+        const char* end_why{}; // TEMP
+        const char* end_file{};
+        u32 end_line{};
+        u64 framebuffer{};
+        u32 clears{};
+        u32 images{};
     };
+    const char* temp_end_why = "other"; // TEMP
+    const char* temp_end_file = "";
+    u32 temp_end_line = 0;
+    u32 temp_begin_clears = 0;
+    void TempEndSite(const char* why, const std::source_location& location) {
+        temp_end_why = why;
+        temp_end_file = location.file_name();
+        temp_end_line = location.line();
+    }
     vk::QueryPool trace_pass_pool;
     std::vector<PassTrace> trace_pass_items;
     /// What each sampled submission recorded after its last render pass ended.
