@@ -678,12 +678,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.IsUniformTexelBufferArrayNonUniformIndexingSupported(),
         .support_storage_texel_buffer_array_nonuniform_indexing =
             device.IsStorageTexelBufferArrayNonUniformIndexingSupported(),
-        // Selecting among the buffers needs the VariablePointers capability: without the
-        // feature, accesses take one branch per buffer.
         .select_global_memory_buffer = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
-                                       device.IsNonUniformStorageBufferPointerSupported() &&
-                                       device.IsVariablePointersSupported(),
-        .support_variable_pointers = device.IsVariablePointersSupported(),
+                                       device.IsNonUniformStorageBufferPointerSupported(),
 
         .warp_size_potentially_larger_than_guest = device.IsWarpSizePotentiallyBiggerThanGuest(),
 

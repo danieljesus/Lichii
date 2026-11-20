@@ -78,9 +78,6 @@ struct Profile {
     /// branch chain (#619). AMD lowers the NonUniform access to a waterfall loop, which spills in
     /// vertex and mesh shaders that already use every register, so it keeps the chain.
     bool select_global_memory_buffer{};
-    /// The device enables variablePointers: a module may declare the VariablePointers
-    /// capability, which a pointer selected among different storage buffers needs.
-    bool support_variable_pointers{};
 
     bool warp_size_potentially_larger_than_guest{};
 

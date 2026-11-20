@@ -518,11 +518,6 @@ FN_MAX_LIMIT_LIST
         return features.descriptor_indexing.shaderStorageTexelBufferArrayNonUniformIndexing;
     }
 
-    /// Returns true if the device enables variablePointers (pointers into any storage buffer).
-    bool IsVariablePointersSupported() const {
-        return features.variable_pointer.variablePointers;
-    }
-
     /// Returns true if storage buffer pointers can be chosen per invocation and decorated NonUniform.
     bool IsNonUniformStorageBufferPointerSupported() const {
         return features.variable_pointer.variablePointersStorageBuffer &&

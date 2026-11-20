@@ -121,6 +121,7 @@ std::pair<size_t, bool> PointerSelects(const std::vector<u32>& code) {
     bool declared{};
     for (size_t i = 5; i < code.size(); i += code[i] >> 16) {
         REQUIRE((code[i] >> 16) > 0);
+        REQUIRE(i + (code[i] >> 16) <= code.size());
         const u32 opcode{code[i] & 0xffff};
         if (opcode == op_capability && code[i + 1] == variable_pointers) {
             declared = true;
@@ -227,7 +228,6 @@ TEST_CASE("Selecting the buffer routes every access among all bound buffers",
     const size_t routed{
         SelectionsPerFunction(Backend::SPIRV::EmitSPIRV(profile, fixture.program)).size()};
     profile.select_global_memory_buffer = true;
-    profile.support_variable_pointers = true;
     const auto selections{
         SelectionsPerFunction(Backend::SPIRV::EmitSPIRV(profile, fixture.program))};
     // The buffer search, the 32, 64 and 128-bit load and store through every buffer, and the entry
@@ -248,16 +248,14 @@ TEST_CASE("A pointer selected among the buffers declares the VariablePointers ca
     profile.support_descriptor_aliasing = true;
     profile.unified_descriptor_binding = true;
     profile.min_ssbo_alignment = 16;
-    profile.support_variable_pointers = true;
     const auto branches{PointerSelects(Backend::SPIRV::EmitSPIRV(profile, fixture.program))};
     CHECK(branches.first == 0);
     CHECK_FALSE(branches.second);
     profile.select_global_memory_buffer = true;
     const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
     Dump(code, "variable_pointers");
-    const auto selected{PointerSelects(code)};
-    CHECK(selected.first > 0);
-    CHECK(selected.second);
+    const auto [selects, declared]{PointerSelects(code)};
+    CHECK((selects > 0 && declared));
 }
 
 TEST_CASE("Selecting the buffer searches the bound buffers in one function that is not inlined",
@@ -272,9 +270,12 @@ TEST_CASE("Selecting the buffer searches the bound buffers in one function that 
     profile.min_ssbo_alignment = 16;
     CHECK(NotInlinedCallers(Backend::SPIRV::EmitSPIRV(profile, fixture.program)).empty());
     profile.select_global_memory_buffer = true;
-    profile.support_variable_pointers = true;
     const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
     Dump(code, "select");
+    {
+        const auto [selects, declared]{PointerSelects(code)};
+        CHECK((selects > 0 && declared));
+    }
     const auto searches{NotInlinedCallers(code)};
     REQUIRE(searches.size() == 1);
     // The 32, 64 and 128-bit load and store each call it
@@ -295,9 +296,12 @@ TEST_CASE("Task and mesh programs search the bound buffers inline",
     profile.unified_descriptor_binding = true;
     profile.min_ssbo_alignment = 16;
     profile.select_global_memory_buffer = true;
-    profile.support_variable_pointers = true;
     const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
     Dump(code, stage == Stage::Task ? "select_task" : "select_mesh");
+    {
+        const auto [selects, declared]{PointerSelects(code)};
+        CHECK((selects > 0 && declared));
+    }
     CHECK(NotInlinedCallers(code).empty());
 }
 
