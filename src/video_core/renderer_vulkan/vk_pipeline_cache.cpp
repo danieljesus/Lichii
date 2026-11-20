@@ -3700,7 +3700,7 @@ void PipelineCache::QueueVulkanPipelineCacheSave(std::function<void()> after_sav
     if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
         return;
     }
-    const auto save = [this, after_save = std::move(after_save)] {
+    auto save = [this, after_save = std::move(after_save)] {
         if (!SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                           CACHE_VERSION)) {
             return;
@@ -3725,7 +3725,7 @@ void PipelineCache::QueueVulkanPipelineCacheSave(std::function<void()> after_sav
     }
     // Not skipped when a timed flush is in flight: that one may have read the cache before the
     // stage's last builds. The serialization thread runs the two one after the other.
-    serialization_thread.QueueWork(save);
+    serialization_thread.QueueWork(std::move(save));
 }
 
 namespace {
