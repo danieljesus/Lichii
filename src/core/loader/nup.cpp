@@ -7,11 +7,14 @@
 #include <cstring>
 
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/string_util.h"
 #include "core/core.h"
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
+#include "core/file_sys/program_metadata.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
@@ -168,15 +171,21 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
             display_title = name;
         }
     }
-    has_program = true;
-
     const auto exefs = nup->GetExeFSDir(*exefs_index);
     if (exefs == nullptr || exefs->GetFile("main") == nullptr ||
         exefs->GetFile("main.npdm") == nullptr) {
         LOG_ERROR(Loader, "NUP package has no usable ExeFS");
         return;
     }
+    if (nup->FindPackage(NupContainer::PackageKind::Addon)) {
+        FileSys::ProgramMetadata program_metadata;
+        if (program_metadata.Load(exefs->GetFile("main.npdm")) == ResultStatus::Success &&
+            program_metadata.IsSwitch2()) {
+            upgrade_program_id = program_metadata.GetTitleID();
+        }
+    }
     secondary_loader = std::make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true, false);
+    has_program = true;
 
     if (update_index) {
         const auto& update = nup->GetPackages()[*update_index];
@@ -272,9 +281,23 @@ ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
         update_index ? nup->GetRomFSDir(*update_index) : FileSys::VirtualDir{};
     // A standalone update carries the complete merged tree; a base+update pair
     // overlays the update onto the base (SPEC §4.1.4).
-    const auto merged = FileSys::NupContainer::MergeShadowDirs(base_romfs, update_romfs);
+    auto merged = FileSys::NupContainer::MergeShadowDirs(base_romfs, update_romfs);
     if (merged == nullptr) {
         return ResultStatus::ErrorNoRomFS;
+    }
+    const auto dlc_disabled = [](u64 id) {
+        const auto& disabled = Settings::values.disabled_addons;
+        const auto it = disabled.find(id);
+        return it != disabled.end() && std::ranges::find(it->second, "DLC") != it->second.end();
+    };
+    if (upgrade_program_id != 0 && !dlc_disabled(base_title_id) &&
+        !dlc_disabled(upgrade_program_id) &&
+        !dlc_disabled(FileSys::GetBaseTitleID(upgrade_program_id))) {
+        if (const auto pack = nup->FindUpgradePack(upgrade_program_id)) {
+            merged = FileSys::NupContainer::MergeShadowDirs(merged, nup->GetRomFSDir(*pack));
+            LOG_INFO(Loader, "NUP upgrade pack {:016X} layered over the program RomFS",
+                     nup->GetPackages()[*pack].title_id);
+        }
     }
     out_file = FileSys::CreateRomFS(merged);
     if (out_file == nullptr) {
@@ -348,6 +371,13 @@ ResultStatus AppLoader_NUP::ReadMainBuildId(Core::System& system,
         return ResultStatus::ErrorNotInitialized;
     }
     return secondary_loader->ReadMainBuildId(system, build_id);
+}
+
+std::optional<std::string> AppLoader_NUP::ReadContainerUpdateVersion() const {
+    if (!has_program || !nup->FindBestUpdatePackage()) {
+        return std::nullopt;
+    }
+    return display_version;
 }
 
 } // namespace Loader

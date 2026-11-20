@@ -91,6 +91,8 @@ public:
     std::optional<std::size_t> FindBasePackage() const;
     /// Highest version among Update packages, if any.
     std::optional<std::size_t> FindBestUpdatePackage() const;
+    /// Highest version of the selected Switch 2 program's marked upgrade pack, if any.
+    std::optional<std::size_t> FindUpgradePack(u64 program_id);
 
     /// Opens a member file by node index; raw extents are zero-copy views into
     /// the container, zstd extents are decompressed only as far as reads reach,
