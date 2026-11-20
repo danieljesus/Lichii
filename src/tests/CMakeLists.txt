@@ -216,6 +216,7 @@ add_executable(tests
     video_core/nx2_video_av1.cpp
     video_core/nx2_video_render.cpp
     video_core/ampere_matrix.cpp
+    video_core/info_serialize.cpp
     video_core/spirv_software_matrix.cpp
     video_core/spirv_program_name.cpp
     video_core/spirv_builtin_capabilities.cpp
