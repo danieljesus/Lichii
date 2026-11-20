@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cstring>
 #include <memory>
@@ -280,6 +281,25 @@ RendererVulkan::~RendererVulkan() {
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    { // TEMP frame-time percentiles
+        static std::vector<double> temp_intervals;
+        static std::chrono::steady_clock::time_point temp_last{};
+        const auto temp_now = std::chrono::steady_clock::now();
+        if (temp_last != std::chrono::steady_clock::time_point{}) {
+            temp_intervals.push_back(
+                std::chrono::duration<double, std::milli>(temp_now - temp_last).count());
+        }
+        temp_last = temp_now;
+        if (temp_intervals.size() >= 300) {
+            std::sort(temp_intervals.begin(), temp_intervals.end());
+            const auto at = [&](double q) {
+                return temp_intervals[static_cast<size_t>(q * (temp_intervals.size() - 1))];
+            };
+            LOG_INFO(Render_Vulkan, "TEMP frametimes n={} p50={:.2f} p95={:.2f} p99={:.2f} max={:.2f}",
+                     temp_intervals.size(), at(0.5), at(0.95), at(0.99), temp_intervals.back());
+            temp_intervals.clear();
+        }
+    }
     const bool trace = Common::DkbFrameTrace::Enabled();
     const auto entered = trace ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
