@@ -447,11 +447,13 @@ void CountPrecompiledReason(const char* reason) {
     ++precompiled_reasons[reason];
 }
 
+// NX2INFO6: infos keep requires_full_guest_warps, and the kept SPIR-V of a software HMMA may use
+// the staged exchange, which older files do not have.
 // NX2INFO5: texture descriptors keep is_descriptor_array and handle_is_pointer_word, and infos
 // demoted_conditional_barrier, uses_barrier_vote and binds_unmapped_pointer_word (NX2INFO3:
 // storage buffer descriptors keep their write extent). A file of another version is prepared
 // again.
-constexpr std::string_view PrecompiledInfosMagic{"NX2INFO5"};
+constexpr std::string_view PrecompiledInfosMagic{"NX2INFO6"};
 
 /// EDEN_NX2_PRECOMPILED_FAST=0: precompiled pipelines are translated on the GPU thread like the
 /// others (their kept infos and SPIR-V unused), to compare.

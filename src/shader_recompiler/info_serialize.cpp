@@ -345,6 +345,7 @@ void VisitInfo(Io& io, I& info) {
     io(info.requires_coherent_image_memory);
     io(info.binds_unmapped_pointer_word);
     io(info.uses_cooperative_matrix);
+    io(info.requires_full_guest_warps);
     io(info.native_global_bounds);
     io(info.uses_atomic_image_u32);
     io(info.uses_shadow_lod);
