@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <span>
 #include <vector>
 
 #include "audio_core/sink/sink_stream.h"
@@ -39,9 +40,9 @@ namespace AudioCore::Sink {
  * reports with MarkFaulted, as sysmix does for a guest fault, is final for every stream.
  *
  * Only one backend plays at a time: the lost one is destroyed, which stops its callbacks, before
- * the stand-in plays a block or a new one opens, and a new one has no callbacks until the worker,
- * which is then not standing in, starts it. So a loss reported while a reopen is under way comes
- * from the new backend, which is then dropped instead of published.
+ * the stand-in plays a block or a new one opens, and a new one consumes the stream only once it is
+ * published (IsPublished), whatever its callbacks do before. So a loss reported while a reopen is
+ * under way comes from the new backend, which is then dropped instead of published.
  *
  * The derived constructor calls OpenInitialBackend last, and the derived destructor must call
  * Finalize first: the worker calls the hooks, so it is joined there, while the derived stream is
@@ -90,11 +91,11 @@ protected:
     StandbySinkStream(Core::System& system_, StreamType type_)
         : StandbySinkStream(system_, type_, Timing{}) {}
 
-    /// Open a backend, or return null. Until StartBackend it must not consume the stream, which
-    /// the stand-in may be playing, though it may report a loss. attempt is 0 for the stream's
-    /// first open, on the constructing thread, then numbers the reopens since the device was lost
-    /// from 1, each on a thread of its own. Called without any of the stream's locks, since it may
-    /// block.
+    /// Open a backend, or return null. Its callbacks may report a loss at any time, but consume
+    /// the stream, which the stand-in may be playing, only once IsPublished. attempt is 0 for the
+    /// stream's first open, on the constructing thread, then numbers the reopens since the device
+    /// was lost from 1, each on a thread of its own. Called without any of the stream's locks,
+    /// since it may block.
     virtual void* OpenBackend(u32 attempt) = 0;
     virtual bool StartBackend(void* backend) = 0;
     virtual bool StopBackend(void* backend) = 0;
@@ -109,6 +110,16 @@ protected:
     /// The backend lost its device. Takes no lock held around backend calls, so its callbacks can
     /// report it. Ignored once the stream is finalized.
     void BackendLost();
+
+    /// Whether the backend is the stream's. Lock-free, for a backend's callbacks: one that is not,
+    /// opening or starting during a reopen while the stand-in plays, must not consume the stream.
+    bool IsPublished(const void* backend) const {
+        return backend && backend == live_backend.load(std::memory_order_acquire);
+    }
+
+    /// For a backend's data callback: play the stream into `output` if the backend is published,
+    /// else fill it with silence. Returns whether it played the stream.
+    bool RenderFromBackend(const void* backend, std::span<s16> output, std::size_t num_frames);
 
     /// For tests: standing in for a lost device, and the reopen counts.
     bool IsStandingIn() const;
@@ -153,7 +164,8 @@ private:
     mutable std::mutex state_mutex;
     std::condition_variable_any wake;
     std::atomic<State> state{State::Stopped};
-    void* live_backend{};
+    /// Atomic for IsPublished; written under state_mutex.
+    std::atomic<void*> live_backend{};
     /// Losses reported, so that a reopen can tell its new backend reported one.
     u64 losses{};
     /// The worker starts on the first loss of a stream that stands in.

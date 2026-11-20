@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -103,10 +104,18 @@ public:
     }
 
 private:
-    /// A cubeb stream, and whether it is on the configured device.
+    /// A cubeb stream and what the stream knows of it. The callbacks' user data, so that they know
+    /// which backend calls.
     struct Backend {
-        cubeb_stream* stream;
-        bool on_configured;
+        CubebSinkStream* owner{};
+        cubeb_stream* stream{};
+        bool on_configured{};
+        /// Set by BackendPublished, under the stream's control lock.
+        bool published{};
+        /// Reported an error.
+        std::atomic<bool> lost{};
+        /// Its init returned: an error before that is the init's, not a loss of the stream.
+        std::atomic<bool> initialized{};
     };
 
     /// Open on the configured device or the default one, as ChooseDevice says. The device is
@@ -162,7 +171,7 @@ private:
             device = nullptr;
         }
         int error{};
-        cubeb_stream* opened = Init(device, error);
+        std::unique_ptr<Backend> opened = Init(device, error);
         if (!opened && device && choice == DeviceChoice::ConfiguredThenDefault) {
             // Listed, but it does not open, and nothing waits for it: the default one, then.
             device = nullptr;
@@ -177,21 +186,40 @@ private:
             }
             return nullptr;
         }
-        return new Backend{opened, device != nullptr};
+        return opened.release();
     }
 
-    cubeb_stream* Init(cubeb_devid device, int& error) {
-        cubeb_stream* opened{};
+    /// A backend of its own for each init, so that nothing one that failed reported is charged to
+    /// the next.
+    std::unique_ptr<Backend> Init(cubeb_devid device, int& error) {
+        auto backend = std::make_unique<Backend>();
+        backend->owner = this;
+        backend->on_configured = device != nullptr;
         if (type == StreamType::In) {
-            error = cubeb_stream_init(ctx, &opened, name.c_str(), device, &params, nullptr, nullptr,
-                                      latency, &CubebSinkStream::DataCallback,
-                                      &CubebSinkStream::StateCallback, this);
+            error = cubeb_stream_init(ctx, &backend->stream, name.c_str(), device, &params, nullptr,
+                                      nullptr, latency, &CubebSinkStream::DataCallback,
+                                      &CubebSinkStream::StateCallback, backend.get());
         } else {
-            error = cubeb_stream_init(ctx, &opened, name.c_str(), nullptr, nullptr, device, &params,
-                                      latency, &CubebSinkStream::DataCallback,
-                                      &CubebSinkStream::StateCallback, this);
+            error = cubeb_stream_init(ctx, &backend->stream, name.c_str(), nullptr, nullptr, device,
+                                      &params, latency, &CubebSinkStream::DataCallback,
+                                      &CubebSinkStream::StateCallback, backend.get());
         }
-        return error == CUBEB_OK ? opened : nullptr;
+        if (error != CUBEB_OK) {
+            return nullptr;
+        }
+        backend->initialized = true;
+        if (backend->lost) {
+            // It reported an error while it opened, as PulseAudio can: a failed open, and on the
+            // configured device a failed start.
+            cubeb_stream_stop(backend->stream);
+            cubeb_stream_destroy(backend->stream);
+            if (backend->on_configured) {
+                configured_start_failed = true;
+            }
+            error = CUBEB_ERROR;
+            return nullptr;
+        }
+        return backend;
     }
 
     bool StartBackend(void* backend) override {
@@ -215,13 +243,21 @@ private:
         const auto* const opened = static_cast<Backend*>(backend);
         cubeb_stream_stop(opened->stream);
         cubeb_stream_destroy(opened->stream);
+        // Its callbacks are over. One on the configured device that reported an error and was
+        // never published counts as a start that failed: the next open that may take the default
+        // does.
+        if (opened->on_configured && opened->lost && !opened->published) {
+            configured_start_failed = true;
+        }
         delete opened;
     }
 
     /// Only a published backend tells which device the stream was on: one that opened but did
     /// not start, or was dropped, does not.
     void BackendPublished(void* backend) override {
-        published_on_configured = static_cast<Backend*>(backend)->on_configured;
+        auto* const published = static_cast<Backend*>(backend);
+        published->published = true;
+        published_on_configured = published->on_configured;
         configured_start_failed = false;
     }
 
@@ -230,7 +266,7 @@ private:
      * provide samples to be copied (audio in).
      *
      * @param stream      - Cubeb-specific data about the stream.
-     * @param user_data   - Custom data pointer passed along, points to a CubebSinkStream.
+     * @param user_data   - Custom data pointer passed along, points to the Backend.
      * @param in_buff     - Input buffer to be used if the stream is an input type.
      * @param out_buff    - Output buffer to be used if the stream is an output type.
      * @param num_frames_ - Number of frames of audio in the buffers. Note: Not number of samples.
@@ -238,22 +274,27 @@ private:
     static long DataCallback([[maybe_unused]] cubeb_stream* stream, void* user_data,
                              [[maybe_unused]] const void* in_buff, void* out_buff,
                              long num_frames_) {
-        auto* impl = static_cast<CubebSinkStream*>(user_data);
-        if (!impl) {
+        const auto* const backend = static_cast<const Backend*>(user_data);
+        if (!backend) {
             return -1;
         }
+        auto* const impl = backend->owner;
 
         const std::size_t num_channels = impl->GetDeviceChannels();
         const std::size_t frame_size = num_channels;
         const std::size_t num_frames{static_cast<size_t>(num_frames_)};
 
+        // Only once published, whatever the cubeb backend calls before: the stand-in may be
+        // playing the stream, which has one consumer at a time.
         if (impl->type == StreamType::In) {
-            std::span<const s16> input_buffer{reinterpret_cast<const s16*>(in_buff),
-                                              num_frames * frame_size};
-            impl->ProcessAudioIn(input_buffer, num_frames);
+            if (impl->IsPublished(backend)) {
+                std::span<const s16> input_buffer{reinterpret_cast<const s16*>(in_buff),
+                                                  num_frames * frame_size};
+                impl->ProcessAudioIn(input_buffer, num_frames);
+            }
         } else {
             std::span<s16> output_buffer{reinterpret_cast<s16*>(out_buff), num_frames * frame_size};
-            impl->ProcessAudioOutAndRender(output_buffer, num_frames);
+            impl->RenderFromBackend(backend, output_buffer, num_frames);
         }
 
         return num_frames_;
@@ -267,13 +308,21 @@ private:
      * standing in meanwhile if it is a renderer or audio out stream (see StandbySinkStream).
      *
      * @param stream      - Cubeb-specific data about the stream.
-     * @param user_data   - Custom data pointer passed along, points to a CubebSinkStream.
+     * @param user_data   - Custom data pointer passed along, points to the Backend.
      * @param state       - New state of the device.
      */
     static void StateCallback(cubeb_stream*, void* user_data, cubeb_state state) {
-        auto* const impl = static_cast<CubebSinkStream*>(user_data);
+        auto* const backend = static_cast<Backend*>(user_data);
+        if (!backend) {
+            return;
+        }
+        auto* const impl = backend->owner;
         if (state == CUBEB_STATE_ERROR) {
-            impl->BackendLost();
+            backend->lost = true;
+            // During its init, the init handles it.
+            if (backend->initialized) {
+                impl->BackendLost();
+            }
             return;
         }
         LOG_DEBUG(Audio_Sink, "Cubeb stream {} state {}", impl->name, static_cast<int>(state));

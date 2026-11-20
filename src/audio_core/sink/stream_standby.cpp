@@ -77,6 +77,17 @@ bool StandbySinkStream::IsReady() const {
     return false;
 }
 
+bool StandbySinkStream::RenderFromBackend(const void* backend, std::span<s16> output,
+                                          std::size_t num_frames) {
+    if (!IsPublished(backend)) {
+        // Opening or starting during a reopen, while the stand-in may play the stream.
+        std::fill(output.begin(), output.end(), s16{0});
+        return false;
+    }
+    ProcessAudioOutAndRender(output, num_frames);
+    return true;
+}
+
 bool StandbySinkStream::IsStandingIn() const {
     const State current = state.load();
     return StandsIn() && !failed && (current == State::Lost || current == State::Reopening);
@@ -169,17 +180,25 @@ void StandbySinkStream::Start(bool) {
         wake.notify_all();
         return;
     }
+    // Not once a close has marked the stream stopped and paused it during StartBackend: a renderer
+    // would wait for queue space nothing frees.
+    const auto unpause = [this] {
+        std::scoped_lock lock{state_mutex};
+        if (state != State::Stopped) {
+            paused = false;
+        }
+    };
     if (!StartBackend(current)) {
         LOG_ERROR(Audio_Sink, "Error starting stream {}", name);
         // A stream that stands in plays into nothing until it reopens; others stay not ready
         // and paused, as their owners expect of one that did not start.
         if (StandsIn()) {
-            paused = false;
+            unpause();
         }
         BackendLost();
         return;
     }
-    paused = false;
+    unpause();
 }
 
 void StandbySinkStream::Stop() {
@@ -210,7 +229,7 @@ void StandbySinkStream::Finalize() {
     void* current{};
     {
         std::scoped_lock lock{state_mutex};
-        current = std::exchange(live_backend, nullptr);
+        current = live_backend.exchange(nullptr);
     }
     if (current) {
         if (playing && before == State::Live) {
@@ -293,7 +312,7 @@ void StandbySinkStream::ReleaseBackend() {
     void* current{};
     {
         std::scoped_lock lock{state_mutex};
-        current = std::exchange(live_backend, nullptr);
+        current = live_backend.exchange(nullptr);
     }
     if (current) {
         DestroyBackend(current);
@@ -316,8 +335,8 @@ StandbySinkStream::Reopen StandbySinkStream::TryReopen(std::stop_token stop_toke
     std::jthread opener;
     try {
         // On a thread of its own, without any lock: opening may block while the device comes and
-        // goes, and the stand-in plays on meanwhile. The backend has no data callback until it is
-        // started.
+        // goes, and the stand-in plays on meanwhile. The backend consumes the stream only once it
+        // is published.
         opener = std::jthread([this, attempt, &opened, &open_done] {
             Common::SetCurrentThreadName("AudioOpener");
             [[maybe_unused]] ComScope com;
