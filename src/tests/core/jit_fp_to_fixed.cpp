@@ -209,12 +209,22 @@ constexpr u32 FcvtAU(u32 ftype) {
 
 } // namespace
 
+// The arm64 backend has no half-precision to integer conversion yet (its emitters assert): the
+// half-precision cases run where the x64 backend compiles them.
+#if defined(__x86_64__) || defined(_M_X64)
+constexpr bool RunHalves = true;
+#else
+constexpr bool RunHalves = false;
+#endif
+
 TEST_CASE("The JIT converts a negative value that rounds to zero to unsigned with Inexact",
           "[jit][fp_to_fixed]") {
-    // The reference result from an Apple M6.
-    const auto reference = RunConversion(FcvtU(3, 0), 0x83FF, 0x04C00000);
-    CHECK(reference.result == 0);
-    CHECK(reference.fpsr == IXC);
+    if (RunHalves) {
+        // The reference result from an Apple M6.
+        const auto reference = RunConversion(FcvtU(3, 0), 0x83FF, 0x04C00000);
+        CHECK(reference.result == 0);
+        CHECK(reference.fpsr == IXC);
+    }
 
     // These conversions reach FP::FPToFixed through the x64 fallback: every half-precision one,
     // and FCVTAU, which has no SSE rounding mode. The SSE path for the other single and double
@@ -222,6 +232,9 @@ TEST_CASE("The JIT converts a negative value that rounds to zero to unsigned wit
     // FPSR.IOC and IXC are sticky; RunConversion starts from 0 each time.
     constexpr std::array<u32, 5> RModeOf{0, 1, 2, 3, 0};
     for (u32 ftype : {3u, 0u, 1u}) {
+        if (ftype == 3 && !RunHalves) {
+            continue;
+        }
         for (size_t value = 0; value < Values; ++value) {
             const u64 input = ftype == 3   ? u64{Half[value]}
                               : ftype == 0 ? u64{Single[value]}
