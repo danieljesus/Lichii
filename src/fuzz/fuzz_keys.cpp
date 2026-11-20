@@ -27,6 +27,8 @@ extern "C" int LLVMFuzzerTestOneInput(const u8* data, std::size_t size) {
         std::ofstream file{keys_dir / name, std::ios::binary | std::ios::trunc};
         file.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
     }
-    Core::Crypto::KeyManager::Instance().ReloadKeys();
+    // From scratch for each input: ReloadKeys only adds, so a crash could depend on what the
+    // inputs before it had loaded and not reproduce from the input alone.
+    Core::Crypto::KeyManager::Instance().ResetKeys();
     return 0;
 }
