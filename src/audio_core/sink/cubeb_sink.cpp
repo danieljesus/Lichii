@@ -112,10 +112,8 @@ private:
         bool on_configured{};
         /// Set by BackendPublished, under the stream's control lock.
         bool published{};
-        /// Reported an error.
-        std::atomic<bool> lost{};
-        /// Its init returned: an error before that is the init's, not a loss of the stream.
-        std::atomic<bool> initialized{};
+        /// An error before its init returned is the init's, not a loss of the stream.
+        BackendOpenState open_state;
     };
 
     /// Open on the configured device or the default one, as ChooseDevice says. The device is
@@ -207,8 +205,7 @@ private:
         if (error != CUBEB_OK) {
             return nullptr;
         }
-        backend->initialized = true;
-        if (backend->lost) {
+        if (!backend->open_state.FinishOpen()) {
             // It reported an error while it opened, as PulseAudio can: a failed open, and on the
             // configured device a failed start.
             cubeb_stream_stop(backend->stream);
@@ -246,7 +243,7 @@ private:
         // Its callbacks are over. One on the configured device that reported an error and was
         // never published counts as a start that failed: the next open that may take the default
         // does.
-        if (opened->on_configured && opened->lost && !opened->published) {
+        if (opened->on_configured && opened->open_state.Lost() && !opened->published) {
             configured_start_failed = true;
         }
         delete opened;
@@ -318,9 +315,8 @@ private:
         }
         auto* const impl = backend->owner;
         if (state == CUBEB_STATE_ERROR) {
-            backend->lost = true;
             // During its init, the init handles it.
-            if (backend->initialized) {
+            if (backend->open_state.ReportError()) {
                 impl->BackendLost();
             }
             return;
