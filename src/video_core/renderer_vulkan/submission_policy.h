@@ -51,4 +51,14 @@ constexpr Action Advance(u32& counter, bool native, bool android,
     return Action::Flush;
 }
 
+/// Whether a flush the draw budget asked for inside a render pass, and that waits for the pass to
+/// end, happens at the start of this draw: when no pass is active, or the draw's render targets
+/// differ from the pass's (it begins another), so the flush splits none; or when it has waited
+/// `budget` draws already, so a long pass is still submitted. At the start of a draw, before the
+/// draw allocates anything for the submission, as every budget flush.
+constexpr bool FlushBeforeDraw(bool render_pass_active, bool render_targets_changed,
+                               u32 deferred_draws, u32 budget) {
+    return !render_pass_active || render_targets_changed || deferred_draws >= budget;
+}
+
 } // namespace Vulkan::SubmissionPolicy
