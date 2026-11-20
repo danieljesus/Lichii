@@ -52,6 +52,8 @@ public:
         Finalize();
     }
 
+    using StandbySinkStream::IsPublished;
+    using StandbySinkStream::RenderFromBackend;
     using StandbySinkStream::IsStandingIn;
     using StandbySinkStream::ReopenAttempts;
     using StandbySinkStream::Reopens;
@@ -63,6 +65,11 @@ public:
     bool Running() {
         std::scoped_lock lock{mutex};
         return std::ranges::any_of(live, [](const Backend* entry) { return entry->running; });
+    }
+    /// The only backend alive, or null.
+    void* Only() {
+        std::scoped_lock lock{mutex};
+        return live.size() == 1 ? *live.begin() : nullptr;
     }
     std::size_t Live() {
         std::scoped_lock lock{mutex};
@@ -89,6 +96,8 @@ public:
     std::atomic<bool> opening{};
     /// Runs in StartBackend, with the stream's control lock held.
     std::function<void()> on_start;
+    /// The backend StartBackend was last called with.
+    std::atomic<void*> last_started{};
 
 private:
     void* OpenBackend(u32 attempt) override {
@@ -120,6 +129,7 @@ private:
         return opened;
     }
     bool StartBackend(void* backend) override {
+        last_started = backend;
         if (start_failures_left.fetch_sub(1) > 0) {
             return false;
         }
@@ -190,8 +200,8 @@ bool Render(LosableStream& stream, u32 blocks) {
 }
 
 template <typename Predicate>
-bool WaitFor(Predicate predicate) {
-    const auto until = Clock::now() + Deadline;
+bool WaitFor(Predicate predicate, std::chrono::milliseconds deadline = Deadline) {
+    const auto until = Clock::now() + deadline;
     while (!predicate()) {
         if (Clock::now() >= until) {
             return false;
@@ -199,6 +209,21 @@ bool WaitFor(Predicate predicate) {
         std::this_thread::sleep_for(1ms);
     }
     return true;
+}
+
+/// Run an owner call on a thread of its own. False if it is still waiting after a deadline, as it
+/// would on a blocked open: blocked opens are then let through, so that it and the test end.
+bool ReturnsWhileOpenBlocks(LosableStream& stream, const std::function<void()>& call) {
+    std::atomic<bool> done{};
+    std::jthread caller([&] {
+        call();
+        done = true;
+    });
+    const bool returned = WaitFor([&] { return done.load(); });
+    if (!returned) {
+        stream.hold_open = false;
+    }
+    return returned;
 }
 
 } // Anonymous namespace
@@ -519,9 +544,9 @@ TEST_CASE("A stream stands in while a reopen is still opening", "[audio_core][st
 
     // Neither the renderer nor the owner's pause and resume wait for the open.
     REQUIRE(Render(stream, 40));
-    stream.Stop();
+    REQUIRE(ReturnsWhileOpenBlocks(stream, [&] { stream.Stop(); }));
     CHECK(stream.IsPaused());
-    stream.Start();
+    REQUIRE(ReturnsWhileOpenBlocks(stream, [&] { stream.Start(); }));
     CHECK_FALSE(stream.IsPaused());
     CHECK(stream.opening);
     CHECK(stream.IsStandingIn());
@@ -561,20 +586,29 @@ TEST_CASE("Closing a stream while a reopen is opening releases its renderer befo
         finished = !stop_token.stop_requested();
     });
     std::this_thread::sleep_for(50ms);
-    // The close waits for the open, which cannot be cancelled; the renderer must not.
+    // The close waits for the open, which cannot be cancelled; the renderer must not. It is
+    // paused while the open still blocks, and only then renders its last blocks: the stand-in,
+    // stopped by the close, frees no queue space for them.
     std::atomic<bool> closed{};
     std::jthread closer([&] {
         stream.Finalize();
         closed = true;
     });
-    left = 32;
-    const bool released = WaitFor([&] { return finished.load(); });
+    const bool paused_during_open = WaitFor([&] { return stream.IsPaused(); });
+    bool released{};
+    if (paused_during_open) {
+        left = 32;
+        released = WaitFor([&] { return finished.load(); });
+    }
     const bool closed_before_open_ended = closed.load();
+    const bool still_opening = stream.opening.load();
     stream.hold_open = false;
     closer.join();
     renderer.request_stop();
     renderer.join();
+    CHECK(paused_during_open);
     CHECK(released);
+    CHECK(still_opening);
     CHECK_FALSE(closed_before_open_ended);
     // The backend it opened was dropped, not published.
     CHECK(stream.Live() == 0);
@@ -663,4 +697,66 @@ TEST_CASE("A stream with a configured device chooses it, waits for it, or takes 
         CHECK(choose(attempt, true, false, false) == Choice::ConfiguredThenDefault);
         CHECK(choose(attempt, true, false, true) == Choice::Default);
     }
+}
+
+TEST_CASE("A backend is the stream's only once its open or reopen publishes it",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    std::atomic<int> starts{};
+    std::atomic<bool> published_while_starting{true};
+    auto owned = MakeStream(context, StreamType::Render);
+    auto& stream = *owned;
+    // The first backend is published as it opens.
+    CHECK(stream.IsPublished(stream.Only()));
+    CHECK_FALSE(stream.IsPublished(nullptr));
+    stream.Start();
+    // A reopened one is started before it is published: until then its callbacks must not
+    // consume the stream, which the stand-in plays.
+    stream.on_start = [&starts, &published_while_starting, reopened = owned.get()] {
+        published_while_starting = reopened->IsPublished(reopened->last_started.load());
+        ++starts;
+    };
+    stream.ReportLost();
+    REQUIRE(WaitFor([&] { return stream.Reopens() == 1; }));
+    CHECK(starts == 1);
+    CHECK_FALSE(published_while_starting);
+    CHECK(stream.IsPublished(stream.Only()));
+    CHECK(stream.IsPublished(stream.last_started.load()));
+}
+
+TEST_CASE("A backend's callback plays the stream only once the backend is published",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    std::atomic<bool> played_while_starting{true};
+    std::atomic<bool> silent_while_starting{};
+    std::atomic<u32> queued_while_starting{};
+    auto owned = MakeStream(context, StreamType::Render);
+    auto& stream = *owned;
+    stream.Start();
+    // As a data callback could call while the reopen starts the backend, before it is published:
+    // only the worker, here, consumes the stream then.
+    stream.on_start = [&played_while_starting, &silent_while_starting, &queued_while_starting,
+                       reopened = owned.get()] {
+        SinkBuffer block{240, 0, 0, false};
+        std::array<s16, 480> samples{};
+        samples.fill(1000);
+        reopened->AppendBuffer(block, samples);
+        reopened->AppendBuffer(block, samples);
+        std::array<s16, 480> output{};
+        output.fill(123);
+        played_while_starting =
+            reopened->RenderFromBackend(reopened->last_started.load(), output, 240);
+        silent_while_starting = std::ranges::all_of(output, [](s16 sample) { return sample == 0; });
+        queued_while_starting = reopened->GetQueueSize();
+    };
+    stream.ReportLost();
+    REQUIRE(WaitFor([&] { return stream.Reopens() == 1; }));
+    CHECK_FALSE(played_while_starting);
+    CHECK(silent_while_starting);
+    CHECK(queued_while_starting == 2);
+    // Published, it plays the stream.
+    const u32 queued = stream.GetQueueSize();
+    std::array<s16, 480> output{};
+    CHECK(stream.RenderFromBackend(stream.Only(), output, 240));
+    CHECK(stream.GetQueueSize() == queued - 1);
 }
