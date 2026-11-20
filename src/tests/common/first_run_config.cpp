@@ -7,6 +7,8 @@
 #include <map>
 #include <random>
 #include <sstream>
+#include <string>
+#include <system_error>
 #include <type_traits>
 #include <catch2/catch_test_macros.hpp>
 #include <fmt/format.h>
@@ -34,6 +36,7 @@ public:
 
     using Config::Reload;
     using Config::SaveValues;
+    using Config::ReadScreenshotValues;
 
 private:
     void ReloadAllValues() override {}
@@ -617,10 +620,21 @@ TEST_CASE("DLSS config round-trips choices and publishes per-game overrides",
 TEST_CASE("A fresh config keeps the data paths without an error", "[config]") {
     // A new configuration has no path settings, and the readers passed the empty values on to
     // SetEdenPath: "Filesystem object at new_path= is not a directory" for the NAND, SD, load,
-    // dump, TAS and screenshot paths at every start. The screenshot path is read by the Qt
-    // config only, which this test does not build.
+    // dump, TAS and screenshot paths at every start.
     using Common::FS::EdenPath;
     ConfigDirectory directory;
+    // Initialize opens the log file in LogDir on first use and moves the previous log aside:
+    // point it at a folder of the test's own so the user's log is left alone.
+    const auto original_log_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir);
+    const auto log_dir = std::filesystem::temp_directory_path() /
+                         ("lichii-config-log-" + std::to_string(std::random_device{}()));
+    REQUIRE(std::filesystem::create_directory(log_dir));
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, log_dir);
+    SCOPE_EXIT {
+        Tests::RestoreEdenPath(Common::FS::EdenPath::LogDir, original_log_dir);
+        std::error_code error;
+        std::filesystem::remove_all(log_dir, error);
+    };
     Common::Log::Initialize();
     // Every class at every level, so a missing error line cannot be a filtered one. The ring has
     // no getter for its capacity, so it is turned off afterwards, as the other ring tests do.
@@ -640,11 +654,15 @@ TEST_CASE("A fresh config keeps the data paths without an error", "[config]") {
         before[path] = Common::FS::GetEdenPath(path);
     }
     FileConfig config{std::string{"qt-config"}};
-    for (const EdenPath path : paths) {
-        CHECK(Common::FS::GetEdenPath(path) == before[path]);
-    }
-    for (const auto& line : Common::Log::ReadRing(0)) {
+    // The screenshot path is read by the frontends' configs (Qt), not by Config's own reload.
+    config.ReadScreenshotValues();
+    // Read the ring at once, so later lines cannot push the error lines out of it.
+    const auto lines = Common::Log::ReadRing(0);
+    for (const auto& line : lines) {
         INFO(line.text);
         CHECK(line.text.find("new_path= is not a directory") == std::string::npos);
+    }
+    for (const EdenPath path : paths) {
+        CHECK(Common::FS::GetEdenPath(path) == before[path]);
     }
 }
