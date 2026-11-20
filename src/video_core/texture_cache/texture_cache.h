@@ -2162,8 +2162,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear, u32 bounding_scissors) 
     drawing_render_targets = !is_clear;
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
-        if (rt_active_mask == 0) {
+        if (rt_active_mask == 0 && bounding_scissors != 0) {
             // The scissors bound a pass without attachments, and they change without the targets.
+            // A clear or a draw that does not ask keeps the size the pass has.
             const auto& resolution = Settings::values.resolution_info;
             const Extent2D size =
                 RenderTargetsSize(is_rescaling ? resolution.up_scale : 1,
@@ -2254,11 +2255,22 @@ Extent2D TextureCache<P>::RenderTargetsSize(u32 up_scale, u32 down_shift,
     const size_t count = (std::min)(size_t{bounding_scissors}, scissors.size());
     for (size_t index = 0; index < count; ++index) {
         const auto& scissor = regs.scissor_test[index];
-        scissors[index] = {scissor.enable != 0, scissor.max_x.Value(), scissor.max_y.Value()};
+        scissors[index] = {
+            .enable = scissor.enable != 0,
+            .min_x = scissor.min_x.Value(),
+            .max_x = scissor.max_x.Value(),
+            .min_y = scissor.min_y.Value(),
+            .max_y = scissor.max_y.Value(),
+        };
     }
-    const bool lower_left = regs.window_origin.mode != Regs::WindowOrigin::Mode::UpperLeft;
-    return AttachmentlessRenderArea(size, lower_left, std::span{scissors}.first(count), up_scale,
-                                    down_shift);
+    const AttachmentlessState state{
+        .size = size,
+        .lower_left = regs.window_origin.mode != Regs::WindowOrigin::Mode::UpperLeft,
+        .viewport_transform = regs.viewport_scale_offset_enabled != 0,
+        .up_scale = up_scale,
+        .down_shift = down_shift,
+    };
+    return AttachmentlessRenderArea(state, std::span{scissors}.first(count));
 }
 
 template <class P>

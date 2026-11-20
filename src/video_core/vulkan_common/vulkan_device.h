@@ -1332,6 +1332,12 @@ FN_MAX_LIMIT_LIST
     /// one too through Mesa's shader cache, unless it is disabled.
     bool DriverCachesPipelines() const noexcept;
 
+    /// Whether the GPU pays for a render pass's area even where nothing is drawn: Apple's tiled
+    /// GPUs through MoltenVK (PCI vendor ID 0x106B, not Intel or AMD GPUs in a Mac).
+    bool HasRenderAreaCost() const noexcept {
+        return IsMoltenVK() && GetVendorID() == 0x106B;
+    }
+
     bool IsMoltenVK() const noexcept {
         return properties.driver.driverID == VK_DRIVER_ID_MOLTENVK;
     }

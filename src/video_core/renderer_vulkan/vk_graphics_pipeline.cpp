@@ -417,12 +417,18 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
-    // Without a shader that picks the viewport, only the first one and its scissor apply.
-    const bool picks_viewport = std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
-        return info.stores[Shader::IR::Attribute::ViewportIndex] ||
-               info.stores[Shader::IR::Attribute::ViewportMask];
-    });
-    bounding_scissors = picks_viewport ? Maxwell::NumViewports : 1;
+    // Only where the render area costs (a tiled GPU): elsewhere the framebuffer stays as it was.
+    // Without a shader that picks the viewport, only the first one and its scissor apply. A mesh
+    // pipeline may pick it from host-made code (the emulation's vertex shader): all of them.
+    if (device.HasRenderAreaCost()) {
+        const bool picks_viewport =
+            IsMeshPipeline() || IsEmulatedMesh() ||
+            std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+                return info.stores[Shader::IR::Attribute::ViewportIndex] ||
+                       info.stores[Shader::IR::Attribute::ViewportMask];
+            });
+        bounding_scissors = picks_viewport ? Maxwell::NumViewports : 1;
+    }
     on_far_plane = infos[0] && infos[0]->position_on_far_plane && !infos[1] && !infos[2] &&
                    !infos[3] && key.state.extended_dynamic_state_2 != 0;
     // The guest leaves render target components the fragment shader doesn't output untouched,

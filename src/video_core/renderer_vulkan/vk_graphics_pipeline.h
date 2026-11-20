@@ -466,7 +466,8 @@ private:
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
     bool fragment_has_color0_output{};
-    /// The guest scissors that can bound a draw: those a pass without attachments is cut to.
+    /// The guest scissors that can bound a draw, those a pass without attachments is cut to, where
+    /// the render area costs (Device::HasRenderAreaCost); 0 elsewhere.
     u32 bounding_scissors{};
     bool on_far_plane{};
     u32 color_output_mask{};

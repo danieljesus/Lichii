@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <span>
 
 #include "common/common_types.h"
@@ -11,45 +12,81 @@
 
 namespace VideoCommon {
 
+/// A guest scissor coordinate scaled to the host resolution as the Vulkan rasterizer scales the
+/// host scissors (GetScissorState): times up_scale, shifted down by down_shift, odd products
+/// rounded outward when scaling down, never to 0 from a value that was not. The product and the
+/// shift are unsigned, as they always were there.
+[[nodiscard]] constexpr s32 ScaleScissorCoordinate(s32 value, u32 up_scale, u32 down_shift) {
+    if (value == 0) {
+        return 0;
+    }
+    const u32 product = static_cast<u32>(value) * up_scale;
+    s32 accumulated = 0;
+    if ((up_scale >> down_shift) == 0) {
+        accumulated = static_cast<s32>(product) % 2;
+    }
+    const s32 converted = static_cast<s32>(product >> down_shift);
+    return value < 0 ? (std::min)(converted - accumulated, -1)
+                     : (std::max)(converted + accumulated, 1);
+}
+
 /// The part of a guest scissor that bounds the framebuffer.
 struct GuestScissor {
     bool enable;
+    u32 min_x;
     u32 max_x;
+    u32 min_y;
     u32 max_y;
 };
 
-/// The framebuffer a pass without attachments needs, `size` being the surface clip's.
+/// What the framebuffer of a pass without attachments depends on.
+struct AttachmentlessState {
+    Extent2D size;           ///< The surface clip's, scaled
+    bool lower_left;         ///< Viewports and scissors are flipped by the surface clip's height
+    bool viewport_transform; ///< The guest scissors apply (viewport_scale_offset_enabled)
+    u32 up_scale;
+    u32 down_shift;
+};
+
+/// The framebuffer a pass without attachments needs, for a host that pays for the render area
+/// (a tiled GPU: Apple's through MoltenVK).
 ///
-/// Nothing is stored in such a pass, so only rasterisation needs the area: fragments (and their
-/// storage writes and queries) come only from inside the scissors. Games leave the surface clip at
-/// the hardware's 32768x32768 there, and an Apple GPU pays for every tile of that area
-/// (2.7 ms for one 1x1 draw in Ocarina of Time, 47 ms the first time). So the size is cut to the
-/// largest scissor any viewport can use: all of them, since a shader can pick the viewport.
-/// It stays as it is when any scissor is off (then only the viewport bounds the draw), and with
-/// a lower-left origin, whose viewports and scissors are flipped by the surface clip's height.
-[[nodiscard]] constexpr Extent2D AttachmentlessRenderArea(Extent2D size, bool lower_left,
-                                                          std::span<const GuestScissor> scissors,
-                                                          u32 up_scale, u32 down_shift) {
-    if (lower_left || scissors.empty()) {
-        return size;
+/// Nothing is stored in such a pass, so only rasterisation needs the area, and the scissors bound
+/// it: fragments, and with them storage writes and queries, come only from inside them. Games
+/// leave the surface clip at the hardware's 32768x32768 there, and an Apple GPU pays for every
+/// tile of that area (2.7 ms for one 1x1 draw in Ocarina of Time, 47 ms the first time). So the
+/// size is cut to the host scissors the draw can use (`scissors`: the first, or all when a shader
+/// picks the viewport), rounded up to a power of two so that a scissor that moves a little keeps
+/// the framebuffer, and the render pass, it had.
+///
+/// It stays the surface clip's when the scissors do not bound the draw: one off (then only the
+/// viewport does) or inverted, the viewport transform off (the rasterizer then sets every host
+/// scissor to the surface clip), or a lower-left origin (scissors flipped by the clip's height).
+[[nodiscard]] constexpr Extent2D AttachmentlessRenderArea(const AttachmentlessState& state,
+                                                          std::span<const GuestScissor> scissors) {
+    if (state.lower_left || !state.viewport_transform || scissors.empty()) {
+        return state.size;
     }
-    u32 width = 0;
-    u32 height = 0;
+    u32 width = 1;
+    u32 height = 1;
     for (const GuestScissor& scissor : scissors) {
-        if (!scissor.enable) {
-            return size;
+        if (!scissor.enable || scissor.max_x < scissor.min_x || scissor.max_y < scissor.min_y) {
+            return state.size;
         }
-        width = (std::max)(width, scissor.max_x);
-        height = (std::max)(height, scissor.max_y);
+        // Where the host scissor ends: its scaled offset plus its scaled extent.
+        const auto end = [&](u32 min, u32 max) {
+            const s32 offset =
+                ScaleScissorCoordinate(static_cast<s32>(min), state.up_scale, state.down_shift);
+            const s32 extent = ScaleScissorCoordinate(static_cast<s32>(max - min), state.up_scale,
+                                                      state.down_shift);
+            return static_cast<u32>(offset + extent);
+        };
+        width = (std::max)(width, end(scissor.min_x, scissor.max_x));
+        height = (std::max)(height, end(scissor.min_y, scissor.max_y));
     }
-    // Scaled up as the host scissors are, rounding up, plus one for their rounding of each end.
-    const auto scale = [&](u32 value) {
-        const u32 slack = up_scale == 1 && down_shift == 0 ? 0 : 1;
-        return ((value * up_scale + (1U << down_shift) - 1) >> down_shift) + slack;
-    };
     return Extent2D{
-        .width = (std::clamp)(scale(width), 1U, (std::max)(size.width, 1U)),
-        .height = (std::clamp)(scale(height), 1U, (std::max)(size.height, 1U)),
+        .width = (std::min)(std::bit_ceil(width), (std::max)(state.size.width, 1U)),
+        .height = (std::min)(std::bit_ceil(height), (std::max)(state.size.height, 1U)),
     };
 }
 

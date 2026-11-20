@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 
 #include <catch2/catch_test_macros.hpp>
@@ -9,33 +10,71 @@
 
 namespace {
 using VideoCommon::AttachmentlessRenderArea;
+using VideoCommon::AttachmentlessState;
 using VideoCommon::Extent2D;
 using VideoCommon::GuestScissor;
+using VideoCommon::ScaleScissorCoordinate;
 
 constexpr Extent2D Max{32768, 32768};
+constexpr AttachmentlessState Native{Max, false, true, 1, 0};
 
 std::array<GuestScissor, 16> AllScissors(u32 max_x, u32 max_y) {
     std::array<GuestScissor, 16> scissors;
-    scissors.fill({true, max_x, max_y});
+    scissors.fill({true, 0, max_x, 0, max_y});
     return scissors;
 }
+
+// GetScissorState's scaling as it was before it moved to ScaleScissorCoordinate, verbatim.
+s32 OldScaleUp(s32 value, u32 up_scale, u32 down_shift) {
+    if (value == 0) {
+        return 0U;
+    }
+    const s32 upset = value * up_scale;
+    s32 acumm = 0;
+    if ((up_scale >> down_shift) == 0) {
+        acumm = upset % 2;
+    }
+    const s32 converted_value = (value * up_scale) >> down_shift;
+    return value < 0 ? std::min<s32>(converted_value - acumm, -1)
+                     : std::max<s32>(converted_value + acumm, 1);
+}
+
+constexpr std::array<std::array<u32, 2>, 8> Scales{{
+    {1, 0}, {1, 1}, {3, 2}, {3, 1}, {2, 0}, {5, 1}, {3, 0}, {4, 0},
+}};
 } // Anonymous namespace
+
+TEST_CASE("The scissor scaling is the rasterizer's", "[video_core][texture_cache][render_area]") {
+    for (const auto& [up_scale, down_shift] : Scales) {
+        for (s32 value = -2048; value <= 2048; ++value) {
+            REQUIRE(ScaleScissorCoordinate(value, up_scale, down_shift) ==
+                    OldScaleUp(value, up_scale, down_shift));
+        }
+        for (const s32 value : {32767, 65535, -65535}) {
+            REQUIRE(ScaleScissorCoordinate(value, up_scale, down_shift) ==
+                    OldScaleUp(value, up_scale, down_shift));
+        }
+    }
+}
 
 TEST_CASE("A pass without attachments is cut to its scissors",
           "[video_core][texture_cache][render_area]") {
     // Ocarina of Time: a 1x1 draw in a 32768x32768 surface clip.
-    REQUIRE(AttachmentlessRenderArea(Max, false, AllScissors(1, 1), 1, 0) == Extent2D{1, 1});
+    REQUIRE(AttachmentlessRenderArea(Native, AllScissors(1, 1)) == Extent2D{1, 1});
 
-    // The largest of all scissors, each dimension on its own: a shader can pick any viewport.
+    // The largest of the scissors given, each dimension on its own, to a power of two.
     auto scissors = AllScissors(16, 16);
-    scissors[3] = {true, 640, 8};
-    scissors[15] = {true, 8, 360};
-    REQUIRE(AttachmentlessRenderArea(Max, false, scissors, 1, 0) == Extent2D{640, 360});
+    scissors[3] = {true, 0, 640, 0, 8};
+    scissors[15] = {true, 100, 120, 200, 360};
+    REQUIRE(AttachmentlessRenderArea(Native, scissors) == Extent2D{1024, 512});
+    // A scissor that moves a little keeps the size.
+    scissors[3].max_x = 1000;
+    REQUIRE(AttachmentlessRenderArea(Native, scissors) == Extent2D{1024, 512});
 
     // Never past the surface clip, never empty.
-    REQUIRE(AttachmentlessRenderArea({256, 128}, false, AllScissors(65535, 65535), 1, 0) ==
-            Extent2D{256, 128});
-    REQUIRE(AttachmentlessRenderArea(Max, false, AllScissors(0, 0), 1, 0) == Extent2D{1, 1});
+    const AttachmentlessState small{{300, 128}, false, true, 1, 0};
+    REQUIRE(AttachmentlessRenderArea(small, AllScissors(65535, 65535)) == Extent2D{300, 128});
+    REQUIRE(AttachmentlessRenderArea(Native, AllScissors(0, 0)) == Extent2D{1, 1});
 }
 
 TEST_CASE("A pass without attachments keeps its size when the scissors do not bound it",
@@ -43,20 +82,40 @@ TEST_CASE("A pass without attachments keeps its size when the scissors do not bo
     // A scissor that is off leaves only the viewport to bound the draw.
     auto scissors = AllScissors(1, 1);
     scissors[9].enable = false;
-    REQUIRE(AttachmentlessRenderArea(Max, false, scissors, 1, 0) == Max);
+    REQUIRE(AttachmentlessRenderArea(Native, scissors) == Max);
+
+    // An inverted scissor: the host extent would wrap.
+    scissors = AllScissors(1, 1);
+    scissors[0] = {true, 10, 5, 0, 1};
+    REQUIRE(AttachmentlessRenderArea(Native, scissors) == Max);
+    scissors[0] = {true, 0, 1, 10, 5};
+    REQUIRE(AttachmentlessRenderArea(Native, scissors) == Max);
+
+    // Without the viewport transform the rasterizer sets every host scissor to the surface clip.
+    REQUIRE(AttachmentlessRenderArea({Max, false, false, 1, 0}, AllScissors(1, 1)) == Max);
 
     // A lower-left origin flips viewports and scissors by the surface clip's height.
-    REQUIRE(AttachmentlessRenderArea(Max, true, AllScissors(1, 1), 1, 0) == Max);
+    REQUIRE(AttachmentlessRenderArea({Max, true, true, 1, 0}, AllScissors(1, 1)) == Max);
 
-    REQUIRE(AttachmentlessRenderArea(Max, false, {}, 1, 0) == Max);
+    REQUIRE(AttachmentlessRenderArea(Native, {}) == Max);
 }
 
-TEST_CASE("A pass without attachments is cut to its scissors when rescaled",
+TEST_CASE("A pass without attachments covers its host scissors at every scale",
           "[video_core][texture_cache][render_area]") {
-    // 2x: twice the scissor, plus one for the host scissors' rounding.
-    REQUIRE(AttachmentlessRenderArea({65536, 65536}, false, AllScissors(100, 50), 2, 0) ==
-            Extent2D{201, 101});
-    // 0.75x (3 >> 2) rounds up: 101 * 3 / 4 = 75.75.
-    REQUIRE(AttachmentlessRenderArea({24576, 24576}, false, AllScissors(101, 1), 3, 2) ==
-            Extent2D{77, 2});
+    for (const auto& [up_scale, down_shift] : Scales) {
+        const Extent2D size{(32768 * up_scale) >> down_shift, (32768 * up_scale) >> down_shift};
+        const AttachmentlessState state{size, false, true, up_scale, down_shift};
+        for (u32 min = 0; min < 70; min += 3) {
+            for (u32 max = min; max < 300; max += 7) {
+                const std::array<GuestScissor, 1> scissor{{{true, min, max, min, max}}};
+                const Extent2D area = AttachmentlessRenderArea(state, scissor);
+                // GetScissorState: offset scale_up(min), extent scale_up(max - min).
+                const s32 end = OldScaleUp(static_cast<s32>(min), up_scale, down_shift) +
+                                OldScaleUp(static_cast<s32>(max - min), up_scale, down_shift);
+                REQUIRE(static_cast<s32>(area.width) >= end);
+                REQUIRE(static_cast<s32>(area.height) >= end);
+                REQUIRE(area.width <= (std::max)(2 * static_cast<u32>(end), 1U));
+            }
+        }
+    }
 }

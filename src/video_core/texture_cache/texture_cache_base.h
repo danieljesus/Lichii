@@ -380,10 +380,11 @@ public:
 
     /// Update bound render targets and upload memory if necessary
     /// @param is_clear True when the render targets are being used for clears
-    /// @param bounding_scissors How many of the guest scissors bound a draw without attachments
-    ///                          (1, or all of them when a shader picks the viewport): its
-    ///                          framebuffer is cut to them (AttachmentlessRenderArea). 0 keeps the
-    ///                          surface clip's size.
+    /// @param bounding_scissors For a host that pays for the render area: how many of the guest
+    ///                          scissors bound a draw without attachments (1, or all of them when
+    ///                          a shader picks the viewport), whose framebuffer is then cut to
+    ///                          them (AttachmentlessRenderArea). 0 (anything else) makes no cut,
+    ///                          and keeps a pass's cut size when its targets did not change.
     void UpdateRenderTargets(bool is_clear, u32 bounding_scissors = 0);
 
     /// Find a framebuffer with the currently bound render targets
