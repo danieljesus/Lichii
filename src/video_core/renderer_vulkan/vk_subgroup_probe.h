@@ -13,7 +13,7 @@ class Device;
 /// runs (Shader::Backend::SPIRV::IsSubgroupProbeShape, within the device's limits), every
 /// invocation i must see SubgroupId i / 32 and lane i % 32 (and SubgroupSize 32, a constant on
 /// MoltenVK). The staged HMMA then takes only those workgroups. Needs computeFullSubgroups and
-/// SPIR-V 1.3; fails when a dispatch does not finish in 2 s.
+/// SPIR-V 1.3.
 ///
 /// It runs one workgroup of a straight-line shader: it checks how the device numbers subgroups,
 /// not every way the driver could pack a shader with shared memory, barriers and branches.

@@ -732,9 +732,13 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     if (profile.compute_subgroups_are_guest_warps && profile.support_compute_full_subgroups &&
         device.AssumesAppleComputeSubgroupsAreGuestWarps()) {
         // Nothing in Vulkan says so on an Apple GPU: check it once on the device.
+        // The verdict is kept three times: the shaders read the profile's two bits, the precache
+        // marker the optional (set only where the probe ran).
         subgroup_probe_passed = ProbeComputeSubgroupsAreGuestWarps(device);
         profile.compute_subgroups_are_guest_warps = *subgroup_probe_passed;
         profile.compute_subgroup_layout_probed = *subgroup_probe_passed;
+        profile.max_compute_workgroup_size = device.GetMaxComputeWorkGroupSize();
+        profile.max_compute_workgroup_invocations = device.GetMaxComputeWorkGroupInvocations();
     }
     profile.support_cooperative_hmma_16x16x16 =
         !profile.support_cooperative_hmma && device.IsCooperativeHmma16x16x16Supported();

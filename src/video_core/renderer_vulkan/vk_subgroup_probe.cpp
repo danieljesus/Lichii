@@ -20,31 +20,25 @@ struct Shape {
     u32 x, y, z;
 };
 
-/// The workgroups the probe runs (IsSubgroupProbeShape) within the device's limits.
+/// The workgroups the probe runs (IsSubgroupProbeShape, with the device's limits).
 std::vector<Shape> ProbedShapes(const Device& device) {
     using Shader::Backend::SPIRV::IsSubgroupProbeShape;
     const u32 max_invocations = device.GetMaxComputeWorkGroupInvocations();
     const std::array<u32, 3> max_size = device.GetMaxComputeWorkGroupSize();
-    const auto fits = [&](const Shape& shape) {
-        return shape.x <= max_size[0] && shape.y <= max_size[1] && shape.z <= max_size[2] &&
-               u64{shape.x} * shape.y * shape.z <= max_invocations;
-    };
     std::vector<Shape> shapes;
-    for (u32 x = GuestWarpSize; IsSubgroupProbeShape(x, 1, 1); x += GuestWarpSize) {
-        if (fits({x, 1, 1})) {
-            shapes.push_back({x, 1, 1});
-        }
-    }
-    for (const auto& [x, y, z] : Shader::Backend::SPIRV::SUBGROUP_PROBE_PLANAR_SHAPES) {
-        if (fits({x, y, z})) {
+    const auto add = [&](u32 x, u32 y, u32 z) {
+        if (IsSubgroupProbeShape(x, y, z, max_size, max_invocations)) {
             shapes.push_back({x, y, z});
         }
+    };
+    for (u32 x = GuestWarpSize; x <= 1024; x += GuestWarpSize) {
+        add(x, 1, 1);
+    }
+    for (const auto& [x, y, z] : Shader::Backend::SPIRV::SUBGROUP_PROBE_PLANAR_SHAPES) {
+        add(x, y, z);
     }
     return shapes;
 }
-
-/// A dispatch of a few invocations takes well under a millisecond: this only catches a hang.
-constexpr u64 ProbeTimeout = u64{2'000'000'000}; // 2 s
 } // Anonymous namespace
 
 bool ProbeComputeSubgroupsAreGuestWarps(const Device& device) {
@@ -66,13 +60,7 @@ bool ProbeComputeSubgroupsAreGuestWarps(const Device& device) {
             const std::vector<u32> code = Shader::Backend::SPIRV::EmitSubgroupLayoutProbe(
                 device.SupportedSpirvVersion(), shape.x, shape.y, shape.z);
             std::vector<u32> words(invocations, 0);
-            if (RunComputeProbe(device, code, words, ProbeTimeout) == ProbeResult::TimedOut) {
-                LOG_WARNING(Render_Vulkan,
-                            "Compute subgroup probe timed out (a {}x{}x{} workgroup did not finish "
-                            "in {} s): the software HMMA keeps its shuffles",
-                            shape.x, shape.y, shape.z, ProbeTimeout / 1'000'000'000);
-                return false;
-            }
+            RunComputeProbe(device, code, words);
             for (u32 index = 0; index < invocations; ++index) {
                 // SubgroupSize is a constant on MoltenVK (its fixed subgroup size, 32, unless the
                 // pipeline allows a varying size): the subgroup and the lane are what is probed.

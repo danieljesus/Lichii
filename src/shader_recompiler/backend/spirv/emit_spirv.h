@@ -69,11 +69,16 @@ inline constexpr std::array<std::array<u32, 3>, 3> SUBGROUP_PROBE_PLANAR_SHAPES{
     {32, 8, 4},
 }};
 
-/// Whether the subgroup layout probe runs (where the device allows it) a workgroup of this size:
-/// x a multiple of 32 up to 1024 invocations with y = z = 1, or SUBGROUP_PROBE_PLANAR_SHAPES. A
-/// probed layout (Profile::compute_subgroup_layout_probed) holds only for these.
-[[nodiscard]] constexpr bool IsSubgroupProbeShape(u32 x, u32 y, u32 z) {
-    if (x == 0 || x % 32 != 0 || u64{x} * y * z > 1024) {
+/// Whether the subgroup layout probe runs a workgroup of this size on a device with these limits:
+/// x a multiple of 32 up to 1024 invocations with y = z = 1, or SUBGROUP_PROBE_PLANAR_SHAPES, that
+/// the device can run. A probed layout (Profile::compute_subgroup_layout_probed) holds only for
+/// these; the probe and the staged HMMA both decide with this.
+[[nodiscard]] constexpr bool IsSubgroupProbeShape(u32 x, u32 y, u32 z,
+                                                  const std::array<u32, 3>& max_size,
+                                                  u32 max_invocations) {
+    const u64 invocations = u64{x} * y * z;
+    if (x == 0 || x % 32 != 0 || invocations > 1024 || invocations > max_invocations ||
+        x > max_size[0] || y > max_size[1] || z > max_size[2]) {
         return false;
     }
     if (y == 1 && z == 1) {

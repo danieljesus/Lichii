@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -11,6 +13,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "shader_recompiler/frontend/ir/program.h"
 
 namespace Shader::Backend::SPIRV {
@@ -327,11 +330,24 @@ std::optional<u32> ReserveSoftwareHmmaScratch(const Profile& profile, IR::Progra
         program.workgroup_size[0] == 0 || program.workgroup_size[0] % GUEST_WARP_LANES != 0 ||
         WorkgroupInvocations(program) < GUEST_WARP_LANES ||
         WorkgroupInvocations(program) > SoftwareHmmaMaxInvocations ||
-        (profile.compute_subgroup_layout_probed &&
-         !IsSubgroupProbeShape(program.workgroup_size[0], program.workgroup_size[1],
-                               program.workgroup_size[2])) ||
         profile.max_subgroup_size != GUEST_WARP_LANES || Summarize(program).count == 0 ||
         !HmmaConverged(program)) {
+        return std::nullopt;
+    }
+    const auto& [x, y, z] = program.workgroup_size;
+    if (profile.compute_subgroup_layout_probed &&
+        !IsSubgroupProbeShape(x, y, z, profile.max_compute_workgroup_size,
+                              profile.max_compute_workgroup_invocations)) {
+        // The layout was probed for other workgroups only. Once a shape, to see whether any game
+        // uses one.
+        static std::mutex mutex;
+        static std::set<std::array<u32, 3>> logged;
+        std::scoped_lock lock{mutex};
+        if (logged.insert({x, y, z}).second) {
+            LOG_INFO(Shader, "Software HMMA keeps its shuffles in a {}x{}x{} workgroup: the "
+                             "subgroup probe did not run that shape",
+                     x, y, z);
+        }
         return std::nullopt;
     }
     return ReserveHmmaScratch(profile, program, SoftwareHmmaWordsPerWarp);

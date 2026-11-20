@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <tuple>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -947,6 +948,37 @@ TEST_CASE("Software HMMA keeps its shuffles where subgroups may not be whole war
     }
 }
 
+TEST_CASE("Software HMMA takes only probed workgroups where the layout was probed",
+          "[video_core][tensor][ampere]") {
+    const auto emit = [](bool probed, std::array<u32, 3> workgroup) {
+        TensorProgram fixture{1, 16};
+        SlowShuffles(fixture);
+        fixture.profile.compute_subgroup_layout_probed = probed;
+        fixture.profile.max_compute_workgroup_size = {1024, 1024, 1024};
+        fixture.profile.max_compute_workgroup_invocations = 1024;
+        fixture.program.workgroup_size = workgroup;
+        auto code = fixture.Emit();
+        return std::make_tuple(std::move(code), fixture.program.info.requires_full_guest_warps,
+                               fixture.program.shared_memory_size);
+    };
+    // 32x2x1 was never probed: shuffles where the layout was probed...
+    const auto [unprobed, unprobed_full, unprobed_shared] = emit(true, {32, 2, 1});
+    REQUIRE(Shuffles(unprobed));
+    REQUIRE_FALSE(unprobed_full);
+    REQUIRE(unprobed_shared == 0);
+    // ...and what it always emitted where the layout is assumed: the staged exchange.
+    const auto [assumed, assumed_full, assumed_shared] = emit(false, {32, 2, 1});
+    REQUIRE_FALSE(Shuffles(assumed));
+    REQUIRE(assumed_full);
+    REQUIRE(assumed_shared == StagedBytes);
+    // A probed shape stages either way, with the same code.
+    const auto [probed, probed_full, probed_shared] = emit(true, {64, 1, 1});
+    const auto [unchecked, unchecked_full, unchecked_shared] = emit(false, {64, 1, 1});
+    REQUIRE(probed_full);
+    REQUIRE(probed == unchecked);
+    REQUIRE(probed_shared == unchecked_shared);
+}
+
 TEST_CASE("Software HMMA's exchange goes after the program's own shared memory",
           "[video_core][tensor][ampere]") {
     TensorProgram fixture{1, 16};
@@ -1249,21 +1281,29 @@ TEST_CASE("Software HMMA's native rounding needs 16-bit floats",
 }
 
 TEST_CASE("The subgroup layout probe covers the workgroups it names", "[video_core][tensor]") {
-    using Backend::SPIRV::IsSubgroupProbeShape;
+    constexpr std::array<u32, 3> M6Size{1024, 1024, 1024};
+    const auto probed = [&](u32 x, u32 y, u32 z) {
+        return Backend::SPIRV::IsSubgroupProbeShape(x, y, z, M6Size, 1024);
+    };
     for (u32 x = 32; x <= 1024; x += 32) {
-        REQUIRE(IsSubgroupProbeShape(x, 1, 1));
+        REQUIRE(probed(x, 1, 1));
     }
-    REQUIRE(IsSubgroupProbeShape(32, 4, 1));
-    REQUIRE(IsSubgroupProbeShape(64, 2, 2));
-    REQUIRE(IsSubgroupProbeShape(32, 8, 4));
+    REQUIRE(probed(32, 4, 1));
+    REQUIRE(probed(64, 2, 2));
+    REQUIRE(probed(32, 8, 4));
     // Never run, so the staged HMMA does not take them on a probed device.
-    REQUIRE_FALSE(IsSubgroupProbeShape(32, 2, 1));
-    REQUIRE_FALSE(IsSubgroupProbeShape(32, 1, 8));
-    REQUIRE_FALSE(IsSubgroupProbeShape(96, 2, 1));
-    REQUIRE_FALSE(IsSubgroupProbeShape(1056, 1, 1));
-    REQUIRE_FALSE(IsSubgroupProbeShape(48, 1, 1));
-    REQUIRE_FALSE(IsSubgroupProbeShape(0, 1, 1));
-    REQUIRE_FALSE(IsSubgroupProbeShape(64, 4, 8));
+    REQUIRE_FALSE(probed(32, 2, 1));
+    REQUIRE_FALSE(probed(32, 1, 8));
+    REQUIRE_FALSE(probed(96, 2, 1));
+    REQUIRE_FALSE(probed(1056, 1, 1));
+    REQUIRE_FALSE(probed(48, 1, 1));
+    REQUIRE_FALSE(probed(0, 1, 1));
+    REQUIRE_FALSE(probed(64, 4, 8));
+    // Nor what the device's limits leave out.
+    REQUIRE_FALSE(Backend::SPIRV::IsSubgroupProbeShape(512, 1, 1, {256, 1024, 64}, 1024));
+    REQUIRE_FALSE(Backend::SPIRV::IsSubgroupProbeShape(512, 1, 1, M6Size, 256));
+    REQUIRE_FALSE(Backend::SPIRV::IsSubgroupProbeShape(32, 8, 4, {1024, 1024, 2}, 1024));
+    REQUIRE(Backend::SPIRV::IsSubgroupProbeShape(256, 1, 1, {256, 1024, 64}, 256));
 }
 
 TEST_CASE("The subgroup layout probe writes each invocation's subgroup", "[video_core][tensor]") {
