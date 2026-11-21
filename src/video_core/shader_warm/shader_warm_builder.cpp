@@ -328,6 +328,19 @@ u64 EmissionStamp() {
     return GeneratedEmissionStamp;
 }
 
+std::optional<u64> ProfileVerdictsHash(const ProfileVerdicts& verdicts) {
+    if (!verdicts.subgroup_probe_passed && !verdicts.hmma_8x8x8_test_passed) {
+        return std::nullopt;
+    }
+    // A check that did not run is 0, one that failed 1 and one that passed 2.
+    const auto code = [](std::optional<bool> verdict) -> u64 {
+        return verdict ? (*verdict ? 2 : 1) : 0;
+    };
+    const std::array<u64, 2> codes{code(verdicts.subgroup_probe_passed),
+                                   code(verdicts.hmma_8x8x8_test_passed)};
+    return Common::CityHash64(reinterpret_cast<const char*>(codes.data()), sizeof(codes));
+}
+
 std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries, u32 driver,
                                           u32 device_id, u32 cache_version, u64 variant) {
     std::error_code ec;

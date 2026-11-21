@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -862,4 +863,32 @@ TEST_CASE("ShaderPrecache: programs that cannot be lowered are refused", "[video
     const std::array<u8, 16> no_exit{};
     REQUIRE(ShaderWarm::LowerProgram(no_exit, lowered).has_value());
     REQUIRE(lowered.code.empty());
+}
+
+TEST_CASE("ShaderPrecache: device check verdicts change a stamp only where a check ran",
+          "[video_core]") {
+    using VideoCommon::ShaderWarm::ProfileVerdicts;
+    using VideoCommon::ShaderWarm::ProfileVerdictsHash;
+    // Where neither the subgroup probe nor the 8x8x8 self-test ran (every device but an Apple GPU),
+    // the precache variant and the precompiled preparation's stamp are what they were without them.
+    REQUIRE_FALSE(ProfileVerdictsHash({}).has_value());
+
+    const std::array<std::optional<bool>, 3> verdicts{std::nullopt, false, true};
+    std::vector<u64> hashes;
+    for (const auto probe : verdicts) {
+        for (const auto test : verdicts) {
+            if (!probe && !test) {
+                continue;
+            }
+            const ProfileVerdicts profile{probe, test};
+            const auto hash = ProfileVerdictsHash(profile);
+            REQUIRE(hash.has_value());
+            REQUIRE(ProfileVerdictsHash(profile) == hash);
+            hashes.push_back(*hash);
+        }
+    }
+    // Every combination where a check ran, the 8x8x8 self-test without the probe included, is
+    // told apart: a change of either verdict prepares and precaches again.
+    REQUIRE(hashes.size() == 8);
+    REQUIRE(std::unordered_set<u64>(hashes.begin(), hashes.end()).size() == hashes.size());
 }

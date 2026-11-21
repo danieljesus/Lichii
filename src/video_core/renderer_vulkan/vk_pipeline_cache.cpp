@@ -2438,11 +2438,9 @@ namespace {
 /// rescaling code of the shaders; the loop safety checks and the bloom fix change the SPIR-V; the
 /// debug setting adds a create flag. `persisted`: whether the builds outlive the run, so neither
 /// the marker nor the progress of a run whose builds were dropped is taken by one that keeps them.
-/// The subgroup probe's verdict also changes the SPIR-V where it ran (the staged or the shuffled
-/// software HMMA), and so does the 8x8x8 cooperative HMMA's self-test where it ran (cooperative
-/// matrices or the staged HMMA); each is left out where it did not, keeping the variant.
-u64 WarmVariant(bool persisted, std::optional<bool> subgroup_probe_passed,
-                std::optional<bool> hmma_8x8x8_test_passed) {
+/// The verdicts of the device checks change the SPIR-V too (ProfileVerdictsHash); where none ran,
+/// the variant is what it was before them.
+u64 WarmVariant(bool persisted, const VideoCommon::ShaderWarm::ProfileVerdicts& verdicts) {
     const auto& resolution = Settings::values.resolution_info;
     const std::array<u64, 8> inputs{
         VideoCommon::ShaderWarm::EmissionStamp(),
@@ -2456,17 +2454,12 @@ u64 WarmVariant(bool persisted, std::optional<bool> subgroup_probe_passed,
     };
     const u64 variant =
         Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));
-    if (!subgroup_probe_passed) {
+    const std::optional<u64> profile = VideoCommon::ShaderWarm::ProfileVerdictsHash(verdicts);
+    if (!profile) {
         return variant;
     }
-    const std::array<u64, 2> probed{variant, *subgroup_probe_passed ? 2ULL : 1ULL};
-    const u64 probed_variant =
-        Common::CityHash64(reinterpret_cast<const char*>(probed.data()), sizeof(probed));
-    if (!hmma_8x8x8_test_passed) {
-        return probed_variant;
-    }
-    const std::array<u64, 2> tested{probed_variant, *hmma_8x8x8_test_passed ? 2ULL : 1ULL};
-    return Common::CityHash64(reinterpret_cast<const char*>(tested.data()), sizeof(tested));
+    const std::array<u64, 2> profiled{variant, *profile};
+    return Common::CityHash64(reinterpret_cast<const char*>(profiled.data()), sizeof(profiled));
 }
 } // Anonymous namespace
 
@@ -2487,8 +2480,8 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
                                             device.GetDeviceID(), CACHE_VERSION,
-                                            WarmVariant(persisted, subgroup_probe_passed,
-                                                        hmma_8x8x8_test_passed));
+                                            WarmVariant(persisted, {subgroup_probe_passed,
+                                                                    hmma_8x8x8_test_passed}));
     };
     // Compute programs of the precache file, unless a matching marker says they were built.
     size_t file_entries = 0;
@@ -2853,17 +2846,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // The driver keeps what it compiled; the step runs again for another file, driver, build or
     // shader settings: the resolution scale is folded into the shaders (RescalingPass), and the
     // bloom fix, loop safety checks and debug renderer change their translation or SPIR-V. The
-    // infos' serialization version is in it too.
+    // infos' serialization version is in it too, and the device checks' verdicts where any ran
+    // (ProfileVerdictsHash): another MoltenVK under the same build and driver version can change
+    // them, and with them the SPIR-V. Where none ran the stamp is the same as without them.
     const auto data_path = base_dir / fmt::format("precompiled_kept.fork-v{}.bin", CACHE_VERSION);
     const auto index_path =
         base_dir / fmt::format("precompiled_kept_index.fork-v{}.bin", CACHE_VERSION);
     const auto& resolution = Settings::values.resolution_info;
+    const std::optional<u64> profile = VideoCommon::ShaderWarm::ProfileVerdictsHash(
+        {subgroup_probe_passed, hmma_8x8x8_test_passed});
     const std::string stamp = fmt::format(
-        "{} {} {:#x} {} {} scale {} {}/{} bloom {} loops {} debug {} {}\n", file_size, modified,
+        "{} {} {:#x} {} {} scale {} {}/{} bloom {} loops {} debug {} {}{}\n", file_size, modified,
         device.GetDriverVersion(), Common::g_scm_rev, device.GetModelName(), resolution.active,
         resolution.up_scale, resolution.down_shift, Settings::values.fix_bloom_effects.GetValue(),
         Settings::values.disable_shader_loop_safety_checks.GetValue(),
-        Settings::values.renderer_debug.GetValue(), PrecompiledInfosMagic);
+        Settings::values.renderer_debug.GetValue(), PrecompiledInfosMagic,
+        profile ? fmt::format(" profile {:#x}", *profile) : std::string{});
 
     auto prep_owner = std::make_unique<PrecompiledPrep>();
     auto& prep = *prep_owner;

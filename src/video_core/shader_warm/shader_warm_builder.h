@@ -71,6 +71,20 @@ struct WarmStamp {
 /// and changes only with a build that may emit other SPIR-V, unlike the revision.
 [[nodiscard]] u64 EmissionStamp();
 
+/// The verdicts of the checks run on the device that decide how guest programs are lowered, each
+/// only where it ran: the compute subgroup probe (the staged or the shuffled software HMMA) and the
+/// 8x8x8 cooperative HMMA's self-test (cooperative matrices or the staged HMMA). The same build and
+/// driver version emit other SPIR-V when one of them changes, under another MoltenVK for one.
+struct ProfileVerdicts {
+    std::optional<bool> subgroup_probe_passed;
+    std::optional<bool> hmma_8x8x8_test_passed;
+};
+
+/// A hash of `verdicts` for the stamps of what was built with them (the precache marker's variant,
+/// the precompiled preparation's stamp). Empty where neither check ran, as on every device but an
+/// Apple GPU, so that a stamp made there is the same as before they existed.
+[[nodiscard]] std::optional<u64> ProfileVerdictsHash(const ProfileVerdicts& verdicts);
+
 /// The stamp of `warm_file` as it is now, empty when it cannot be read.
 std::optional<WarmStamp> CurrentWarmStamp(const std::filesystem::path& warm_file, u64 entries,
                                           u32 driver, u32 device_id, u32 cache_version,
