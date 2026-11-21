@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -23,7 +24,9 @@
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/vfs/vfs_offset.h"
 #include "core/hle/kernel/code_set.h"
+#include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_page_table.h"
+#include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -148,53 +151,107 @@ bool AppLoader_NRO::IsHomebrew() {
            nro_header.magic_ext2 == Common::MakeMagic('B', 'R', 'E', 'W');
 }
 
-static constexpr u32 PageAlignSize(u32 size) {
-    return static_cast<u32>((size + Core::Memory::LICHII_PAGEMASK) & ~Core::Memory::LICHII_PAGEMASK);
+std::optional<NroLayout> ValidateNroLayout(std::span<const u8> data) {
+    constexpr u64 PageSize = Core::Memory::LICHII_PAGESIZE;
+    NroHeader header{};
+    if (data.size() < sizeof(NroHeader)) {
+        return std::nullopt;
+    }
+    std::memcpy(&header, data.data(), sizeof(NroHeader));
+    if (header.magic != Common::MakeMagic('N', 'R', 'O', '0')) {
+        return std::nullopt;
+    }
+
+    // The loader used to size the image from the header's 32-bit fields and copy and read at the
+    // offsets they give without checking them, so a damaged or crafted .nro could make it read
+    // outside its buffers or allocate gigabytes when launched. Every sum here is 64-bit, so none
+    // wraps.
+    //
+    // As hbloader, which launches homebrew on the console, does: the file must hold the size its
+    // header gives (the header included), and each segment must lie inside that size.
+    const u64 file_size = header.file_size;
+    if (file_size < sizeof(NroHeader) || file_size > data.size()) {
+        return std::nullopt;
+    }
+    // As Atmosphere's ro (ValidateNro) requires of an NRO: .text at 0, then .rodata and .data in
+    // order. ro also wants them back to back with page aligned sizes; here each segment is
+    // rounded up to a page, as this loader always did, and must end before the next begins, so
+    // the protections it gets do not overlap.
+    NroLayout layout{};
+    u64 previous_end = 0;
+    for (std::size_t i = 0; i < header.segments.size(); ++i) {
+        const u64 offset = header.segments[i].offset;
+        const u64 size = header.segments[i].size;
+        if (offset % PageSize != 0 || offset < previous_end || offset + size > file_size) {
+            return std::nullopt;
+        }
+        layout.segments[i] = {offset, Common::AlignUp(size, PageSize)};
+        previous_end = offset + layout.segments[i].size;
+    }
+    if (layout.segments[0].offset != 0) {
+        return std::nullopt;
+    }
+
+    const u64 file_image_size = Common::AlignUp(file_size, PageSize);
+    u64 bss_size = Common::AlignUp(u64{header.bss_size}, PageSize);
+    // A module header is read only from inside the file's part of the image; libnx finds its own
+    // MOD0 without this offset, so one that points elsewhere is not used rather than refused.
+    const u64 mod_offset = header.module_header_offset;
+    if (mod_offset + sizeof(ModHeader) <= file_size) {
+        ModHeader mod_header{};
+        std::memcpy(&mod_header, data.data() + mod_offset, sizeof(ModHeader));
+        if (mod_header.magic == Common::MakeMagic('M', 'O', 'D', '0')) {
+            if (mod_header.bss_end_offset < mod_header.bss_start_offset) {
+                return std::nullopt;
+            }
+            bss_size = Common::AlignUp(
+                u64{mod_header.bss_end_offset} - mod_header.bss_start_offset, PageSize);
+        }
+    } else {
+        LOG_WARNING(Loader, "NRO module header offset {:#x} is outside its {:#x} bytes",
+                    mod_offset, file_size);
+    }
+
+    // A code set segment's size is a u32: real NROs are megabytes.
+    const u64 image_size = file_image_size + bss_size;
+    if (image_size > std::numeric_limits<u32>::max()) {
+        return std::nullopt;
+    }
+    layout.segments[2].size = image_size - layout.segments[2].offset;
+    layout.file_size = file_size;
+    layout.image_size = image_size;
+    return layout;
 }
 
 static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
                         const std::vector<u8>& data) {
-    if (data.size() < sizeof(NroHeader)) {
-        return {};
+    const auto layout = ValidateNroLayout(data);
+    if (!layout) {
+        LOG_ERROR(Loader, "NRO header does not describe a valid image");
+        return false;
+    }
+    // Before anything is allocated: not more than the memory of the pool the process is created
+    // in.
+    const auto default_metadata = FileSys::ProgramMetadata::GetDefault();
+    const auto pool =
+        static_cast<Kernel::KMemoryManager::Pool>(default_metadata.GetPoolPartition());
+    if (layout->image_size > system.Kernel().MemoryManager().GetSize(pool)) {
+        LOG_ERROR(Loader, "NRO needs a {:#x} byte image, which the process cannot hold",
+                  layout->image_size);
+        return false;
     }
 
-    // Read NSO header
-    NroHeader nro_header{};
-    std::memcpy(&nro_header, data.data(), sizeof(NroHeader));
-    if (nro_header.magic != Common::MakeMagic('N', 'R', 'O', '0')) {
-        return {};
-    }
-
-    // Build program image
-    std::vector<u8> program_image(PageAlignSize(nro_header.file_size));
-    std::memcpy(program_image.data(), data.data(), program_image.size());
-    if (program_image.size() != PageAlignSize(nro_header.file_size)) {
-        return {};
-    }
+    // The file's part of the image, then .bss, zero.
+    std::vector<u8> program_image(static_cast<std::size_t>(layout->image_size));
+    std::memcpy(program_image.data(), data.data(), static_cast<std::size_t>(layout->file_size));
 
     Kernel::CodeSet codeset;
-    for (std::size_t i = 0; i < nro_header.segments.size(); ++i) {
-        codeset.segments[i].addr = nro_header.segments[i].offset;
-        codeset.segments[i].offset = nro_header.segments[i].offset;
-        codeset.segments[i].size = PageAlignSize(nro_header.segments[i].size);
+    for (std::size_t i = 0; i < layout->segments.size(); ++i) {
+        codeset.segments[i].addr = layout->segments[i].offset;
+        codeset.segments[i].offset = layout->segments[i].offset;
+        codeset.segments[i].size = static_cast<u32>(layout->segments[i].size);
     }
 
-    // Default .bss to NRO header bss size if MOD0 section doesn't exist
-    u32 bss_size{PageAlignSize(nro_header.bss_size)};
-
-    // Read MOD header
-    ModHeader mod_header{};
-    std::memcpy(&mod_header, program_image.data() + nro_header.module_header_offset,
-                sizeof(ModHeader));
-
-    const bool has_mod_header{mod_header.magic == Common::MakeMagic('M', 'O', 'D', '0')};
-    if (has_mod_header) {
-        // Resize program image to include .bss section and page align each section
-        bss_size = PageAlignSize(mod_header.bss_end_offset - mod_header.bss_start_offset);
-    }
-
-    codeset.DataSegment().size += bss_size;
-    program_image.resize(static_cast<u32>(program_image.size()) + bss_size);
     struct ConfigEntry {
         u32_le key;
         u32_le flags;
@@ -233,6 +290,12 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
             Common::AlignUp(kConfigTableSize + argv_string.size(), Core::Memory::LICHII_PAGESIZE);
 
         args_offset_in_image = program_image.size();
+        // The arguments extend .data, whose size is a u32.
+        if (args_offset_in_image + entries_and_argv > std::numeric_limits<u32>::max()) {
+            LOG_ERROR(Loader, "NRO image with its {:#x} bytes of arguments is too large",
+                      entries_and_argv);
+            return false;
+        }
         codeset.DataSegment().size += static_cast<u32>(entries_and_argv);
         program_image.resize(args_offset_in_image + entries_and_argv);
     }
@@ -273,7 +336,7 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
 
     // Setup the process code layout
     if (process
-            .LoadFromMetadata(system.Kernel(), FileSys::ProgramMetadata::GetDefault(), image_size, fastmem_base, aslr_offset)
+            .LoadFromMetadata(system.Kernel(), default_metadata, image_size, fastmem_base, aslr_offset)
             .IsError()) {
         return false;
     }

@@ -2,7 +2,10 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 #include "common/common_types.h"
@@ -21,6 +24,26 @@ class KProcess;
 }
 
 namespace Loader {
+
+/// Where an NRO's segments lie in the image it is loaded as, checked by ValidateNroLayout.
+struct NroLayout {
+    struct Segment {
+        u64 offset;
+        u64 size;
+    };
+    /// .text, .rodata and .data, page aligned and in order; .data runs to the end of the image,
+    /// over .bss.
+    std::array<Segment, 3> segments;
+    /// How many bytes of the file the image holds: the NRO's size from its header.
+    u64 file_size;
+    /// The image: the file's part page aligned, then .bss. At most 4 GiB.
+    u64 image_size;
+};
+
+/// Checks the header of the NRO in `data` (the whole file as read) against what the file holds
+/// and what an image can describe, before anything is allocated. Returns no layout for a damaged
+/// NRO.
+std::optional<NroLayout> ValidateNroLayout(std::span<const u8> data);
 
 /// Loads an NRO file
 class AppLoader_NRO final : public AppLoader {
