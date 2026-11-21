@@ -6,8 +6,9 @@
 // Seed: FUZZ_META_SEED=corpus/meta build-fuzz/bin/fuzz_meta writes a made-up KIP1 with a layout
 // the kernel accepts, an INI1 holding two of them and an NPDM; from an empty corpus the fuzzer
 // never got past their magics to the layout checks.
-// A KIP header can still ask for a large zero-filled .text, .rodata or .data with no stored bytes;
-// those show up as out-of-memory reports, not crashes.
+// A KIP's sections are kept at the bytes the file stores or decompresses to (BLZ output is at most
+// nine times its input), never at the sizes its header gives, so an out-of-memory report from
+// KIP1 or INI1 is a finding, not a header asking for a large section.
 
 #include <cstring>
 #include <memory>
