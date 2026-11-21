@@ -540,7 +540,12 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
         &scheduler);
+    // This fork keeps nx2's GPU render follower off unless EDEN_NX2_RENDER_FOLLOWER=1 asks for it:
+    // with it on, Ocarina of Time ran 3.5 times slower on an RTX 5080 with an i7-6900K and 17%
+    // slower on a Steam Deck (zortos293/Lichii#2352).
+    const char* const render_follower = std::getenv("EDEN_NX2_RENDER_FOLLOWER");
     VideoCommon::GpuSplit::Get().SetRenderFollowerSupported(
+        render_follower && render_follower[0] == '1' &&
         device.GetDriverID() != VK_DRIVER_ID_AMD_PROPRIETARY && !device.IsMoltenVK() &&
         device.IsHostQueryResetSupported());
     oot_performance_scale =
