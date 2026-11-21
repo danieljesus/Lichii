@@ -207,6 +207,7 @@ void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t n
 
 /// Render queued PCM with the stream's underrun policy and optional two-second diagnostics.
 void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::size_t num_frames) {
+    output_requests.fetch_add(1, std::memory_order_relaxed);
     if (num_frames == 0) {
         return;
     }
@@ -330,8 +331,34 @@ void SinkStream::WaitFreeSpace(std::stop_token stop_token) {
 
     release_cv.wait_for(lk, std::chrono::milliseconds(7), can_continue);
 
-    if (queued_buffers > max_queue_size + 3) {
+    if (queued_buffers <= max_queue_size + 3) {
+        return;
+    }
+    const auto interval = StallCheckInterval();
+    if (interval.count() == 0) {
         release_cv.wait(lk, stop_token, can_continue);
+        return;
+    }
+    // Wait for whatever plays the stream to free space, checking that it still asks for audio: a
+    // backend whose callback stopped without an error never frees any, and held the renderer, and
+    // the game, until it was stopped.
+    u64 seen = output_requests.load(std::memory_order_relaxed);
+    u32 idle_checks = 0;
+    while (!release_cv.wait_for(lk, stop_token, interval, can_continue)) {
+        if (stop_token.stop_requested()) {
+            return;
+        }
+        const u64 requests = output_requests.load(std::memory_order_relaxed);
+        idle_checks = requests == seen ? idle_checks + 1 : 0;
+        seen = requests;
+        if (idle_checks > 0) {
+            lk.unlock();
+            const bool stalled = BackendIdle(idle_checks);
+            lk.lock();
+            if (stalled) {
+                idle_checks = 0;
+            }
+        }
     }
 }
 

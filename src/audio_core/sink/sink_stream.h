@@ -259,6 +259,31 @@ protected:
      */
     void SignalPause();
 
+    /**
+     * How often a renderer waiting for queue space checks that the stream's backend still asks
+     * for audio, given at construction. Zero, as for streams with no way to recover a backend
+     * that stopped, waits without checking, as before.
+     */
+    virtual std::chrono::milliseconds StallCheckInterval() const {
+        return {};
+    }
+
+    /**
+     * A renderer waiting for queue space found that nothing asked for audio during the last
+     * `idle_checks` checks in a row. Called on the renderer's thread without the stream's locks.
+     *
+     * @return Whether the stream took it as a stalled backend, which starts the count again.
+     */
+    virtual bool BackendIdle([[maybe_unused]] u32 idle_checks) {
+        return false;
+    }
+
+    /// Count as a request, so that a renderer waiting for queue space starts counting idle checks
+    /// again: for a backend just published or started, which the checks before were not about.
+    void RestartStallCount() {
+        output_requests.fetch_add(1, std::memory_order_relaxed);
+    }
+
 protected:
     /// Core system
     Core::System& system;
@@ -297,6 +322,9 @@ private:
     u64 level_max_missing_frames{};
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
+    /// Times anything played the stream, its backend or a stand-in: what a renderer waiting for
+    /// queue space checks for.
+    std::atomic<u64> output_requests{};
     /// Largest number of frames the host device has asked for in one callback (sysmix streams)
     std::atomic<u64> largest_request_frames{};
     /// The ring size for audio out buffers (usually 4, rarely 2 or 8)

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -73,6 +74,10 @@ private:
  * meanwhile, so neither the renderer nor the owner's Start and Stop wait for it. Only closing the
  * stream does, as an open cannot be cancelled.
  *
+ * A backend can also stop calling back without reporting anything, as cubeb's WASAPI backend can
+ * after re-routing a stream to a new default device: a renderer that waits for queue space finds
+ * that nothing asked for audio for StallThreshold checks, and the stream is then lost as above.
+ *
  * Input and sysmix streams do not stand in: their owners check IsReady and fall back to silence or
  * fail the guest's open, so a loss leaves them not ready, as it always did. A fault the owner
  * reports with MarkFaulted, as sysmix does for a guest fault, is final for every stream.
@@ -91,7 +96,16 @@ public:
     struct Timing {
         std::chrono::milliseconds first_retry{500};
         std::chrono::milliseconds max_retry{4000};
+        /// How often a renderer waiting for queue space checks that the backend still asks for
+        /// audio (see StallThreshold).
+        std::chrono::milliseconds stall_check{1000};
     };
+
+    /// Checks in a row without a request before a backend that asked since it started counts as
+    /// stalled: cubeb's WASAPI backend's own rule until 2025, three waits of a second with no
+    /// event. Counting waits rather than measuring time keeps one wait across a system sleep from
+    /// counting as three.
+    static constexpr u32 StallChecks = 3;
 
     /// Reopens on a configured device before the backend should try the default one.
     static constexpr u32 ConfiguredDeviceAttempts = 3;
@@ -145,6 +159,14 @@ protected:
     /// Open the first backend. Renderer and audio out streams with no device yet stand in.
     void OpenInitialBackend();
 
+    std::chrono::milliseconds StallCheckInterval() const override {
+        return timing.stall_check;
+    }
+    /// A published backend that stopped asking for audio for StallThreshold checks is treated as
+    /// one that lost its device, except that it is destroyed off the stream's locks while the
+    /// stand-in plays, as it may not respond.
+    bool BackendIdle(u32 idle_checks) override;
+
     /// The backend lost its device. Takes no lock held around backend calls, so its callbacks can
     /// report it. Ignored once the stream is finalized.
     void BackendLost();
@@ -158,6 +180,27 @@ protected:
     /// For a backend's data callback: play the stream into `output` if the backend is published,
     /// else fill it with silence. Returns whether it played the stream.
     bool RenderFromBackend(const void* backend, std::span<s16> output, std::size_t num_frames);
+
+    /**
+     * Checks without a request before the published backend counts as stalled. StallChecks for one
+     * that has asked since it was published or started; one doubling more for one that has not
+     * yet, as a device waking up (a Bluetooth sink, an HDMI receiver, a suspended PulseAudio or
+     * PipeWire stream, a resume from sleep) can take longer to start than a running one to resume.
+     * Doubled again after each stall that reopened the stream, as the reopen delay doubles, over
+     * as many doublings as that delay has (first_retry to max_retry: three by default). A backend
+     * found stalled once more after the last doubling is not reopened again, but left to start
+     * (BackendIdle): so a device slower to start than every threshold is reopened that many times
+     * plus one at most. Its first request clears that, with one stall left at the longest
+     * threshold, and the doublings are forgotten once a backend has asked for audio for as long as
+     * the threshold they reached.
+     */
+    u32 StallThreshold(bool asked, u32 level) const {
+        return (asked ? StallChecks : 2 * StallChecks) << (std::min)(level, max_stall_level);
+    }
+    /// For tests: stalls that reopened the stream, not yet forgotten.
+    u32 StallLevel() const {
+        return stall_level.load();
+    }
 
     /// For tests: standing in for a lost device, and the reopen counts.
     bool IsStandingIn() const;
@@ -187,12 +230,18 @@ private:
     bool StandIn(std::stop_token stop_token, std::chrono::steady_clock::time_point until,
                  const std::atomic<bool>* done = nullptr);
     void ReleaseBackend();
+    /// Destroy a stalled backend, already unpublished, on a thread of its own once no callback of
+    /// it plays the stream, so that the stand-in plays meanwhile. False if the stream stops before
+    /// that callback ends: the backend is then left for Finalize. Worker thread only.
+    bool RetireStalled(std::stop_token stop_token, void* backend);
     Reopen TryReopen(std::stop_token stop_token, u32 attempt);
     /// Mark the stream finalized and pause it, so that nothing waits for queue space meanwhile,
     /// then stop and join the worker, which waits for an open under way. Returns the state before.
     State StopWorker();
 
-    Timing timing;
+    const Timing timing;
+    /// Doublings of the reopen delay from first_retry to max_retry; see StallThreshold.
+    const u32 max_stall_level;
 
     /// Serializes Start, Stop, Finalize, the worker's release and publication, and each block the
     /// stand-in plays, so that none plays after Stop returns: held around backend calls, except
@@ -208,6 +257,23 @@ private:
     u64 losses{};
     /// The worker starts on the first loss of a stream that stands in.
     std::jthread worker;
+
+    /// A backend found stalled, unpublished, for the worker to destroy. Guarded by state_mutex.
+    void* stalled_backend{};
+    /// Destroys the stalled backend; `retired` once it has.
+    std::jthread retiring;
+    std::atomic<bool> retired{true};
+    /// Callbacks of the published backend playing the stream, so that a stalled one's last
+    /// callback has ended before the stand-in plays it.
+    std::atomic<u32> rendering{};
+    /// The published backend asked for audio since it was published or started, first at
+    /// `first_ask` (steady clock, nanoseconds).
+    std::atomic<bool> backend_asked{};
+    std::atomic<s64> first_ask{};
+    /// See StallThreshold.
+    std::atomic<u32> stall_level{};
+    /// Found stalled past the last doubling and left to start, until its first request.
+    std::atomic<bool> left_to_start{};
 
     /// Worker only: the block it plays, and when the next one is due.
     std::vector<s16> stand_in_block;
