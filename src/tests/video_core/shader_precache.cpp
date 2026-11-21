@@ -257,6 +257,44 @@ TEST_CASE("ShaderPrecache: progress carries over only to the same file and drive
     REQUIRE(ShaderWarm::ReadWarmProgress(warm, *rebuilt).empty());
 }
 
+TEST_CASE("ShaderPrecache: a finished precache is marked done only once a save holds its builds",
+          "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    WriteBytes(warm, "precache file contents");
+    const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 4795, 10401, 0x1B02020A, 54, 7);
+    REQUIRE(stamp.has_value());
+    const std::unordered_set<u64> built{0x1, 0x2};
+    REQUIRE(ShaderWarm::WriteWarmProgress(warm, *stamp, built));
+
+    // Where Lichii saves the Vulkan pipeline cache, the record waits for the save after the
+    // precache: one that fails never runs it, and the marker is not written.
+    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(true, true) ==
+            ShaderWarm::WarmRecordCommit::AfterSave);
+    const auto record = ShaderWarm::FinishedWarmRecord(warm, stamp);
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+    REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp) == built);
+
+    // The save worked: the precache is done, and its progress goes.
+    record();
+    const auto marker = ShaderWarm::ReadWarmMarker(warm);
+    REQUIRE(marker.has_value());
+    REQUIRE(marker->Matches(*stamp));
+    REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp).empty());
+
+    // The driver's own cache holds the builds, or nothing was built and no save follows: now.
+    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(false, true) == ShaderWarm::WarmRecordCommit::Now);
+    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(true, false) == ShaderWarm::WarmRecordCommit::Now);
+    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(false, false) == ShaderWarm::WarmRecordCommit::Now);
+
+    // A precache whose stamp could not be taken only drops its progress.
+    REQUIRE(std::filesystem::remove(ShaderWarm::WarmMarkerPath(warm)));
+    REQUIRE(ShaderWarm::WriteWarmProgress(warm, *stamp, built));
+    ShaderWarm::FinishedWarmRecord(warm, std::nullopt)();
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+    REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp).empty());
+}
+
 TEST_CASE("ShaderPrecache: a BNSH file gives each stage's code and control", "[video_core]") {
     const auto bnsh = SyntheticBnsh();
     std::vector<ShaderWarm::ProgramStage> stages;

@@ -402,6 +402,17 @@ fs::path WarmProgressPath(const fs::path& warm_file) {
     return progress;
 }
 
+std::function<void()> FinishedWarmRecord(const fs::path& warm_file,
+                                         std::optional<WarmStamp> stamp) {
+    return [warm_file, stamp] {
+        if (stamp) {
+            WriteWarmMarker(warm_file, *stamp);
+        }
+        std::error_code ignored;
+        fs::remove(WarmProgressPath(warm_file), ignored);
+    };
+}
+
 std::unordered_set<u64> ReadWarmProgress(const fs::path& warm_file, const WarmStamp& current) {
     std::ifstream in(WarmProgressPath(warm_file));
     WarmStamp stamp;

@@ -101,6 +101,25 @@ std::unordered_set<u64> ReadWarmProgress(const std::filesystem::path& warm_file,
 bool WriteWarmProgress(const std::filesystem::path& warm_file, const WarmStamp& stamp,
                        const std::unordered_set<u64>& built);
 
+/// When what a precache recorded is written: its marker, when it finished, or the builds of one
+/// that was skipped. Both vouch for builds held by a pipeline cache. Where that is the Vulkan
+/// pipeline cache Lichii saves (`lichii_saves_cache`), only once the save that follows the
+/// precache (`save_follows`) worked: written before it, a failed save or an app that ended
+/// before its next save left a marker saying "done" for a cache without those builds, and the
+/// precache built nothing at the next boot. Now where the driver keeps its own cache, or when no
+/// save follows (nothing was built, so what is recorded is in the cache already).
+enum class WarmRecordCommit { Now, AfterSave };
+[[nodiscard]] constexpr WarmRecordCommit WhenToCommitWarmRecord(bool lichii_saves_cache,
+                                                                bool save_follows) {
+    return lichii_saves_cache && save_follows ? WarmRecordCommit::AfterSave
+                                              : WarmRecordCommit::Now;
+}
+
+/// The record of a precache that finished: writes the marker of `stamp`, when there is one, and
+/// removes the progress, whose builds it now vouches for.
+[[nodiscard]] std::function<void()> FinishedWarmRecord(const std::filesystem::path& warm_file,
+                                                       std::optional<WarmStamp> stamp);
+
 /// "Precompile All Shaders" of one game (same folder, extension .requested): the game's precache
 /// runs before it starts whatever precache_shaders says, and the boot builds every pipeline the
 /// title's cache recorded (as build_all_cached_shaders does).

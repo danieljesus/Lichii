@@ -2222,13 +2222,13 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
         batch.Wait();
     }
     const size_t total_built = static_cast<size_t>(std::count(built.begin(), built.end(), u8{1}));
+    // What this precache records (the marker of a finished one, the builds of a skipped one) is
+    // committed once the save below worked, where that save is what holds the builds.
+    const bool save_follows = !stop_loading.stop_requested() && total_built != 0;
+    std::function<void()> commit_record;
     if (compute_pending && !skipped) {
-        if (const auto stamp_done = stamp(file_entries)) {
-            ShaderWarm::WriteWarmMarker(warm_file, *stamp_done);
-        }
-        std::filesystem::remove(ShaderWarm::WarmProgressPath(warm_file), ec);
+        commit_record = ShaderWarm::FinishedWarmRecord(warm_file, stamp(file_entries));
     }
-    std::function<void()> commit_progress;
     if (compute_pending && skipped && current && persisted && total_built != 0 &&
         !stop_loading.stop_requested()) {
         // A closed load saves no Vulkan pipeline cache below.
@@ -2237,18 +2237,19 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                 built_before.insert(job_keys[index]);
             }
         }
-        commit_progress = [warm_file, at = *current, keys = std::move(built_before)] {
+        commit_record = [warm_file, at = *current, keys = std::move(built_before)] {
             ShaderWarm::WriteWarmProgress(warm_file, at, keys);
         };
-        if (!vulkan_cache) {
-            commit_progress();
-            commit_progress = {};
-        }
     }
-    if (!stop_loading.stop_requested() && total_built != 0) {
+    if (commit_record && ShaderWarm::WhenToCommitWarmRecord(vulkan_cache, save_follows) ==
+                             ShaderWarm::WarmRecordCommit::Now) {
+        commit_record();
+        commit_record = {};
+    }
+    if (save_follows) {
         // Without this, the builds reach the file only at the next boot, game change or clean
         // close, and are lost if the app ends otherwise.
-        QueueVulkanPipelineCacheSave(std::move(commit_progress));
+        QueueVulkanPipelineCacheSave(std::move(commit_record));
     }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
