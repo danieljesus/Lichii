@@ -5,6 +5,7 @@
 
 #include <cstring>
 
+#include "common/logging.h"
 #include "common/string_util.h"
 #include "core/file_sys/kernel_executable.h"
 #include "core/file_sys/vfs/vfs_offset.h"
@@ -304,17 +305,24 @@ INI::INI(const VirtualFile& file) : status(Loader::ResultStatus::Success) {
         return;
     }
 
-    // The KIPs follow the header back to back. A KIP that does not parse gives no reliable size,
-    // so the ones after it cannot be found.
+    // The KIPs follow the header back to back. A KIP whose header or stored sections the file
+    // does not hold gives no reliable size, so the ones after it cannot be found. One that is
+    // whole but rejected (a layout the kernel would refuse, a section that does not decompress)
+    // is skipped: stopping there lost every KIP after it, FS and spl among them.
     u64 offset = sizeof(INIHeader);
     for (std::size_t i = 0; i < header.kip_count && offset < file->GetSize(); ++i) {
         const auto kip_file =
             std::make_shared<OffsetVfsFile>(file, file->GetSize() - offset, offset);
         KIP kip(kip_file);
-        if (kip.GetStatus() != Loader::ResultStatus::Success) {
+        if (!kip.IsSizeKnown()) {
             break;
         }
         offset += kip.GetSize();
+        if (kip.GetStatus() != Loader::ResultStatus::Success) {
+            LOG_WARNING(Loader, "INI1: KIP {} ({}) skipped: {}", i, kip.GetName(),
+                        Loader::GetResultStatusString(kip.GetStatus()));
+            continue;
+        }
         kips.push_back(std::move(kip));
     }
 }

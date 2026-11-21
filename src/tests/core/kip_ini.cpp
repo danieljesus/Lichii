@@ -74,3 +74,17 @@ TEST_CASE("INI1 stops at the end of the file when it counts more KIPs", "[core][
     REQUIRE(ini.GetKIPs().size() == 1);
     CHECK(ini.GetKIPs()[0].GetName() == "FS");
 }
+
+TEST_CASE("INI1 steps over a whole KIP it rejects and reads the ones after it", "[core][file_sys]") {
+    // A layout the kernel would refuse (.rodata off a page), with its header and text intact.
+    auto rejected = MakeKip("bad", "rejected");
+    Put32(rejected, 0x30, 0x1004);
+    const INI ini{MakeIni({rejected, MakeKip("FS", "fs text"), MakeKip("spl", "spl text")})};
+    REQUIRE(ini.GetStatus() == Loader::ResultStatus::Success);
+    const auto& kips = ini.GetKIPs();
+    // The walk used to stop at the rejected one, losing FS and spl.
+    REQUIRE(kips.size() == 2);
+    CHECK(kips[0].GetName() == "FS");
+    CHECK(Text(kips[0]) == "fs text");
+    CHECK(kips[1].GetName() == "spl");
+}
