@@ -209,6 +209,45 @@ public:
     }
 };
 
+/// The game's state for a record, as a draw asks it: the record's own program, constant buffer
+/// and texture answers, with one texture's type changed when asked.
+class LiveTestEnvironment final : public VideoCommon::GenericEnvironment {
+public:
+    LiveTestEnvironment(Shader::Stage shader_stage, std::span<const u64> lowered_code,
+                        u32 texture_bound_) {
+        stage = shader_stage;
+        code.assign(lowered_code.begin(), lowered_code.end());
+        cached_lowest = 0;
+        cached_highest = static_cast<u32>((code.size() - 1) * sizeof(u64));
+        texture_bound = texture_bound_;
+    }
+    std::map<u64, u32> cbuf;
+    std::map<u32, Shader::TextureType> types;
+    std::map<u32, Shader::TexturePixelFormat> formats;
+
+    u32 ReadCbufValue(u32 index, u32 offset) override {
+        const auto it = cbuf.find((u64{index} << 32) | offset);
+        return it != cbuf.end() ? it->second : 0;
+    }
+    Shader::TextureType ReadTextureType(u32 handle) override {
+        const auto it = types.find(handle);
+        return it != types.end() ? it->second : Shader::TextureType::Color2D;
+    }
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
+        const auto it = formats.find(handle);
+        return it != formats.end() ? it->second : Shader::TexturePixelFormat{};
+    }
+    bool IsTexturePixelFormatInteger(u32) override {
+        return false;
+    }
+    u32 ReadViewportTransformState() override {
+        return 1;
+    }
+    std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
+        return std::nullopt;
+    }
+};
+
 Vulkan::GraphicsPipelineCacheKey TestGraphicsKey(u64 shader, u32 driver_version) {
     Vulkan::GraphicsPipelineCacheKey key{};
     key.unique_hashes[4] = shader;
@@ -1247,4 +1286,58 @@ TEST_CASE("Shader cache v2: used pipelines follow the graphics records a relink 
             {RecordKind::Used, 102, V2::EncodeUsed({.session_time = 30, .pipelines = {2, 5, 9}})},
             {RecordKind::Used, 101, V2::EncodeUsed({.session_time = 20, .pipelines = {9}})}});
     REQUIRE(Vulkan::RelinkUsedPipelines(parsed.live, {}, 2, used).empty());
+}
+
+TEST_CASE("Precompiled records keep header-offset classifications for the draw to check",
+          "[shader_cache_v2][texture_header_records]") {
+    const u64 saved_program_id = Settings::GetCurrentProgramID();
+    SCOPE_EXIT { Settings::SetCurrentProgramID(saved_program_id); };
+    // A native program of a title other than Switch Sports, recorded without the rule's marker,
+    // as every precompiled file's oracle records are.
+    Settings::SetCurrentProgramID(0x0400486024DEC000ULL);
+    const auto program = LowerTestProgram(std::array{EXIT}, false, 0);
+    constexpr u64 marker_key = (u64{~u32{0}} << 32) | 2;
+    constexpr u32 marker_value = 1;
+    std::string marker(sizeof(marker_key) + sizeof(marker_value), '\0');
+    std::memcpy(marker.data(), &marker_key, sizeof(marker_key));
+    std::memcpy(marker.data() + sizeof(marker_key), &marker_value, sizeof(marker_value));
+    NativeTestEnvironment source{Shader::Stage::Fragment, program.lowered_code, 2};
+    source.SetTextureInfo(0xbe000, Shader::TextureType::Color3D,
+                          Shader::TexturePixelFormat::R16_FLOAT);
+    std::ostringstream serialized(std::ios::binary);
+    source.Serialize(serialized, ReadProperties);
+    std::string bytes = serialized.str();
+    const size_t at = bytes.find(marker);
+    REQUIRE(at != std::string::npos);
+    bytes.erase(at, marker.size());
+    u64 count{};
+    std::memcpy(&count, bytes.data() + 3 * sizeof(u64), sizeof(count));
+    --count;
+    std::memcpy(bytes.data() + 3 * sizeof(u64), &count, sizeof(count));
+    const auto read = [&](VideoCommon::FileEnvironment::RecordSource source_kind) {
+        auto env = std::make_unique<VideoCommon::FileEnvironment>();
+        std::istringstream file(bytes, std::ios::binary);
+        env->Deserialize(file, std::streampos{static_cast<std::streamoff>(bytes.size())},
+                         source_kind);
+        return env;
+    };
+
+    // Played, the classification is dropped, as #2384 does, so the game records it again.
+    auto played = read(VideoCommon::FileEnvironment::RecordSource::Played);
+    REQUIRE_THROWS_AS(played->ReadTextureType(0xbe000), Shader::LogicError);
+
+    // Precompiled, it is kept: the preparation can translate the record, and a draw checks the
+    // classification against the game's state before it uses what was prepared.
+    auto precompiled = read(VideoCommon::FileEnvironment::RecordSource::Precompiled);
+    REQUIRE(precompiled->ReadTextureType(0xbe000) == Shader::TextureType::Color3D);
+    REQUIRE_FALSE(precompiled->LacksRecordedValue(ReadProperties));
+    LiveTestEnvironment live{Shader::Stage::Fragment, program.lowered_code, 2};
+    live.cbuf.emplace((u64{1} << 32) | 16, 0x1357);
+    live.formats.emplace(0xbe000, Shader::TexturePixelFormat::R16_FLOAT);
+    const char* why = "";
+    live.types[0xbe000] = Shader::TextureType::Color3D;
+    CHECK(precompiled->AnswersHoldFor(live, &why));
+    live.types[0xbe000] = Shader::TextureType::Color2D;
+    CHECK_FALSE(precompiled->AnswersHoldFor(live, &why));
+    CHECK(std::string_view{why} == "texture type");
 }
