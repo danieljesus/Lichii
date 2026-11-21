@@ -6,6 +6,10 @@
 #include <memory>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif
+
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/common_funcs.h"
@@ -138,3 +142,85 @@ TEST_CASE("NSO rejects segments that end past a 32-bit image", "[core][loader]")
                                      {0x2000, 0x10, 0x10}}}))
                     .has_value());
 }
+
+namespace {
+
+// The bytes of an NSO with three stored segments, whose stored sizes the test may change after.
+std::vector<u8> StoredNsoBytes(const std::array<Segment, 3>& segments) {
+    const auto file = MakeStoredNso(segments);
+    return file->ReadAllBytes();
+}
+
+FileSys::VirtualFile AsFile(std::vector<u8> bytes) {
+    return std::make_shared<FileSys::VectorVfsFile>(std::move(bytes), "main");
+}
+
+} // Anonymous namespace
+
+TEST_CASE("NSO loads raw, empty and .bss segments", "[core][loader]") {
+    SECTION("raw") {
+        CHECK(Load(MakeStoredNso({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10}, {0x2000, 0x10, 0x10}}}))
+                  .has_value());
+    }
+    SECTION("an empty segment") {
+        CHECK(Load(MakeStoredNso({{{0, 0x10, 0x10}, {0x1000, 0, 0}, {0x2000, 0x10, 0x10}}}))
+                  .has_value());
+    }
+    SECTION(".bss after .data") {
+        auto bytes = StoredNsoBytes({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10}, {0x2000, 0x10, 0x10}}});
+        Put32(bytes, 0x3C, 0x4000);
+        const auto end = Load(AsFile(std::move(bytes)));
+        REQUIRE(end.has_value());
+        CHECK(*end - 0x8000000 >= 0x2010 + 0x4000);
+    }
+}
+
+TEST_CASE("NSO rejects a segment past the end of the file", "[core][loader]") {
+    // Its stored size runs past the file's end, by a little and by far.
+    for (const u32 stored : {0x11u, 0x7FFFFFFFu}) {
+        auto bytes = StoredNsoBytes({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10}, {0x2000, 0x10, 0x10}}});
+        Put32(bytes, 0x68, stored);
+        CHECK_FALSE(Load(AsFile(std::move(bytes))).has_value());
+    }
+}
+
+TEST_CASE("NSO rejects an LZ4 segment larger than its compressed bytes can fill",
+          "[core][loader]") {
+    // LZ4 makes at most 255 bytes of each byte it reads.
+    const std::vector<u8> text{0x80, 'N', 'S', 'O', 't', 'e', 'x', 't', '!'};
+    CHECK_FALSE(Load(MakeNso(text, 255 * 9 + 1)).has_value());
+}
+
+TEST_CASE("NSO rejects an image no process can hold", "[core][loader]") {
+    // Inside a 32-bit image, but past the largest pool of the 4 GiB layout the tests use. This one
+    // used to load, allocating its whole image.
+    CHECK_FALSE(Load(MakeStoredNso({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10},
+                                     {0xF0000000, 0x10, 0x10}}}))
+                    .has_value());
+}
+
+#if !defined(_WIN32)
+TEST_CASE("NSO allocates nothing for segments its file cannot hold", "[core][loader]") {
+    // Stored sizes far past a file of a few hundred bytes, which the loader used to allocate
+    // buffers for, and fill, before reading the file: refused without the process's memory
+    // growing by anything like them.
+    auto bytes = StoredNsoBytes({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10}, {0x2000, 0x10, 0x10}}});
+    for (std::size_t i = 0; i < 3; ++i) {
+        Put32(bytes, 0x60 + i * 4, 0x60000000);
+        Put32(bytes, 0x18 + i * 0x10, 0x60000000);
+        Put32(bytes, 0x14 + i * 0x10, static_cast<u32>(i) * 0x10);
+    }
+    const auto peak = [] {
+        rusage usage{};
+        getrusage(RUSAGE_SELF, &usage);
+#if defined(__APPLE__)
+        return static_cast<u64>(usage.ru_maxrss); // bytes
+#else
+        return static_cast<u64>(usage.ru_maxrss) * 1024; // KiB
+#endif
+    };
+    const u64 before = peak();
+    CHECK_FALSE(Load(AsFile(std::move(bytes))).has_value());
+    CHECK(peak() - before < u64{256} << 20);
+}
+#endif

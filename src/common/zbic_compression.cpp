@@ -42,6 +42,14 @@ bool IsZBIC(std::span<const u8> src) {
     return magic == ZSTD_MAGICNUMBER; // 0x4349425A ("ZBIC")
 }
 
+u64 DecompressBoundZBIC(std::span<const u8> src) {
+    if (src.empty()) {
+        return 0;
+    }
+    const unsigned long long bound = ZSTD_decompressBound(src.data(), src.size());
+    return bound == ZSTD_CONTENTSIZE_ERROR ? 0 : bound;
+}
+
 int DecompressDataZBIC(std::span<u8> dst, std::span<const u8> src) {
     if (dst.empty() || src.empty()) {
         return -1;
