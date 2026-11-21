@@ -3446,6 +3446,12 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
     if (precompiled_compute_records.empty() || !PrecompiledFastPath()) {
         return {};
     }
+    // The normal path refuses every compute pipeline on a driver with broken compute; a record
+    // kept while compute pipelines were allowed must not be built there either.
+    if (device.HasBrokenCompute()) {
+        CountPrecompiledReason("the device reports broken compute");
+        return {};
+    }
     const u64 hash = key.Hash();
     if (precompiled_rejected.contains(hash)) {
         return {};
