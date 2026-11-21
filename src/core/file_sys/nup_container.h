@@ -114,8 +114,11 @@ public:
     VirtualDir GetPackageDir(std::size_t package_index);
     VirtualDir GetPackageSubdirectory(std::size_t package_index, std::string_view path);
 
-    /// Hashes every member file against its stored SHA-256, a chunk at a time; progress is in
-    /// bytes of the members' recorded sizes.
+    /// Hashes every member file against its stored SHA-256, decoding compressed ones as a stream
+    /// from their extents. Progress is in bytes of the members' recorded sizes (a stored one's
+    /// no larger than its extent), reported when it has moved by 4 MiB and at each member's end,
+    /// never with a total of zero; the callback is also the cancel, so it is polled at least once
+    /// per 4 MiB of member data plus one 1 MiB read of an extent.
     Loader::ResultStatus VerifyIntegrity(
         std::function<bool(std::size_t, std::size_t)> progress_callback) const;
 
