@@ -1,10 +1,15 @@
 {
-  "summary": "A third GPU thread, better Switch 2 Edition support, and game fixes.",
+  "summary": "Sound that survives a headset switch, a faster Apple Silicon path, and safer file loading.",
   "changes": [
     {
+      "icon": "audio",
+      "title": "Sound comes back by itself",
+      "body": "When the output device is removed and returns (a USB headset moved to another computer, for example), the sound resumes after a few seconds, and closing the game no longer stalls."
+    },
+    {
       "icon": "cpu",
-      "title": "A third GPU thread",
-      "body": "Eligible Switch 2 Vulkan draws use a third recording thread."
+      "title": "Faster on Apple Silicon",
+      "body": "Tensor operations run on the GPU's cooperative matrices, with a MoltenVK built for it. Kokiri Forest on an M6 goes from about 30 to about 34 FPS."
     },
     {
       "icon": "clock",
@@ -12,29 +17,24 @@
       "body": "FPS Unlock fixes Epona's fence jump, the day/night clock and the Deku Tree webs. The game no longer freezes after closing the R1 menu."
     },
     {
+      "icon": "download",
+      "title": "Shaders",
+      "body": "Precompile All Shaders can be turned on for a game from its right-click menu. A shader cache from an earlier build keeps working; a few shaders are built again the first time the game draws them."
+    },
+    {
       "icon": "apps",
       "title": "Switch 2 games in HOME and better Edition support",
       "body": "Launch games from HOME without installing them. Lichii better detects and launches Switch 2 Editions, applies matching upgrade packs, and keeps update information in NUPs."
     },
     {
-      "icon": "download",
-      "title": "Precompile All Shaders",
-      "body": "Turn it on for individual games in their right-click menu. Precompilation can now find compute shaders in asset packs such as Kirby Air Riders' packs."
-    },
-    {
       "icon": "bug",
-      "title": "Xenoblade DE and Yoshi fixes",
-      "body": "Fixes Xenoblade DE's title-screen textures and docked/handheld crash. Yoshi no longer crashes when Vulkan rejects a texture-buffer view."
-    },
-    {
-      "icon": "globe",
-      "title": "Multiplayer room connections",
-      "body": "The room proxy keeps the right player address and port and drops packets left over from earlier connections."
+      "title": "Damaged files",
+      "body": "KIP, NRO and NSO files are checked before they are loaded, and verifying a damaged NCA or NUP no longer hangs or runs out of memory."
     },
     {
       "icon": "sparkles",
-      "title": "What's New in Lichii",
-      "body": "See the highlights after an update or reopen them anytime from Help, even offline."
+      "title": "About this build",
+      "body": "This is a build of the zelda branch of danieljesus/Lichii, not an official Lichii release. Reopen these notes anytime from Help, even offline."
     }
   ]
 }
