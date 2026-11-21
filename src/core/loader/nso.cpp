@@ -115,21 +115,22 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             return std::nullopt;
         }
     }
-    // The whole image, the argument block and .bss included, is sized and aligned in u32 below:
-    // check its extent in 64 bits before allocating, so a segment near the top of the address
-    // space can neither wrap that arithmetic nor ask for gigabytes.
     // One copy, taken once: the setting can be assigned from the UI thread while this runs, and
     // the block is sized from the same bytes it is filled with.
     const std::string arg_data = Settings::values.program_args.GetValue();
-    const bool pass_arguments = should_pass_arguments && !arg_data.empty();
     // Sized as the console's loader sizes it, which also refuses longer arguments: the block,
     // its header included, then always holds them, and libnx has the room it needs after them
-    // to split them into argv.
-    if (pass_arguments && arg_data.size() >= NSO_ARGUMENT_BUFFER_SIZE) {
-        LOG_ERROR(Loader, "{}: program arguments are {:#x} bytes, the console accepts less than {:#x}",
+    // to split them into argv. Longer arguments are left out rather than cut, which could fall
+    // inside one and change what the program gets: it starts with an empty argv. The setting
+    // applies to every title, so refusing to load would make each one fail.
+    const bool arguments_fit = arg_data.size() < NSO_ARGUMENT_BUFFER_SIZE;
+    if (should_pass_arguments && !arguments_fit) {
+        LOG_ERROR(Loader,
+                  "{}: starting without its program arguments: they are {:#x} bytes, the console "
+                  "accepts less than {:#x}",
                   nso_file.GetName(), arg_data.size(), NSO_ARGUMENT_BUFFER_SIZE);
-        return std::nullopt;
     }
+    const bool pass_arguments = should_pass_arguments && !arg_data.empty() && arguments_fit;
     const u32 argument_block_size =
         pass_arguments
             ? static_cast<u32>(Common::AlignUp(2 * sizeof(u32) + 2 * arg_data.size() +
@@ -150,6 +151,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 #endif
         return 0;
     }();
+    // The whole image, the argument block and .bss included, is sized and aligned in u32 below:
+    // check its extent in 64 bits before allocating, so a segment near the top of the address
+    // space can neither wrap that arithmetic nor ask for gigabytes.
     const u64 aligned_extent =
         (u64{module_start} + segments_end + argument_block_size +
          nso_header.segments[2].bss_size + Core::Memory::LICHII_PAGEMASK) &
