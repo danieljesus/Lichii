@@ -108,14 +108,6 @@ class Scheduler;
 
 using VideoCommon::ShaderInfo;
 
-/// Reads a driver pipeline cache's data whole through `read` (vkGetPipelineCacheData). Pipelines
-/// may build into the cache between asking for its size and reading it; the size is then stale,
-/// and the driver returns VK_INCOMPLETE with part of the data, or none of it (MoltenVK). The size
-/// is asked for again each time, up to `attempts` reads. Empty when no read got all of it, or a
-/// call failed.
-std::optional<std::vector<char>> ReadPipelineCacheData(
-    const std::function<VkResult(size_t* size, void* data)>& read, int attempts = 4);
-
 using VideoCommon::ShaderPools;
 
 struct ComputePipelineCacheEntry {
@@ -262,9 +254,11 @@ private:
     /// Cancels the v2 prebuild and waits for its running stages
     void StopBackgroundJobs();
 
-    /// Returns true when the file was written and replaced the previous one.
-    bool SerializeVulkanPipelineCache(const std::filesystem::path& filename,
-                                      const vk::PipelineCache& pipeline_cache, u32 cache_version);
+    /// Returns the bytes of driver data written when the file was written and replaced the
+    /// previous one.
+    std::optional<size_t> SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+                                                       const vk::PipelineCache& pipeline_cache,
+                                                       u32 cache_version);
 
     /// Sets vulkan_pipeline_cache_restored when the file's contents were read back.
     vk::PipelineCache LoadVulkanPipelineCache(const std::filesystem::path& filename,
@@ -380,7 +374,8 @@ private:
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
     size_t pipelines_since_flush{};
-    std::chrono::steady_clock::time_point last_flush{};
+    /// When a save last succeeded; written by the serialization thread
+    std::atomic<std::chrono::steady_clock::time_point> last_flush{};
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
 
