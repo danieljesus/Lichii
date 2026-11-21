@@ -55,12 +55,20 @@ TEST_CASE("Driver pipeline cache data from another driver build is another drive
     CHECK(Origin(Data(0x10DE, DeviceId, Uuid)) == PipelineCacheDataOrigin::OtherDriver);
 }
 
-TEST_CASE("Driver pipeline cache data without a header Lichii reads is left to the driver",
+TEST_CASE("Driver pipeline cache data shorter than its header holds nothing",
           "[video_core][vulkan_pipeline_cache]") {
-    CHECK(Origin({}) == PipelineCacheDataOrigin::Unknown);
-    auto data = Data(Vendor, DeviceId, Uuid);
+    // A file of Lichii's header alone, as a save that read nothing from the driver left it.
+    CHECK(Origin({}) == PipelineCacheDataOrigin::NoData);
+    const auto data = Data(Vendor, DeviceId, Uuid);
     CHECK(Origin(std::vector<char>(data.begin(), data.begin() + 31)) ==
-          PipelineCacheDataOrigin::Unknown);
+          PipelineCacheDataOrigin::NoData);
+    CHECK(Origin(std::vector<char>(data.begin(), data.begin() + 32)) ==
+          PipelineCacheDataOrigin::ThisDriver);
+}
+
+TEST_CASE("Driver pipeline cache data with a header of another version is left to the driver",
+          "[video_core][vulkan_pipeline_cache]") {
+    auto data = Data(Vendor, DeviceId, Uuid);
     auto other_version = data;
     const u32 version = 2;
     std::memcpy(other_version.data() + 4, &version, sizeof(version));

@@ -3851,7 +3851,7 @@ PipelineCacheDataOrigin PipelineCacheDataMadeBy(std::span<const char> data, u32 
     // Its fields are little endian whatever the host, as every host Lichii runs on is.
     VkPipelineCacheHeaderVersionOne header;
     if (data.size() < sizeof(header)) {
-        return PipelineCacheDataOrigin::Unknown;
+        return PipelineCacheDataOrigin::NoData;
     }
     std::memcpy(&header, data.data(), sizeof(header));
     if (header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
@@ -3920,14 +3920,22 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
 
         // The driver would accept data another driver version made and silently start empty;
         // the cache is not restored then, so the precache progress that relied on it goes too.
+        // Nor is it from a file with no driver data, which a save that read none used to leave.
         // The file is replaced at the next save.
-        if (PipelineCacheDataMadeBy(cache_data, device.GetVendorID(), device.GetDeviceID(),
-                                    device.GetPipelineCacheUUID()) ==
-            PipelineCacheDataOrigin::OtherDriver) {
+        switch (PipelineCacheDataMadeBy(cache_data, device.GetVendorID(), device.GetDeviceID(),
+                                        device.GetPipelineCacheUUID())) {
+        case PipelineCacheDataOrigin::OtherDriver:
             LOG_INFO(Render_Vulkan,
                      "Vulkan driver pipeline cache discarded: made by another driver version: {}",
                      Common::FS::PathToUTF8String(filename));
             return create_pipeline_cache(0, nullptr);
+        case PipelineCacheDataOrigin::NoData:
+            LOG_INFO(Render_Vulkan, "Vulkan driver pipeline cache holds no driver data: {}",
+                     Common::FS::PathToUTF8String(filename));
+            return create_pipeline_cache(0, nullptr);
+        case PipelineCacheDataOrigin::ThisDriver:
+        case PipelineCacheDataOrigin::Unknown:
+            break;
         }
 
         LOG_INFO(Render_Vulkan,
