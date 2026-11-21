@@ -132,7 +132,13 @@ KIP::KIP(const VirtualFile& file) : status(Loader::ResultStatus::Success) {
             if (i >= 3) {
                 continue;
             }
-            decompressed_sections[i] = std::vector<u8>(header.sections[i].decompressed_size);
+            // .text, .rodata and .data come from the file: stored raw they hold their whole size,
+            // and BLZ never compresses to nothing (a stream ends in a 12-byte footer). None stored
+            // with a size in memory is a damaged header, and that size is the file's: allocating
+            // it made a .kip whose .text claimed 0xABABAB94 bytes cost 2.9 GB, or throw
+            // std::bad_alloc, as soon as the game list read it.
+            status = Loader::ResultStatus::ErrorBadKIPHeader;
+            return;
         } else if (header.sections[i].compressed_size == header.sections[i].decompressed_size) {
             decompressed_sections[i] = std::move(compressed);
         } else {
