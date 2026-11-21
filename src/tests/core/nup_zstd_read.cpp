@@ -433,7 +433,10 @@ TEST_CASE("Verifying a NUP hashes its members as it reads them", "[nup][nup-read
         {Zstd(exact), exact.size(), 1, {}, Sha256(exact)},
         {Zstd(longer), longer.size(), 1, {}, Sha256(longer)},
     };
-    const std::size_t total = exact.size() * 2 + longer.size() * 2;
+    std::size_t total = 0;
+    for (const auto& member : members) {
+        total += member.extent.size();
+    }
     TempDir t;
     for (const std::size_t cap : {std::size_t{64} << 20, std::size_t{64} << 10}) {
         CAPTURE(cap);
@@ -444,13 +447,11 @@ TEST_CASE("Verifying a NUP hashes its members as it reads them", "[nup][nup-read
             reports.emplace_back(done, all);
             return true;
         }) == Loader::ResultStatus::Success);
-        // In bytes, at least 4 MiB apart except at a member's end, never twice the same, ending at
-        // the total: once at each member's end, and inside the stored 5 MiB one.
+        // In extent bytes, out of the extents' total, never going back, ending at the total: at
+        // least once at each member's end and inside the stored 5 MiB one.
         REQUIRE(reports.size() >= members.size() + 1);
-        REQUIRE(reports.size() <= members.size() + total / (4 << 20));
-        REQUIRE(std::ranges::adjacent_find(reports, [](const auto& a, const auto& b) {
-                    return a.first >= b.first;
-                }) == reports.end());
+        REQUIRE(std::ranges::is_sorted(reports));
+        REQUIRE(std::ranges::all_of(reports, [&](const auto& r) { return r.second == total; }));
         REQUIRE(reports.back() == std::pair{total, total});
 
         // A cancel stops it at the report it answered.
@@ -518,49 +519,75 @@ TEST_CASE("Verifying a NUP checks a compressed member's frames against its size"
     CHECK(verify(longer) == Loader::ResultStatus::ErrorIntegrityVerificationFailed);
 }
 
-TEST_CASE("Verifying a NUP refuses a frame with a window above zstd's default limit",
+TEST_CASE("Verifying a NUP accepts a frame with a large window exactly when reading does",
           "[nup][nup-read]") {
-    // Verification keeps zstd's default window limit (128 MiB), so a frame that declares a
-    // 256 MiB window and no content size fails here rather than having that window allocated,
-    // although the cache's in-memory reader (which needs no window) would read such a small
-    // member. The writer never makes one: it records content sizes and keeps default windows.
-    const auto content = Content(64 * 1024, 14);
-    std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> cctx{ZSTD_createCCtx(), &ZSTD_freeCCtx};
-    REQUIRE(cctx);
-    REQUIRE(!ZSTD_isError(ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_windowLog, 28)));
-    REQUIRE(!ZSTD_isError(ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_contentSizeFlag, 0)));
-    std::vector<u8> frame(ZSTD_compressBound(content.size()) + 64);
-    ZSTD_outBuffer out{frame.data(), frame.size(), 0};
-    ZSTD_inBuffer in{content.data(), content.size(), 0};
-    // Fed in a call of its own, so the encoder does not learn the size and keep a small window.
-    REQUIRE(!ZSTD_isError(ZSTD_compressStream2(cctx.get(), &out, &in, ZSTD_e_continue)));
-    REQUIRE(in.pos == in.size);
-    ZSTD_inBuffer none{nullptr, 0, 0};
-    REQUIRE(ZSTD_compressStream2(cctx.get(), &out, &none, ZSTD_e_end) == 0);
-    frame.resize(out.pos);
+    // A frame declaring a 256 MiB window and no content size, made by hand: the stream decoder
+    // refuses it (zstd's default limit is 128 MiB), so verification hashes the member through the
+    // reader, which reads it when it decodes the member in memory and refuses it when it spills.
+    std::vector<u8> content(64 * 1024);
+    std::mt19937 rng{16};
+    std::ranges::generate(content, [&] { return static_cast<u8>(rng()); });
+    std::vector<u8> frame{0x28, 0xB5, 0x2F, 0xFD, // magic
+                          0x00,                   // no content size, not single segment
+                          18 << 3};               // window descriptor: 2^(10 + 18)
+    const u32 block = static_cast<u32>(content.size() << 3) | 1; // last block, raw
+    frame.insert(frame.end(), {static_cast<u8>(block), static_cast<u8>(block >> 8),
+                               static_cast<u8>(block >> 16)});
+    frame.insert(frame.end(), content.begin(), content.end());
     REQUIRE(ZSTD_getFrameContentSize(frame.data(), frame.size()) == ZSTD_CONTENTSIZE_UNKNOWN);
-    // The frame really needs the larger window: a decoder allowed it reads the frame, one at the
-    // default limit refuses it.
-    const auto decodes = [&](int window_log_max) {
+    {
+        // Refused at the frame header by a decoder at the default limit, before any window.
         std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(),
                                                                   &ZSTD_freeDCtx};
-        if (window_log_max != 0) {
-            ZSTD_DCtx_setParameter(dctx.get(), ZSTD_d_windowLogMax, window_log_max);
-        }
-        std::vector<u8> decoded(content.size());
-        ZSTD_outBuffer dst{decoded.data(), decoded.size(), 0};
-        ZSTD_inBuffer src{frame.data(), frame.size(), 0};
-        const std::size_t result = ZSTD_decompressStream(dctx.get(), &dst, &src);
-        return !ZSTD_isError(result) && dst.pos == content.size();
-    };
-    REQUIRE(decodes(28));
-    REQUIRE_FALSE(decodes(0));
-
+        std::vector<u8> scratch(16);
+        ZSTD_outBuffer out{scratch.data(), scratch.size(), 0};
+        ZSTD_inBuffer in{frame.data(), frame.size(), 0};
+        REQUIRE(ZSTD_isError(ZSTD_decompressStream(dctx.get(), &out, &in)));
+    }
+    const Member sound{frame, content.size(), 1, {}, Sha256(content)};
+    Member flipped = sound;
+    flipped.extent[1000] ^= 1;
     TempDir t;
-    NupContainer nup{Backing(BuildNup({{frame, content.size(), 1, {}, Sha256(content)}})),
-                     std::size_t{64} << 20, t.path};
+    // Decoded in memory: read, so verified, and a changed byte is found.
+    {
+        NupContainer nup{Backing(BuildNup({sound})), std::size_t{64} << 20, t.path};
+        REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
+        REQUIRE(ReadMatches(nup.OpenFile(0), content, 0, content.size()));
+        REQUIRE(nup.VerifyIntegrity({}) == Loader::ResultStatus::Success);
+        NupContainer changed{Backing(BuildNup({flipped})), std::size_t{64} << 20, t.path};
+        REQUIRE(changed.VerifyIntegrity({}) ==
+                Loader::ResultStatus::ErrorIntegrityVerificationFailed);
+    }
+    // Spilled: the reader keeps the default limit and refuses it, and so does verification.
+    {
+        NupContainer nup{Backing(BuildNup({sound})), std::size_t{64} << 10, t.path};
+        REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
+        REQUIRE(nup.OpenFile(0)->ReadAllBytes().empty());
+        REQUIRE(nup.VerifyIntegrity({}) == Loader::ResultStatus::ErrorIntegrityVerificationFailed);
+    }
+}
+
+TEST_CASE("Verifying a NUP polls its callback while a small extent decodes to much",
+          "[nup][nup-read]") {
+    // 64 MiB of zeros in a few KiB: one input chunk decodes to far more than the 4 MiB step, and
+    // the callback, which is also the cancel, is called while it does.
+    const std::vector<u8> zeros(64 << 20);
+    const Member member{Zstd(zeros), zeros.size(), 1, {}, Sha256(zeros)};
+    REQUIRE(member.extent.size() < (1 << 20));
+    TempDir t;
+    NupContainer nup{Backing(BuildNup({member})), std::size_t{64} << 20, t.path};
     REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
-    REQUIRE(nup.VerifyIntegrity({}) == Loader::ResultStatus::ErrorIntegrityVerificationFailed);
+    std::size_t calls{};
+    REQUIRE(nup.VerifyIntegrity([&](std::size_t, std::size_t) {
+        ++calls;
+        return true;
+    }) == Loader::ResultStatus::Success);
+    REQUIRE(calls >= (64 << 20) / (4 << 20));
+    // A cancel inside the member stops it there.
+    calls = 0;
+    REQUIRE(nup.VerifyIntegrity([&](std::size_t, std::size_t) { return ++calls < 3; }) ==
+            Loader::ResultStatus::ErrorIntegrityVerificationFailed);
+    REQUIRE(calls == 3);
 }
 
 TEST_CASE("Verifying a NUP with an impossible member size fails without reading it whole",
