@@ -3807,6 +3807,10 @@ std::optional<std::vector<char>> ReadPipelineCacheData(
         if (result != VK_INCOMPLETE) {
             return std::nullopt;
         }
+        LOG_DEBUG(Render_Vulkan,
+                  "Driver pipeline cache changed after its size ({} bytes) was read, read {} of "
+                  "{} got {} bytes",
+                  data.size(), attempt + 1, attempts, size);
     }
     return std::nullopt;
 }
@@ -3874,8 +3878,8 @@ bool PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
         return false;
     }
 
-    LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
-             Common::FS::PathToUTF8String(filename));
+    LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {} ({} bytes of driver data)",
+             Common::FS::PathToUTF8String(filename), cache_size);
     return true;
 }
 
