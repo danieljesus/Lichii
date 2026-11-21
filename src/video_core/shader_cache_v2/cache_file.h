@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <functional>
+#include <istream>
 #include <optional>
 #include <memory>
 #include <span>
@@ -24,6 +25,9 @@ namespace VideoCommon::ShaderCacheV2 {
 struct LogFile {
     std::vector<u8> bytes;
     ParsedLog parsed;
+    /// A strict read returned fewer bytes than the log's size: a read error. Nothing read may then
+    /// decide a rewrite or a removal.
+    bool read_failed{};
 
     LogFile() = default;
     LogFile(LogFile&&) = default;
@@ -32,10 +36,25 @@ struct LogFile {
     LogFile& operator=(const LogFile&) = delete;
 };
 
-/// Reads the whole log without its lock: records are only appended under it, and the reader
-/// ignores one cut off by an append still in progress. A missing file reads as empty. See ParseLog
-/// for `for_each`.
-[[nodiscard]] LogFile ReadLogFile(const std::filesystem::path& file, const ForEach& for_each = {});
+/// How a log is read.
+enum class ReadMode {
+    /// Without the log's lock: another emulator may compact it meanwhile, so fewer bytes than its
+    /// size are a file that shrank, and what was read is parsed.
+    Tolerant,
+    /// With the log's lock held: nothing else changes it, so fewer bytes than its size, or a file
+    /// that is not a regular one, are a read error (LogFile::read_failed).
+    Strict,
+};
+
+/// Reads a log of `size` bytes from `stream`. See ParseLog for `for_each`.
+[[nodiscard]] LogFile ReadLog(std::istream& stream, u64 size, const ForEach& for_each = {},
+                              ReadMode mode = ReadMode::Tolerant);
+
+/// Reads the whole log, by default without its lock: records are only appended under it, and the
+/// reader ignores one cut off by an append still in progress. A missing file reads as empty. See
+/// ParseLog for `for_each`.
+[[nodiscard]] LogFile ReadLogFile(const std::filesystem::path& file, const ForEach& for_each = {},
+                                  ReadMode mode = ReadMode::Tolerant);
 
 /// The payload of the record of `kind` and `key` that a read of the log found at `offset`, read
 /// again from the file the same way. Empty when the file no longer holds it there intact (a
@@ -73,6 +92,11 @@ struct CompactLimit {
 /// process reads it under the lock or writes it.
 [[nodiscard]] WriteResult CompactLog(const std::filesystem::path& file,
                                      const CompactLimit& limit = {});
+
+/// CompactLog's rewrite of `file` from `log`, read whole with the log's lock held, which the
+/// caller holds. A log whose read failed is not rewritten (WriteResult::Failed).
+[[nodiscard]] WriteResult CompactRead(const std::filesystem::path& file, const LogFile& log,
+                                      const CompactLimit& limit);
 
 /// Writes a log that a caller produces record by record, holding the log's lock and a temporary
 /// file from Start until Commit. A log made from a large source therefore costs one record of

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <streambuf>
+#include <istream>
 #include <fstream>
 #include <optional>
 #include <span>
@@ -128,6 +130,36 @@ std::vector<std::pair<u64, u64>> BlobRanges(const std::filesystem::path& file) {
     return ranges;
 }
 
+} // Anonymous namespace
+
+namespace {
+/// A stream over `bytes` that serves only the first `limit` of them, then either ends, as a read
+/// error does in libc++, or fails, as one does in libstdc++ (badbit).
+class CutStream final : public std::streambuf {
+public:
+    CutStream(std::span<const u8> bytes_, size_t limit_, bool fail_)
+        : bytes{bytes_}, limit{limit_}, fail{fail_} {}
+
+protected:
+    int_type underflow() override {
+        if (position >= limit) {
+            if (fail) {
+                throw std::ios_base::failure("read error");
+            }
+            return traits_type::eof();
+        }
+        current = static_cast<char>(bytes[position++]);
+        setg(&current, &current, &current + 1);
+        return traits_type::to_int_type(current);
+    }
+
+private:
+    std::span<const u8> bytes;
+    size_t limit;
+    bool fail;
+    size_t position{};
+    char current{};
+};
 } // Anonymous namespace
 
 TEST_CASE("Shader cache v2 driver blobs: payloads read back as written",
@@ -603,4 +635,39 @@ TEST_CASE("Shader cache v2 driver blobs: a session stores nothing past the ceili
     REQUIRE_FALSE(store.Full());
     REQUIRE(store.Counts().loaded > 0);
     REQUIRE_FALSE(store.Find(RecordKind::GraphicsBinary, 5).has_value());
+}
+
+TEST_CASE("Shader cache v2 driver blobs: a read failing before the identity removes nothing",
+          "[video_core][shader_cache_v2]") {
+    TempDir temp;
+    const auto file = temp.path / V2::DriverFileName;
+    StoreBlobs(file, 5);
+    const std::vector<u8> before = ReadAll(file);
+    const V2::DeviceIdentity identity = TestIdentity();
+    REQUIRE(V2::IdentityCheck(V2::ReadLogFile(file), identity) == V2::DriverBlobDiscard::None);
+    for (const bool fail : {false, true}) {
+        INFO((fail ? "fails" : "ends") << " after the header");
+        const size_t cut = V2::FileHeaderSize + 1;
+        // Read without the lock, a read that ends there gives a log with a header and no identity,
+        // and the store would remove the file: so it reads again with the lock held, where the
+        // same failure is a failed read. (One that fails loses what it read, which reads as no
+        // file at all.)
+        if (!fail) {
+            CutStream tolerant_buffer{before, cut, fail};
+            std::istream tolerant_stream{&tolerant_buffer};
+            const V2::LogFile tolerant = V2::ReadLog(tolerant_stream, before.size());
+            REQUIRE(V2::IdentityCheck(tolerant, identity) == V2::DriverBlobDiscard::NoIdentity);
+        }
+        CutStream strict_buffer{before, cut, fail};
+        std::istream strict_stream{&strict_buffer};
+        const V2::LogFile strict =
+            V2::ReadLog(strict_stream, before.size(), {}, V2::ReadMode::Strict);
+        REQUIRE(strict.read_failed);
+    }
+    // Read whole, the same file keeps its blobs.
+    {
+        V2::DriverBlobStore store{file, identity, {.writer = FastWriter}};
+        REQUIRE(store.Discarded() == V2::DriverBlobDiscard::None);
+        REQUIRE(store.Counts().loaded == 5);
+    }
 }

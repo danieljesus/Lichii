@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <streambuf>
+#include <istream>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -541,6 +543,36 @@ TEST_CASE("Shader cache v2: the last record of a kind and key wins, tombstones r
     REQUIRE(parsed.stats.superseded == 4);
     REQUIRE(parsed.stats.tombstones == 3);
 }
+
+namespace {
+/// A stream over `bytes` that serves only the first `limit` of them, then either ends, as a read
+/// error does in libc++, or fails, as one does in libstdc++ (badbit).
+class CutStream final : public std::streambuf {
+public:
+    CutStream(std::span<const u8> bytes_, size_t limit_, bool fail_)
+        : bytes{bytes_}, limit{limit_}, fail{fail_} {}
+
+protected:
+    int_type underflow() override {
+        if (position >= limit) {
+            if (fail) {
+                throw std::ios_base::failure("read error");
+            }
+            return traits_type::eof();
+        }
+        current = static_cast<char>(bytes[position++]);
+        setg(&current, &current, &current + 1);
+        return traits_type::to_int_type(current);
+    }
+
+private:
+    std::span<const u8> bytes;
+    size_t limit;
+    bool fail;
+    size_t position{};
+    char current{};
+};
+} // Anonymous namespace
 
 TEST_CASE("Shader cache v2: compaction keeps the live records and only them",
           "[video_core][shader_cache_v2]") {
@@ -1248,3 +1280,52 @@ TEST_CASE("Shader cache v2: used pipelines follow the graphics records a relink 
             {RecordKind::Used, 101, V2::EncodeUsed({.session_time = 20, .pipelines = {9}})}});
     REQUIRE(Vulkan::RelinkUsedPipelines(parsed.live, {}, 2, used).empty());
 }
+
+TEST_CASE("Shader cache v2: a log read with the lock that fails partway is not compacted",
+          "[video_core][shader_cache_v2]") {
+    TempDir temp;
+    const auto file = temp.path / "cache.bin";
+    {
+        V2::CacheWriter writer{file};
+        for (u64 i = 0; i < 50; ++i) {
+            writer.Append(RecordKind::Graphics, i, TestPayload(i));
+        }
+        REQUIRE(writer.Drain(5s));
+    }
+    const std::vector<u8> before = ReadAll(file);
+    const size_t live = V2::ReadLogFile(file).parsed.live.size();
+    REQUIRE(live == 50);
+    for (const bool fail : {false, true}) {
+        INFO((fail ? "fails" : "ends") << " halfway");
+        // Read as CompactLog reads it, the lock held, from a stream that stops halfway.
+        CutStream strict_buffer{before, before.size() / 2, fail};
+        std::istream strict_stream{&strict_buffer};
+        const V2::LogFile strict =
+            V2::ReadLog(strict_stream, before.size(), {}, V2::ReadMode::Strict);
+        REQUIRE(strict.read_failed);
+        REQUIRE(V2::CompactRead(file, strict, {}) == V2::WriteResult::Failed);
+        REQUIRE(ReadAll(file) == before);
+        // Read as without the lock, the same stream gives a log that lacks the records after the
+        // failure: compacting that one would have dropped them.
+        CutStream tolerant_buffer{before, before.size() / 2, fail};
+        std::istream tolerant_stream{&tolerant_buffer};
+        const V2::LogFile tolerant = V2::ReadLog(tolerant_stream, before.size());
+        REQUIRE_FALSE(tolerant.read_failed);
+        REQUIRE(tolerant.parsed.live.size() < live);
+    }
+}
+
+#ifndef _WIN32
+TEST_CASE("Shader cache v2: with the lock held, a log that is not a regular file is not compacted",
+          "[video_core][shader_cache_v2]") {
+    TempDir temp;
+    const auto file = temp.path / "cache.bin";
+    std::filesystem::create_symlink("/dev/null", file);
+    // Without the lock it reads as no log at all; with it, as a read that failed.
+    REQUIRE(V2::ReadLogFile(file).parsed.header == V2::HeaderStatus::Empty);
+    REQUIRE(V2::ReadLogFile(file, {}, V2::ReadMode::Strict).read_failed);
+    REQUIRE(V2::CompactLog(file) == V2::WriteResult::Failed);
+    REQUIRE(std::filesystem::is_symlink(file));
+    REQUIRE(std::filesystem::read_symlink(file) == "/dev/null");
+}
+#endif

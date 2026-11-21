@@ -95,6 +95,11 @@ enum class DriverBlobDiscard {
     Failed,        ///< Such a file couldn't be removed: the store stays off for the session
 };
 
+/// What a store does with its file when its log reads as `log`: keeps it (None: no file yet, or
+/// one of `identity`), or discards it, saying why. A log a read error cut short can lack the
+/// identity it holds: decide a removal only on one read whole (ReadMode::Strict).
+[[nodiscard]] DriverBlobDiscard IdentityCheck(const LogFile& log, const DeviceIdentity& identity);
+
 /// A driver blob file. Any thread looks blobs up, rejects and stores them; the writer thread alone
 /// writes the file. Only an index stays in memory: Find reads the blob from the file.
 class DriverBlobStore {

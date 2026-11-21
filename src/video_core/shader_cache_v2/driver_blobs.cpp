@@ -91,38 +91,63 @@ std::optional<PipelineBinaries> DecodeBinaries(std::span<const u8> payload) {
     return binaries;
 }
 
+DriverBlobDiscard IdentityCheck(const LogFile& log, const DeviceIdentity& identity) {
+    bool same_identity{};
+    bool has_identity{};
+    for (const LogRecord& record : log.parsed.live) {
+        if (record.kind == RecordKind::DeviceIdentity && record.key == 0) {
+            has_identity = true;
+            same_identity = DecodeIdentity(record.payload) == identity;
+        }
+    }
+    if (log.parsed.header == HeaderStatus::Empty || same_identity) {
+        return DriverBlobDiscard::None;
+    }
+    return has_identity ? DriverBlobDiscard::OtherIdentity : DriverBlobDiscard::NoIdentity;
+}
+
 DriverBlobStore::DriverBlobStore(std::filesystem::path file_, const DeviceIdentity& identity,
                                  DriverBlobOptions options_)
     : file{std::move(file_)}, options{options_} {
     {
         // Read without the lock, as the v2 log is: appends are complete records or a cut-off tail.
-        const LogFile log = ReadLogFile(file);
-        bool same_identity{};
-        bool has_identity{};
-        for (const LogRecord& record : log.parsed.live) {
-            if (record.kind == RecordKind::DeviceIdentity && record.key == 0) {
-                has_identity = true;
-                same_identity = DecodeIdentity(record.payload) == identity;
-            }
-        }
-        if (log.parsed.header != HeaderStatus::Empty && !same_identity) {
-            discarded =
-                has_identity ? DriverBlobDiscard::OtherIdentity : DriverBlobDiscard::NoIdentity;
+        LogFile log = ReadLogFile(file);
+        if (IdentityCheck(log, identity) != DriverBlobDiscard::None) {
             const Common::FS::FileLock lock{PipelineCacheLockPath(file)};
-            std::error_code error;
-            if (!lock.Busy()) {
-                std::filesystem::remove(file, error);
-            }
-            if (lock.Busy() || error) {
+            if (lock.Busy()) {
                 LOG_WARNING(Render_Vulkan,
                             "Driver blobs: can't remove {}, made for another device or driver: "
-                            "{}",
-                            Common::FS::PathToUTF8String(file),
-                            lock.Busy() ? "another emulator holds it" : error.message());
+                            "another emulator holds it",
+                            Common::FS::PathToUTF8String(file));
                 discarded = DriverBlobDiscard::Failed;
                 return;
             }
-        } else if (same_identity) {
+            // Read again with the lock held, whole: the read without it may be cut short by
+            // another emulator's compaction, and one failing partway hides the identity after
+            // the failure. Neither may remove the driver's blobs.
+            log = ReadLogFile(file, {}, ReadMode::Strict);
+            if (log.read_failed) {
+                LOG_WARNING(Render_Vulkan,
+                            "Driver blobs: can't read {} whole; the store stays off this session",
+                            Common::FS::PathToUTF8String(file));
+                discarded = DriverBlobDiscard::Failed;
+                return;
+            }
+            discarded = IdentityCheck(log, identity);
+            if (discarded != DriverBlobDiscard::None) {
+                std::error_code error;
+                std::filesystem::remove(file, error);
+                if (error) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Driver blobs: can't remove {}, made for another device or "
+                                "driver: {}",
+                                Common::FS::PathToUTF8String(file), error.message());
+                    discarded = DriverBlobDiscard::Failed;
+                    return;
+                }
+            }
+        }
+        if (discarded == DriverBlobDiscard::None && log.parsed.header != HeaderStatus::Empty) {
             for (const LogRecord& record : log.parsed.live) {
                 if (!IsBlobKind(record.kind)) {
                     continue;

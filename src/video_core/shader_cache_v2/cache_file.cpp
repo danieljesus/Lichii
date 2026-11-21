@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <sstream>
 #include <system_error>
 
 #include "common/fs/file.h"
@@ -63,32 +64,63 @@ u64 UnixNow() {
                                 .count());
 }
 
-LogFile ReadLogFile(const std::filesystem::path& file, const ForEach& for_each) {
+LogFile ReadLog(std::istream& stream, u64 size, const ForEach& for_each, ReadMode mode) {
     LogFile log;
-    std::ifstream stream(file, std::ios::binary | std::ios::ate);
-    if (stream.is_open()) {
-        const std::streamoff size = stream.tellg();
-        if (size > 0) {
-            log.bytes.resize(static_cast<size_t>(size));
-            stream.seekg(0);
-            // In chunks: MinGW's libstdc++ hands one read to the CRT's _read, which aborts the
-            // process (invalid parameter) on a count above INT_MAX, a cache past 2 GiB
-            constexpr std::streamoff Chunk = std::streamoff{256} << 20;
-            std::streamoff done = 0;
-            while (done < size) {
-                const std::streamoff want = std::min(Chunk, size - done);
-                stream.read(reinterpret_cast<char*>(log.bytes.data()) + done, want);
-                done += stream.gcount();
-                if (stream.gcount() != want) {
-                    break;
-                }
+    if (size > 0) {
+        log.bytes.resize(static_cast<size_t>(size));
+        // In chunks: MinGW's libstdc++ hands one read to the CRT's _read, which aborts the
+        // process (invalid parameter) on a count above INT_MAX, a cache past 2 GiB
+        constexpr u64 Chunk = u64{256} << 20;
+        u64 done = 0;
+        while (done < size) {
+            const u64 want = std::min(Chunk, size - done);
+            stream.read(reinterpret_cast<char*>(log.bytes.data()) + done,
+                        static_cast<std::streamsize>(want));
+            done += static_cast<u64>(stream.gcount());
+            if (static_cast<u64>(stream.gcount()) != want) {
+                break;
             }
-            // Cut short when the file shrank since (a compaction replaced it)
-            log.bytes.resize(static_cast<size_t>(done));
         }
+        // A read error is not always reported as one: libc++ returns fewer bytes with no badbit.
+        // Under the lock nothing shrinks the file, so fewer bytes are an error, and nothing read
+        // may decide a rewrite or a removal. Without it, the file shrank since (a compaction
+        // replaced it).
+        if (mode == ReadMode::Strict && (done < size || stream.bad())) {
+            log.bytes.clear();
+            log.read_failed = true;
+            return log;
+        }
+        log.bytes.resize(static_cast<size_t>(done));
     }
     log.parsed = ParseLog(log.bytes, for_each);
     return log;
+}
+
+LogFile ReadLogFile(const std::filesystem::path& file, const ForEach& for_each, ReadMode mode) {
+    if (mode == ReadMode::Strict) {
+        std::error_code error;
+        if (!std::filesystem::exists(file, error) && !error) {
+            std::istringstream none; // a missing file reads as empty
+            return ReadLog(none, 0, for_each, mode);
+        }
+        if (!std::filesystem::is_regular_file(file, error) || error) {
+            LogFile log;
+            log.read_failed = true;
+            return log;
+        }
+    }
+    std::ifstream stream(file, std::ios::binary | std::ios::ate);
+    if (!stream.is_open()) {
+        if (mode == ReadMode::Strict) {
+            LogFile log;
+            log.read_failed = true;
+            return log;
+        }
+        return ReadLog(stream, 0, for_each, mode);
+    }
+    const std::streamoff size = stream.tellg();
+    stream.seekg(0);
+    return ReadLog(stream, size > 0 ? static_cast<u64>(size) : 0, for_each, mode);
 }
 
 std::optional<std::vector<u8>> ReadRecordPayload(const std::filesystem::path& file,
@@ -195,7 +227,17 @@ WriteResult CompactLog(const std::filesystem::path& file, const CompactLimit& li
     if (!lock.Held()) {
         return WriteResult::Busy;
     }
-    const LogFile log = ReadLogFile(file);
+    return CompactRead(file, ReadLogFile(file, {}, ReadMode::Strict), limit);
+}
+
+WriteResult CompactRead(const std::filesystem::path& file, const LogFile& log,
+                        const CompactLimit& limit) {
+    // A log that couldn't be read whole would be rewritten without the records after the error.
+    if (log.read_failed) {
+        LOG_ERROR(Common_Filesystem, "Couldn't read shader cache {} whole; not compacted",
+                  Common::FS::PathToUTF8String(file));
+        return WriteResult::Failed;
+    }
     if (log.parsed.header == HeaderStatus::Empty) {
         return WriteResult::Written;
     }
