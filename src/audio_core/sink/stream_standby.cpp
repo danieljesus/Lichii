@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <limits>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -106,7 +107,8 @@ bool StandbySinkStream::RenderFromBackend(const void* backend, std::span<s16> ou
         return false;
     }
     const s64 now = SteadyNow();
-    if (!backend_asked.load(std::memory_order_acquire)) {
+    if (!backend_asked.load(std::memory_order_acquire) &&
+        now >= asks_from.load(std::memory_order_acquire)) {
         first_ask.store(now, std::memory_order_relaxed);
         backend_asked.store(true, std::memory_order_release);
         if (left_to_start.exchange(false)) {
@@ -142,6 +144,7 @@ void StandbySinkStream::OpenInitialBackend() {
             published = opened && losses == 0;
             if (published) {
                 backend_asked = false;
+                asks_from = SteadyNow();
                 RestartStallCount();
                 live_backend = opened;
                 state = State::Live;
@@ -278,7 +281,9 @@ void StandbySinkStream::Start(bool) {
         }
     };
     // A started backend may take a while to ask for audio again: it gets the grace of one that
-    // has not asked yet.
+    // has not asked yet. Only a request made once it has started counts: a callback trailing the
+    // stop, which a backend can still make, came before.
+    asks_from = std::numeric_limits<s64>::max();
     backend_asked = false;
     RestartStallCount();
     if (!StartBackend(current)) {
@@ -291,6 +296,7 @@ void StandbySinkStream::Start(bool) {
         BackendLost();
         return;
     }
+    asks_from = SteadyNow();
     unpause();
 }
 
@@ -552,6 +558,7 @@ StandbySinkStream::Reopen StandbySinkStream::TryReopen(std::stop_token stop_toke
                     // The checks a waiting renderer counted while this one opened and started,
                     // during which nothing played the stream, are not its own.
                     backend_asked = false;
+                    asks_from = SteadyNow();
                     RestartStallCount();
                     live_backend = opened;
                     state = State::Live;

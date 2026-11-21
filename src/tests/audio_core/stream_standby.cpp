@@ -853,8 +853,11 @@ private:
     std::jthread thread;
 };
 
-TEST_CASE("A stream whose backend stops asking for audio without an error reopens",
+TEST_CASE("A stream whose backend is reconfigured and never restarted reopens",
           "[audio_core][stream_standby]") {
+    // As cubeb's WASAPI backend did when a removed headset's reconfigure raced the default
+    // device's: the stream was set up again and never restarted, so its callbacks stopped and
+    // nothing reported an error.
     SysmixTests::Context context;
     auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, 50ms);
     stream->Start();
@@ -1033,4 +1036,137 @@ TEST_CASE("A reopened backend's grace starts when it is published",
     // Found stalled once, the first backend; not the reopened one at its first check.
     CHECK(stream->Reopens() == 1);
     CHECK(stream->published == 2);
+}
+
+namespace {
+
+/// A renderer that keeps the stream's queue full, so that it waits for space and counts checks,
+/// except while `rendering` is clear, as when the emulation stalls, or the stream is paused.
+std::jthread KeepQueueFull(LosableStream& stream, std::atomic<bool>& rendering) {
+    return std::jthread([&stream, &rendering](std::stop_token stop_token) {
+        SinkBuffer block{240, 0, 0, false};
+        std::array<s16, 480> samples{};
+        while (!stop_token.stop_requested()) {
+            if (!rendering || stream.IsPaused()) {
+                std::this_thread::sleep_for(1ms);
+                continue;
+            }
+            stream.AppendBuffer(block, samples);
+            stream.WaitFreeSpace(stop_token);
+        }
+    });
+}
+
+/// The first backend's callbacks every 5 ms while `mode` says so: Play takes a block's worth,
+/// Silence asks for nothing, as a callback while the emulation is paused returns before taking
+/// any, and Off makes none. Only while the first backend is the published one.
+enum class Device { Off, Play, Silence };
+std::jthread FirstBackendCallbacks(LosableStream& stream, std::atomic<Device>& mode) {
+    return std::jthread([&stream, &mode](std::stop_token stop_token) {
+        std::array<s16, 480> output{};
+        auto* const first = stream.Only();
+        while (!stop_token.stop_requested() && stream.published == 1) {
+            const Device now = mode;
+            if (now != Device::Off) {
+                stream.RenderFromBackend(first, output, now == Device::Play ? 240 : 0);
+            }
+            std::this_thread::sleep_for(5ms);
+        }
+    });
+}
+
+} // Anonymous namespace
+
+TEST_CASE("Pausing the emulation does not reopen a stream", "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    constexpr auto Check = 20ms;
+    auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, Check);
+    stream->Start();
+    std::atomic<Device> device{Device::Play};
+    std::atomic<bool> rendering{true};
+    auto callbacks = FirstBackendCallbacks(*stream, device);
+    auto renderer = KeepQueueFull(*stream, rendering);
+    std::this_thread::sleep_for(10 * Check);
+    // Paused, the device keeps calling back but takes nothing: the renderer waits throughout,
+    // checking, and finds the backend still asking. Briefly, and for over a minute, a check
+    // standing for a second.
+    for (const u32 checks : {2u, 61u}) {
+        device = Device::Silence;
+        std::this_thread::sleep_for(checks * Check);
+        device = Device::Play;
+        std::this_thread::sleep_for(10 * Check);
+    }
+    renderer.request_stop();
+    renderer.join();
+    callbacks.request_stop();
+    callbacks.join();
+    CHECK(stream->ReopenAttempts() == 0);
+    CHECK(stream->published == 1);
+}
+
+TEST_CASE("A stall of the emulation during a load does not reopen a stream",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    constexpr auto Check = 100ms;
+    auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, Check);
+    stream->Start();
+    std::atomic<Device> device{Device::Play};
+    std::atomic<bool> rendering{true};
+    auto callbacks = FirstBackendCallbacks(*stream, device);
+    auto renderer = KeepQueueFull(*stream, rendering);
+    std::this_thread::sleep_for(5 * Check);
+    // The emulation stalls for a few seconds: no block is rendered, and the device plays the
+    // queue out and underruns, still asking.
+    rendering = false;
+    std::this_thread::sleep_for(5 * Check);
+    rendering = true;
+    std::this_thread::sleep_for(5 * Check);
+    // The host stalls the device too, for less than the three checks of the rule.
+    device = Device::Off;
+    std::this_thread::sleep_for(3 * Check / 2);
+    device = Device::Play;
+    std::this_thread::sleep_for(5 * Check);
+    renderer.request_stop();
+    renderer.join();
+    callbacks.request_stop();
+    callbacks.join();
+    CHECK(stream->ReopenAttempts() == 0);
+    CHECK(stream->published == 1);
+}
+
+TEST_CASE("A stream paused and resumed keeps the grace of a backend that has not asked",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    constexpr auto Check = 100ms;
+    auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, Check);
+    stream->Start();
+    std::atomic<Device> device{Device::Play};
+    std::atomic<bool> rendering{true};
+    auto callbacks = FirstBackendCallbacks(*stream, device);
+    auto renderer = KeepQueueFull(*stream, rendering);
+    std::this_thread::sleep_for(5 * Check);
+    // Paused: the backend stops.
+    stream->Stop();
+    device = Device::Off;
+    std::this_thread::sleep_for(2 * Check);
+    // Resumed, a callback trailing the stop arrives while it starts, as a backend can still make
+    // one; then it takes four and a half checks to call back: past the three of a backend that
+    // asked since it started, within the six of one that has not. The trailing callback does not
+    // count as asking.
+    auto* const backend = stream->Only();
+    stream->on_start = [&stream, backend] {
+        std::array<s16, 480> output{};
+        stream->RenderFromBackend(backend, output, 240);
+    };
+    stream->Start();
+    stream->on_start = nullptr;
+    std::this_thread::sleep_for(9 * Check / 2);
+    device = Device::Play;
+    std::this_thread::sleep_for(5 * Check);
+    renderer.request_stop();
+    renderer.join();
+    callbacks.request_stop();
+    callbacks.join();
+    CHECK(stream->ReopenAttempts() == 0);
+    CHECK(stream->published == 1);
 }

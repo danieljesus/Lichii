@@ -270,6 +270,10 @@ private:
     /// `first_ask` (steady clock, nanoseconds).
     std::atomic<bool> backend_asked{};
     std::atomic<s64> first_ask{};
+    /// Requests before this (steady clock, nanoseconds) do not count as asking: set when the
+    /// backend is published, and once Start has started it, so that a callback trailing the stop
+    /// before does not take the grace of a backend that has not asked yet.
+    std::atomic<s64> asks_from{};
     /// See StallThreshold.
     std::atomic<u32> stall_level{};
     /// Found stalled past the last doubling and left to start, until its first request.
