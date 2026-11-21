@@ -132,3 +132,62 @@ TEST_CASE("A wait for a render on a stalled stream ends when it is stopped",
     CHECK(prompt);
     renderer.Stop();
 }
+
+TEST_CASE("Nothing of a render the stop ended reaches the next start",
+          "[audio_core][renderer_stalled_stream]") {
+    SysmixTests::Context context;
+    StalledSink sink;
+    AudioCore::ADSP::AudioRenderer::AudioRenderer renderer{context.system, sink};
+    renderer.Start();
+    REQUIRE(!sink.streams.empty());
+    auto& stream = *sink.streams[0];
+    stream.Start();
+    AudioCore::Sink::SinkBuffer block{240, 0, 0, false};
+    std::array<s16, 480> samples{};
+    for (int i = 0; i < 8; ++i) {
+        stream.AppendBuffer(block, samples);
+    }
+    // Session 0's list has one command, which the processor refuses (no magic): once the stop
+    // releases the render, it is left with that command remaining.
+    struct alignas(16) List {
+        AudioCore::Renderer::CommandListHeader header{};
+        std::array<u8, 0x40> commands{};
+    };
+    List old_list{};
+    old_list.header.command_count = 1;
+    renderer.SetCommandBuffer(0, reinterpret_cast<AudioCore::CpuAddr>(&old_list), sizeof(old_list),
+                              2'000'000, 0, &*context.process, false);
+    renderer.Signal();
+
+    std::atomic<bool> stopped{};
+    std::jthread stopper([&] {
+        renderer.Stop();
+        stopped = true;
+    });
+    const bool prompt = WaitFor([&] { return stopped.load(); });
+    if (!prompt) {
+        stream.Stop();
+    }
+    stopper.join();
+    REQUIRE(prompt);
+    CHECK(renderer.GetRemainCommandCount(0) == 0);
+
+    // Started again, with only session 1 set: session 0's list, whose memory a new system would
+    // not own, is not processed again, nor resumed.
+    renderer.Start();
+    AudioCore::Renderer::CommandListHeader new_list{};
+    renderer.SetCommandBuffer(1, reinterpret_cast<AudioCore::CpuAddr>(&new_list), sizeof(new_list),
+                              2'000'000, 0, &*context.process, false);
+    renderer.Signal();
+    std::atomic<bool> rendered{};
+    std::jthread waiter([&](std::stop_token stop_token) {
+        renderer.Wait(stop_token);
+        rendered = true;
+    });
+    const bool responded = WaitFor([&] { return rendered.load(); });
+    waiter.request_stop();
+    waiter.join();
+    CHECK(responded);
+    CHECK(renderer.GetRemainCommandCount(0) == 0);
+    renderer.Stop();
+}
