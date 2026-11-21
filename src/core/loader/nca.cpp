@@ -188,6 +188,15 @@ ResultStatus AppLoader_NCA::VerifyIntegrity(std::function<bool(size_t, size_t)> 
         const size_t intended_read_size = (std::min)(buffer.size(), total_size - processed_size);
         const size_t read_size = file->Read(buffer.data(), intended_read_size, processed_size);
 
+        // A read that returns nothing before the end (a damaged .ncz inside an NSP or XCI, or an
+        // I/O error) would be asked again forever, the progress standing still until the user
+        // cancelled. A shorter read that returns something is fine: the next one continues it.
+        if (read_size == 0) {
+            LOG_ERROR(Loader, "NCA {} stopped returning data at {} of {} bytes", name,
+                      processed_size, total_size);
+            return ResultStatus::ErrorIntegrityVerificationFailed;
+        }
+
         // Update the hash function with the buffer contents.
         if (!EVP_DigestUpdate(ctx, buffer.data(), read_size)) {
             return ResultStatus::ErrorIntegrityVerificationFailed;
