@@ -55,6 +55,17 @@ constexpr u32 COOPERATIVE_HMMA_TEST_LANE_WORDS = 10;
 /// buffer (set 0, binding 0), to check at startup that the driver's matrix layout is the expected.
 [[nodiscard]] std::vector<u32> EmitCooperativeHmmaTest(u32 spirv_version);
 
+/// Lanes of EmitCooperativeHmma8x8x8Test: two warps of one workgroup, so that the check covers
+/// where each warp's shared memory starts.
+constexpr u32 COOPERATIVE_HMMA_8X8X8_TEST_LANES = 64;
+
+/// A compute shader of COOPERATIVE_HMMA_8X8X8_TEST_LANES invocations running HMMA.16816.F16 on the
+/// registers in its storage buffer (set 0, binding 0; EmitCooperativeHmmaTest's layout, a lane at
+/// LocalInvocationIndex), through the lowering a guest program gets with `profile`. It checks at
+/// startup that the 8x8x8 cooperative HMMA computes what the guest's HMMA does. Throws LogicError
+/// unless `profile` runs it on 8x8x8 cooperative matrices.
+[[nodiscard]] std::vector<u32> EmitCooperativeHmma8x8x8Test(const Profile& profile);
+
 /// A compute shader of one workgroup of x * y * z invocations in which each writes, at its
 /// LocalInvocationIndex in a storage buffer at set 0 binding 0, SUBGROUP_PROBE_VALID | SubgroupSize
 /// | SubgroupId << 8 | SubgroupLocalInvocationId << 16: how the device lays its subgroups out.

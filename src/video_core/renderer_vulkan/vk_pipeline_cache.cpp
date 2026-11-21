@@ -1064,6 +1064,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     if (profile.support_cooperative_hmma_16x16x16) {
         LOG_INFO(Render_Vulkan, "Guest tensor operations run on 16x16x16 cooperative matrices");
     }
+    if (!profile.support_cooperative_hmma && !profile.support_cooperative_hmma_16x16x16 &&
+        device.IsCooperativeHmma8x8x8Supported() && profile.compute_subgroups_are_guest_warps) {
+        // Checked against the CPU once with this profile: the staged software HMMA stays if
+        // anything on the way (the device's matrices, the subgroups, the conversion) gets it wrong.
+        profile.support_cooperative_hmma_8x8x8 = true;
+        hmma_8x8x8_test_passed = TestCooperativeHmma8x8x8(device, profile);
+        profile.support_cooperative_hmma_8x8x8 = *hmma_8x8x8_test_passed;
+    }
     if (profile.has_broken_mesh_user_sgprs) {
         LOG_INFO(Render_Vulkan, "RADV before 26.2.5: native mesh shaders read the grid size to "
                                 "avoid the stale mesh user SGPR hang");
@@ -2431,8 +2439,10 @@ namespace {
 /// debug setting adds a create flag. `persisted`: whether the builds outlive the run, so neither
 /// the marker nor the progress of a run whose builds were dropped is taken by one that keeps them.
 /// The subgroup probe's verdict also changes the SPIR-V where it ran (the staged or the shuffled
-/// software HMMA); it is left out where it did not, keeping the variant.
-u64 WarmVariant(bool persisted, std::optional<bool> subgroup_probe_passed) {
+/// software HMMA), and so does the 8x8x8 cooperative HMMA's self-test where it ran (cooperative
+/// matrices or the staged HMMA); each is left out where it did not, keeping the variant.
+u64 WarmVariant(bool persisted, std::optional<bool> subgroup_probe_passed,
+                std::optional<bool> hmma_8x8x8_test_passed) {
     const auto& resolution = Settings::values.resolution_info;
     const std::array<u64, 8> inputs{
         VideoCommon::ShaderWarm::EmissionStamp(),
@@ -2450,7 +2460,13 @@ u64 WarmVariant(bool persisted, std::optional<bool> subgroup_probe_passed) {
         return variant;
     }
     const std::array<u64, 2> probed{variant, *subgroup_probe_passed ? 2ULL : 1ULL};
-    return Common::CityHash64(reinterpret_cast<const char*>(probed.data()), sizeof(probed));
+    const u64 probed_variant =
+        Common::CityHash64(reinterpret_cast<const char*>(probed.data()), sizeof(probed));
+    if (!hmma_8x8x8_test_passed) {
+        return probed_variant;
+    }
+    const std::array<u64, 2> tested{probed_variant, *hmma_8x8x8_test_passed ? 2ULL : 1ULL};
+    return Common::CityHash64(reinterpret_cast<const char*>(tested.data()), sizeof(tested));
 }
 } // Anonymous namespace
 
@@ -2471,7 +2487,8 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
                                             device.GetDeviceID(), CACHE_VERSION,
-                                            WarmVariant(persisted, subgroup_probe_passed));
+                                            WarmVariant(persisted, subgroup_probe_passed,
+                                                        hmma_8x8x8_test_passed));
     };
     // Compute programs of the precache file, unless a matching marker says they were built.
     size_t file_entries = 0;

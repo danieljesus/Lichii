@@ -662,6 +662,10 @@ bool UsesCooperativeHmma(const Profile& profile, const IR::Program& program);
 /// word where it starts.
 std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program);
 std::optional<u32> ReserveSoftwareHmmaScratch(const Profile& profile, IR::Program& program);
+/// Where the device has 8x8x8 cooperative matrices only (Apple GPUs): reserves each warp's area
+/// for HMMA on four 8x8x8 products and returns its first word.
+std::optional<u32> ReserveCooperativeHmma8x8x8Scratch(const Profile& profile,
+                                                      IR::Program& program);
 /// Gives the program back the shared memory an HMMA path reserved, if any.
 void ReleaseHmmaScratch(IR::Program& program);
 

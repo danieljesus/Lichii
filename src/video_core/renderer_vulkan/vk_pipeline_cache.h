@@ -473,6 +473,8 @@ private:
     Shader::Profile profile;
     /// Whether the compute subgroup probe passed, where it ran (ProbeComputeSubgroupsAreGuestWarps)
     std::optional<bool> subgroup_probe_passed;
+    /// Whether the 8x8x8 cooperative HMMA passed its self-test, where it ran.
+    std::optional<bool> hmma_8x8x8_test_passed;
     Shader::HostTranslateInfo host_info;
 
     std::filesystem::path pipeline_cache_filename;

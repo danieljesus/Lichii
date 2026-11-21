@@ -2250,6 +2250,26 @@ void Device::RemoveUnsuitableExtensions() {
             properties.subgroup_size_control.maxSubgroupSize == GuestWarpSize;
         cooperative_hmma_16x16x16 =
             usable && has_shape(16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+        // Apple GPUs (MoltenVK with VK_KHR_cooperative_matrix) only have 8x8x8 shapes, on Metal's
+        // simdgroup matrices: fp16 inputs with fp32 accumulators run HMMA as four of them. Their
+        // compute subgroups are 32-wide SIMD groups, though MoltenVK reports a minimum subgroup
+        // size of 4 and no required size (see Profile::compute_subgroups_are_guest_warps).
+        const bool has_8x8x8 =
+            std::ranges::any_of(shapes, [](const VkCooperativeMatrixPropertiesKHR& shape) {
+                return shape.MSize == 8 && shape.NSize == 8 && shape.KSize == 8 &&
+                       shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                       shape.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                       shape.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                       shape.saturatingAccumulation == VK_FALSE &&
+                       shape.scope == VK_SCOPE_SUBGROUP_KHR;
+            });
+        const bool apple_simd_groups = properties.properties.vendorID == 0x106B &&
+                                       properties.subgroup_size_control.maxSubgroupSize ==
+                                           GuestWarpSize;
+        cooperative_hmma_8x8x8 =
+            usable && !cooperative_hmma_16x8x16 && !cooperative_hmma_16x16x16 && has_8x8x8 &&
+            (IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT) || apple_simd_groups);
         const auto has_fp32_result_shape = [&](VkComponentTypeKHR input) {
             return std::ranges::any_of(shapes, [=](const VkCooperativeMatrixPropertiesKHR& shape) {
                 return shape.MSize == 16 && shape.NSize == 16 && shape.KSize == 16 &&
@@ -2262,7 +2282,8 @@ void Device::RemoveUnsuitableExtensions() {
         };
         fp8_matrix_shapes = has_fp32_result_shape(VK_COMPONENT_TYPE_FLOAT16_KHR) &&
                             has_fp32_result_shape(VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT);
-        extensions.cooperative_matrix = cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16;
+        extensions.cooperative_matrix =
+            cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16 || cooperative_hmma_8x8x8;
         features.cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
         RemoveExtensionFeatureIfUnsuitable(extensions.cooperative_matrix,
                                            features.cooperative_matrix,
