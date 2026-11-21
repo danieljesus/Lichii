@@ -51,6 +51,12 @@ struct INIHeader {
 };
 static_assert(sizeof(INIHeader) == 0x10, "INIHeader has incorrect size.");
 
+/// Where a segment of a KIP's image lies and how far it reaches, page aligned.
+struct KIPSegment {
+    u64 offset;
+    u64 size;
+};
+
 // Kernel Internal Process
 class KIP {
 public:
@@ -89,9 +95,14 @@ public:
     /// segment is zero. Only what the file stores or decompresses to is kept.
     u32 GetSectionSize(u8 index) const;
 
-    /// The size of the process image, .text to the end of .bss, page aligned. With Success, the
-    /// sections lie inside it in order, as the kernel requires (see the constructor).
+    /// The size of the process image, .text to the end of .bss, page aligned, at most 4 GiB. With
+    /// Success, the sections lie inside it in order, as the kernel requires (see the constructor).
     u64 GetImageSize() const;
+
+    /// The extents of the .text, .rodata and .data segments in the image, checked by the
+    /// constructor: page aligned, in order, each holding its section's bytes, the last running to
+    /// the end of the image over .bss. A segment may be empty. All zero unless Success.
+    const std::array<KIPSegment, 3>& GetSegments() const;
 
     // The header and the stored sections, which is where the next KIP of an INI1 starts.
     u64 GetSize() const;
@@ -104,7 +115,8 @@ private:
     Loader::ResultStatus status;
 
     KIPHeader header{};
-    std::array<std::vector<u8>, 6> decompressed_sections;
+    std::array<std::vector<u8>, 3> decompressed_sections;
+    std::array<KIPSegment, 3> segments{};
     u64 image_size{};
     bool size_known{};
 };

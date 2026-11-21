@@ -60,6 +60,18 @@ TEST_CASE("KIP keeps a valid layout and its stored sections", "[core][file_sys]"
     CHECK(kip.GetSectionSize(2) == 0x10);
     // .text to the end of .bss, page aligned.
     CHECK(kip.GetImageSize() == 0x5000);
+    // The extents the loader copies into: page aligned, .data's running over .bss to the end.
+    const auto& segments = kip.GetSegments();
+    CHECK(segments[0].offset == 0);
+    CHECK(segments[0].size == 0x1000);
+    CHECK(segments[1].offset == 0x1000);
+    CHECK(segments[1].size == 0x1000);
+    CHECK(segments[2].offset == 0x2000);
+    CHECK(segments[2].size == 0x3000);
+    // Only .text, .rodata and .data are kept.
+    for (u8 index = 3; index < 6; ++index) {
+        CHECK(kip.GetSectionDecompressed(index).empty());
+    }
 }
 
 TEST_CASE("KIP does not allocate a .bss the file holds no data for", "[core][file_sys]") {
@@ -96,6 +108,13 @@ TEST_CASE("KIP keeps an empty section that is empty in memory too", "[core][file
     CHECK(kip.GetRODataSection().empty());
     CHECK(kip.GetDataSection().empty());
     CHECK(kip.GetImageSize() == 0x1000);
+    // An empty segment: the loader leaves it unprotected, as the kernel's loader skips it.
+    CHECK(kip.GetSegments()[1].size == 0);
+
+    const auto no_text = MakeKip({0, 0, 0}, {0, 0x10, 0x10}, Data, Bss);
+    REQUIRE(no_text.GetStatus() == Loader::ResultStatus::Success);
+    CHECK(no_text.GetSegments()[0].size == 0);
+    CHECK(no_text.GetSegments()[1].size == 0x1000);
 }
 
 TEST_CASE("KIP rejects a layout the kernel would refuse", "[core][file_sys]") {
@@ -127,4 +146,17 @@ TEST_CASE("KIP rejects a layout the kernel would refuse", "[core][file_sys]") {
     SECTION("more stored bytes than the section's size") {
         rejects(MakeKip({0, 4, 8}, RoData, Data, Bss));
     }
+    SECTION("an image larger than a code set segment can describe") {
+        rejects(MakeKip(Text, RoData, Data, {0xFFFFF000, 0x2000, 0}));
+    }
+}
+
+TEST_CASE("KIP keeps nothing of a section it rejects", "[core][file_sys]") {
+    // Read, then found to hold more bytes than its size.
+    const auto kip = MakeKip({0, 4, 8}, RoData, Data, Bss);
+    REQUIRE(kip.GetStatus() == Loader::ResultStatus::ErrorBadKIPHeader);
+    CHECK(kip.GetTextSection().empty());
+    CHECK(kip.GetRODataSection().empty());
+    CHECK(kip.GetImageSize() == 0);
+    CHECK(kip.GetSegments()[2].size == 0);
 }
