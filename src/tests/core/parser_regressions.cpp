@@ -68,8 +68,17 @@ std::vector<Core::Memory::CheatEntry> ParseCheats(std::string_view text) {
 std::vector<u8> Kip(const std::vector<u8>& section, u32 decompressed) {
     std::vector<u8> bytes(0x100);
     Put32(bytes, 0, Common::MakeMagic('K', 'I', 'P', '1'));
+    // The header's flags say whether .text is BLZ compressed: here, when its stored bytes are
+    // not its size in memory, as these cases meant when the sizes alone decided it.
+    if (section.size() != decompressed) {
+        bytes[0x1F] = 0x1;
+    }
     Put32(bytes, 0x24, decompressed);
     Put32(bytes, 0x28, static_cast<u32>(section.size()));
+    // A layout the kernel accepts: .rodata, .data and .bss each on a page after .text.
+    Put32(bytes, 0x30, 0x1000);
+    Put32(bytes, 0x40, 0x2000);
+    Put32(bytes, 0x50, 0x3000);
     bytes.insert(bytes.end(), section.begin(), section.end());
     return bytes;
 }
@@ -205,14 +214,20 @@ TEST_CASE("Fuzzed KIP: BLZ footers", "[core][fuzz_regressions]") {
 }
 
 TEST_CASE("Fuzzed KIP: a .bss larger than memory", "[core][fuzz_regressions]") {
-    // #1881: a .bss with no stored bytes was allocated at its declared size, here 4 GiB - 1. The
-    // fixed code allocates nothing for it.
+    // #1881: a .bss with no stored bytes was allocated at its declared size. The fixed code
+    // allocates nothing for it. 0xF0000000 is the largest round size whose image still fits the
+    // 4 GiB a code set segment can describe; with 4 GiB - 1 the layout itself is refused.
     std::vector<u8> bytes = Kip({'t', 'e', 'x', 't'}, 4);
-    Put32(bytes, 0x54, 0xFFFFFFFF);
+    Put32(bytes, 0x54, 0xF0000000);
     const KIP kip{File(bytes, "fuzz.kip")};
     REQUIRE(kip.GetStatus() == Loader::ResultStatus::Success);
-    CHECK(kip.GetBSSSize() == 0xFFFFFFFF);
+    CHECK(kip.GetBSSSize() == 0xF0000000);
     CHECK(kip.GetSectionDecompressed(3).empty());
+
+    Put32(bytes, 0x54, 0xFFFFFFFF);
+    const KIP too_large{File(bytes, "fuzz.kip")};
+    CHECK(too_large.GetStatus() == Loader::ResultStatus::ErrorBadKIPHeader);
+    CHECK(too_large.GetSectionDecompressed(3).empty());
 }
 
 TEST_CASE("Fuzzed INI1: every KIP is read", "[core][fuzz_regressions]") {
