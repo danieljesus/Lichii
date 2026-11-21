@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "common/common_types.h"
 #include "core/loader/loader.h"
@@ -32,18 +33,21 @@ struct NroLayout {
         u64 size;
     };
     /// .text, .rodata and .data, page aligned and in order; .data runs to the end of the image,
-    /// over .bss.
+    /// over .bss. An empty segment has size 0; an empty .data's segment is .bss alone.
     std::array<Segment, 3> segments;
     /// How many bytes of the file the image holds: the NRO's size from its header.
     u64 file_size;
     /// The image: the file's part page aligned, then .bss. At most 4 GiB.
     u64 image_size;
+    /// Why the module header was not used for the size of .bss, if it was not; empty otherwise.
+    std::string_view module_header_unused;
 };
 
 /// Checks the header of the NRO in `data` (the whole file as read) against what the file holds
 /// and what an image can describe, before anything is allocated. Returns no layout for a damaged
-/// NRO.
-std::optional<NroLayout> ValidateNroLayout(std::span<const u8> data);
+/// NRO, and sets `reason`, if given, to the rule it breaks. Logs nothing.
+std::optional<NroLayout> ValidateNroLayout(std::span<const u8> data,
+                                           std::string_view* reason = nullptr);
 
 /// Loads an NRO file
 class AppLoader_NRO final : public AppLoader {
