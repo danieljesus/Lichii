@@ -3265,6 +3265,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
     if (graphics_key.unique_hashes[0] != 0 || live.size() != record.env_count) {
         return nullptr;
     }
+    // Only native task/mesh pipelines are kept (Keep leaves an emulated one without SPIR-V), and
+    // the key does not say which: without VK_EXT_mesh_shader now (the Mesh Shaders setting on
+    // Compute, or another driver under the same stamp) the draw takes the normal path, which
+    // emulates them.
+    if (!device.IsExtMeshShaderSupported() &&
+        std::ranges::any_of(live, [](const Shader::Environment* env) {
+            return env->ShaderStage() == Shader::Stage::Task ||
+                   env->ShaderStage() == Shader::Stage::Mesh;
+        })) {
+        CountPrecompiledReason("task/mesh stages without VK_EXT_mesh_shader");
+        return nullptr;
+    }
     auto recorded = std::make_shared<std::vector<FileEnvironment>>(record.env_count);
     std::array<Shader::Info, 5> infos{};
     std::array<const Shader::Info*, 5> info_ptrs{};
