@@ -514,6 +514,7 @@ PreparationProgress GetPreparationProgress() {
 }
 
 bool DeleteWarmFiles(u64 title_id, std::string* error) {
+    LOG_INFO(Render_Vulkan, "Shader precache: deleting the precache files of {:016x}", title_id);
     const auto warm = ComputeWarmPath(title_id);
     fs::path tmp = warm;
     tmp += ".tmp";

@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 #ifdef __APPLE__
@@ -20,34 +22,61 @@ namespace {
 
 #ifdef __APPLE__
 // A secondary thread on macOS gets 512 KiB of stack. MoltenVK converts SPIR-V to MSL on the thread
-// that builds the pipeline, and SPIRV-Cross's recursive control-flow walk overflowed that on a
-// compute program of Ocarina of Time; 256 MiB held. Pages never touched cost no memory.
-constexpr size_t WorkerStackSize = size_t{256} << 20;
+// that creates the pipeline, and SPIRV-Cross's CFG::walk_from recurses once per block reachable
+// after a loop, 64-80 bytes a level on arm64: an Ocarina of Time compute program overflowed a
+// worker's 544 KiB. A guest program has at most 1 MiB of code (131,072 Maxwell or 65,536 Ampere
+// words), and 32 MiB holds about 400,000 levels, three blocks for each of those words. Only the
+// pages a walk touches take memory.
+constexpr size_t LargeStackSize = size_t{32} << 20;
+thread_local bool t_large_stack{};
 
 template <typename Body>
-void* RunBody(void* body) {
-    (*static_cast<Body*>(body))();
+struct LargeStackCall {
+    Body& body;
+    std::exception_ptr exception;
+};
+
+template <typename Body>
+void* RunLargeStackCall(void* argument) {
+    auto& call{*static_cast<LargeStackCall<Body>*>(argument)};
+    t_large_stack = true;
+    try {
+        call.body();
+    } catch (...) {
+        call.exception = std::current_exception();
+    }
     return nullptr;
 }
 #endif
 
-/// Runs `body` on a thread with WorkerStackSize of stack where the platform's default is too
-/// small, and on this thread otherwise or when that thread can't be made.
+/// Runs body on a thread with LargeStackSize of stack where the platform's default is too small
+/// for the driver's shader compiler, and on this thread otherwise or when that thread can't be made.
 template <typename Body>
-void RunOnWorkerStack(Body& body) {
+void RunOnLargeStack(Body&& body) {
 #ifdef __APPLE__
-    pthread_attr_t attr;
-    if (pthread_attr_init(&attr) == 0) {
-        pthread_t thread;
-        const bool created = pthread_attr_setstacksize(&attr, WorkerStackSize) == 0 &&
-                             pthread_create(&thread, &attr, &RunBody<Body>, &body) == 0;
-        pthread_attr_destroy(&attr);
-        if (created) {
-            pthread_join(thread, nullptr);
-            return;
+    if (!t_large_stack) {
+        LargeStackCall<std::remove_reference_t<Body>> call{body};
+        pthread_attr_t attr;
+        if (pthread_attr_init(&attr) == 0) {
+            pthread_t thread;
+            const bool created =
+                pthread_attr_setstacksize(&attr, LargeStackSize) == 0 &&
+                pthread_create(&thread, &attr, &RunLargeStackCall<std::remove_reference_t<Body>>,
+                               &call) == 0;
+            pthread_attr_destroy(&attr);
+            if (created) {
+                pthread_join(thread, nullptr);
+                if (call.exception) {
+                    std::rethrow_exception(call.exception);
+                }
+                return;
+            }
+        }
+        static std::atomic_bool logged{};
+        if (!logged.exchange(true)) {
+            LOG_WARNING(HW_GPU, "Shader jobs run on the default stack: no larger one");
         }
     }
-    LOG_WARNING(HW_GPU, "Shader job worker runs on the default stack: no larger one");
 #endif
     body();
 }
@@ -198,13 +227,12 @@ ShaderJobScheduler::ShaderJobScheduler(const ShaderJobConfig& config)
     stats.budget_bytes = budget;
     const auto start{[this](std::string name, bool driver) {
         threads.emplace_back([this, name = std::move(name), driver] {
-            auto body = [&] {
+            RunOnLargeStack([&] {
                 Common::SetCurrentThreadName(name.c_str());
                 Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
                 Common::SetCurrentThreadToBackgroundWork();
                 Worker(driver);
-            };
-            RunOnWorkerStack(body);
+            });
         });
     }};
     for (size_t i = 0; i < std::max<size_t>(config.cpu_threads, 1); ++i) {
@@ -333,12 +361,12 @@ void ShaderJobScheduler::RunOrWait(const ShaderJobHandle& handle) {
     case ShaderJobStatus::Queued:
         StartStage(job, false, Clock::now());
         lock.unlock();
-        RunCpu(handle.state, true);
+        RunOnLargeStack([&] { RunCpu(handle.state, true); });
         return;
     case ShaderJobStatus::DriverQueued:
         StartStage(job, true, Clock::now());
         lock.unlock();
-        RunDriver(handle.state);
+        RunOnLargeStack([&] { RunDriver(handle.state); });
         return;
     default:
         break;
