@@ -2096,11 +2096,13 @@ public:
 
     void Query(GPUVAddr address, VideoCommon::QueryType, VideoCommon::QueryPropertiesFlags flags,
                u32 payload, u32) override {
+        const bool mirrored = True(flags & VideoCommon::QueryPropertiesFlags::Nx2Mirror);
         if (False(flags & VideoCommon::QueryPropertiesFlags::IsAFence)) {
-            memory.Write<u32>(address, payload);
+            Land(address, payload, mirrored);
             return;
         }
-        reports.push_back({address, payload, VideoCommon::GpuSplit::Get().TrackFencedWrite()});
+        reports.push_back(
+            {address, payload, VideoCommon::GpuSplit::Get().TrackFencedWrite(), mirrored});
     }
     void SignalFence(std::function<void()>&& func) override {
         func();
@@ -2108,10 +2110,25 @@ public:
     /// The fence after the reports passed.
     void RunFence() {
         for (Report& report : reports) {
-            memory.Write<u32>(report.address, report.payload);
+            Land(report.address, report.payload, report.mirrored);
             report.hold.Release();
         }
         reports.clear();
+    }
+    /// A payload report lands as QueryCacheBase::CounterReport lands one: a mirrored release
+    /// into a word that diverts goes to the mirror shadow, any other to guest memory, and a
+    /// direct one is told to the shadow.
+    void Land(GPUVAddr address, u32 payload, bool mirrored) {
+        auto& shadow = Tegra::Nx2MirrorShadow::Get();
+        const auto device = memory.GpuToCpuAddress(address);
+        if (mirrored && device && shadow.Diverts(*device)) {
+            shadow.Set(*device, payload, memory.Read<u32>(address));
+            return;
+        }
+        memory.Write<u32>(address, payload);
+        if (!mirrored && device) {
+            shadow.NoteDirectRelease(*device, address);
+        }
     }
 
     void FlushRegion(DAddr address, u64 size, VideoCommon::CacheType which) override {
@@ -2166,6 +2183,7 @@ public:
         GPUVAddr address;
         u32 payload;
         VideoCommon::GpuSplit::FencedHold hold;
+        bool mirrored{};
     };
     Tegra::MemoryManager& memory;
     std::vector<Report> reports;
@@ -2801,15 +2819,99 @@ TEST_CASE("Split front passes equal and mask acquires only on what their word se
     CHECK(dma_pusher.puller.ResumeAcquire(dma_pusher));
     drains(0);
 
-    // GPU acquires read a word mirrored releases go beside from the mirror shadow.
+    // GPU acquires read a word mirrored releases go beside from the mirror shadow over memory.
+    // The front notes the mirrored releases it sends there, so the word settles as any other.
+    // The page before the word's is a queue's first page: releases to the word are mirrored to
+    // `beside`, which also gets releases of its own and so diverts.
+    constexpr GPUVAddr beside = word - 0x1000;
+    constexpr DAddr beside_device = word_device - 0x1000;
     const u64 elsewhere = unsettled(AcquireUnsettled::Elsewhere);
-    Tegra::Nx2AddSemaphoreRegion(word & ~GPUVAddr{0xfff});
-    Tegra::Nx2MirrorShadow::Get().NoteDirectRelease(word_device, word);
-    CHECK(acquire(Equal, 11));
+    const auto acquire_beside = [&](u32 operation, u32 value) {
+        semaphore_at(beside, value, operation);
+        return !dma_pusher.puller.HasPendingAcquire();
+    };
+    const auto hold_back = [&](VideoCommon::GpuSplit::Writes held_writes) {
+        release = false;
+        split.Defer(
+            [&release, before = stats.drained.load()] {
+                while (VideoCommon::g_acquire_stats.drained.load() == before && !release.load()) {
+                    std::this_thread::yield();
+                }
+            },
+            0, held_writes);
+    };
+    auto& shadow = Tegra::Nx2MirrorShadow::Get();
+    Tegra::Nx2AddSemaphoreRegion(beside & ~GPUVAddr{0xfff});
+    shadow.NoteDirectRelease(beside_device, beside);
+    REQUIRE(shadow.Diverts(beside_device));
+    // Nothing sent there: memory decides, and the mirrored value over it while memory is as it
+    // was when that landed.
+    u64 met = stats.diverted_met.load();
+    f.memory.Write<u32>(beside, 20);
+    CHECK(acquire_beside(Equal, 20));
+    shadow.Set(beside_device, 21, 20);
+    CHECK(acquire_beside(Equal, 21));
+    drains(0);
+    CHECK(stats.diverted_met.load() == met + 2);
+    // A mirrored release the back has yet to run decides, ordered after it. Guest memory keeps
+    // its word.
+    hold_back(VideoCommon::GpuSplit::Writes::Noted);
+    semaphore(22, WideRelease);
+    CHECK(acquire_beside(Equal, 22));
+    CHECK(stats.by_queued.load() == by_queued + 1);
+    by_queued += 1;
+    drains(0);
+    release = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(f.memory.Read<u32>(word) == 22);
+    CHECK(f.memory.Read<u32>(beside) == 20);
+    CHECK(acquire_beside(Equal, 22));
+    drains(0);
+    // Shader stores the back has yet to run may write it, as any word.
+    const u64 stores = unsettled(AcquireUnsettled::Writes);
+    hold_back(VideoCommon::GpuSplit::Writes::Caches);
+    split.Publish();
+    CHECK(acquire_beside(Equal, 22));
     drains(1);
-    CHECK(unsettled(AcquireUnsettled::Elsewhere) == elsewhere + 1);
-    Tegra::Nx2MirrorShadow::Get().Clear();
-    Tegra::Nx2RemoveSemaphoreRegion(word & ~GPUVAddr{0xfff});
+    CHECK(unsettled(AcquireUnsettled::Writes) == stores + 1);
+    // A mirrored release that lands by its fence does not decide before it ran, though the back
+    // ran its entry: the acquire drains and waits.
+    const u64 fenced_mirrors = unsettled(AcquireUnsettled::Fenced);
+    semaphore(23, OneWordRelease);
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK_FALSE(acquire_beside(Equal, 23));
+    drains(1);
+    CHECK(unsettled(AcquireUnsettled::Fenced) == fenced_mirrors + 1);
+    fences.RunFence();
+    CHECK(f.memory.Read<u32>(word) == 23);
+    CHECK(f.memory.Read<u32>(beside) == 20);
+    CHECK(dma_pusher.puller.ResumeAcquire(dma_pusher));
+    drains(0);
+    // A direct release into it replaces what acquires read, mirrored value included.
+    hold_back(VideoCommon::GpuSplit::Writes::Noted);
+    semaphore_at(beside, 24, WideRelease);
+    CHECK(acquire_beside(Equal, 24));
+    CHECK(stats.by_queued.load() == by_queued + 1);
+    by_queued += 1;
+    drains(0);
+    release = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(f.memory.Read<u32>(beside) == 24);
+    CHECK(acquire_beside(Equal, 24));
+    drains(0);
+    // Settled at a value that does not meet it: it drains as before and waits. A poll passes
+    // once memory meets it.
+    const u64 settled_short = stats.diverted_short.load();
+    CHECK_FALSE(acquire_beside(Equal, 5));
+    drains(1);
+    CHECK(stats.diverted_short.load() == settled_short + 1);
+    f.memory.Write<u32>(beside, 5);
+    CHECK(dma_pusher.puller.ResumeAcquire(dma_pusher));
+    drains(0);
+    CHECK(unsettled(AcquireUnsettled::Elsewhere) == elsewhere);
+    shadow.Clear();
+    Tegra::Nx2RemoveSemaphoreRegion(beside & ~GPUVAddr{0xfff});
+    f.memory.Write<u32>(word, 11);
 
     // A list word the back owes reads as its placeholder until it lands (Nx2NoteOwedListWord),
     // bit 31 set: what memory holds there decides nothing.
