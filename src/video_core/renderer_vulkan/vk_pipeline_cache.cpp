@@ -2853,7 +2853,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const auto index_path =
         base_dir / fmt::format("precompiled_kept_index.fork-v{}.bin", CACHE_VERSION);
     const auto& resolution = Settings::values.resolution_info;
-    const std::optional<u64> profile = VideoCommon::ShaderWarm::ProfileVerdictsHash(
+    const std::optional<u64> verdicts_hash = VideoCommon::ShaderWarm::ProfileVerdictsHash(
         {subgroup_probe_passed, hmma_8x8x8_test_passed});
     const std::string stamp = fmt::format(
         "{} {} {:#x} {} {} scale {} {}/{} bloom {} loops {} debug {} {}{}\n", file_size, modified,
@@ -2861,7 +2861,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         resolution.up_scale, resolution.down_shift, Settings::values.fix_bloom_effects.GetValue(),
         Settings::values.disable_shader_loop_safety_checks.GetValue(),
         Settings::values.renderer_debug.GetValue(), PrecompiledInfosMagic,
-        profile ? fmt::format(" profile {:#x}", *profile) : std::string{});
+        verdicts_hash ? fmt::format(" profile {:#x}", *verdicts_hash) : std::string{});
 
     auto prep_owner = std::make_unique<PrecompiledPrep>();
     auto& prep = *prep_owner;
