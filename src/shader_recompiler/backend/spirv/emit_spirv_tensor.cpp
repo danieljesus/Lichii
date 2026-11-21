@@ -14,7 +14,9 @@
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/ir/program.h"
+#include "shader_recompiler/object_pool.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -886,6 +888,55 @@ std::vector<u32> EmitCooperativeHmmaTest(u32 spirv_version) {
 
     std::vector<u32> code{module.Assemble()};
     PatchCooperativeHmma(code, types);
+    return code;
+}
+
+std::vector<u32> EmitCooperativeHmma8x8x8Test(const Profile& profile) {
+    ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::Program program;
+    program.stage = Stage::Compute;
+    program.workgroup_size = {COOPERATIVE_HMMA_8X8X8_TEST_LANES, 1, 1};
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
+                           {{}, IR::AbstractSyntaxNode::Type::Return}};
+    program.info.uses_subgroup_invocation_id = true;
+    program.info.uses_local_invocation_id = true;
+    program.info.used_storage_buffer_types = IR::Type::U32;
+    program.info.storage_buffers_descriptors.push_back({
+        .cbuf_index = 0,
+        .cbuf_offset = 0,
+        .count = 1,
+        .is_written = true,
+    });
+
+    IR::IREmitter ir{block};
+    const IR::U32 base{ir.IMul(ir.LocalInvocationIdX(),
+                               ir.Imm32(COOPERATIVE_HMMA_TEST_LANE_WORDS * u32{sizeof(u32)}))};
+    const auto offset{[&](u32 word) { return ir.IAdd(base, ir.Imm32(word * u32{sizeof(u32)})); }};
+    std::array<IR::U32, 8> registers;
+    for (u32 word = 0; word < registers.size(); ++word) {
+        const auto load{block.PrependNewInst(block.end(), IR::Opcode::LoadStorage32,
+                                             {ir.Imm32(0), offset(word)})};
+        registers[word] = IR::U32{IR::Value{&*load}};
+    }
+    const IR::Value d{ir.TensorMulAdd(
+        ir.CompositeConstruct(registers[0], registers[1], registers[2], registers[3]),
+        ir.CompositeConstruct(registers[4], registers[5]),
+        ir.CompositeConstruct(registers[6], registers[7]), 16)};
+    for (u32 index = 0; index < 2; ++index) {
+        block.AppendNewInst(IR::Opcode::WriteStorage32,
+                            {ir.Imm32(0), offset(8 + index), ir.CompositeExtract(d, index)});
+    }
+
+    std::vector<u32> code{EmitSPIRV(profile, program)};
+    if (!program.info.uses_cooperative_matrix ||
+        program.shared_memory_size !=
+            COOPERATIVE_HMMA_8X8X8_TEST_LANES / GUEST_WARP_LANES * Hmma8x8x8WordsPerWarp *
+                sizeof(u32)) {
+        throw LogicError("The profile does not run HMMA on 8x8x8 cooperative matrices");
+    }
     return code;
 }
 

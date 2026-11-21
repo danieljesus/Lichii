@@ -1361,3 +1361,136 @@ TEST_CASE("The subgroup layout probe writes each invocation's subgroup", "[video
         }));
     }
 }
+
+namespace {
+constexpr u32 OpTypeCooperativeMatrixKHR = 4456;
+constexpr u32 OpTypeFloat = 22;
+/// Words a 64-invocation workgroup's two warps use on 8x8x8 matrices: 320 a warp.
+constexpr u32 Hmma8x8x8Bytes = 2 * 320 * 4;
+
+/// An Apple GPU with VK_KHR_cooperative_matrix (MoltenVK): 8x8x8 shapes only.
+void Apple8x8x8(TensorProgram& fixture) {
+    fixture.profile.support_cooperative_hmma_8x8x8 = true;
+    fixture.profile.support_compute_full_subgroups = true;
+    fixture.profile.compute_subgroups_are_guest_warps = true;
+    fixture.profile.support_float_controls = true;
+    fixture.profile.fp16_conversion_rounds_rte_with_denorms = true;
+}
+} // Anonymous namespace
+
+TEST_CASE("8x8x8 cooperative HMMA runs each K half as one product per 8 rows",
+          "[video_core][tensor][ampere]") {
+    for (const u32 depth : {8U, 16U}) {
+        for (const u32 count : {1U, 3U}) {
+            TensorProgram fixture{count, depth};
+            Apple8x8x8(fixture);
+            const auto code = fixture.Emit("cooperative-8x8x8-k" + std::to_string(depth) + "-n" +
+                                           std::to_string(count));
+            REQUIRE(HasCapability(code, CAPABILITY_COOPERATIVE_MATRIX));
+            RequireVulkanMemoryModel(code);
+            REQUIRE(fixture.program.info.uses_cooperative_matrix);
+            REQUIRE(fixture.program.shared_memory_size == Hmma8x8x8Bytes);
+            // Two 8-row halves, each with one product per K half.
+            REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_MUL_ADD).size() ==
+                    count * 2 * (depth / 8));
+            REQUIRE_FALSE(Shuffles(code));
+            // fp16 A and B, fp32 accumulator, all 8x8 at subgroup scope.
+            const auto types = Instructions(code, OpTypeCooperativeMatrixKHR);
+            REQUIRE(types.size() == 3);
+            const auto floats = Instructions(code, OpTypeFloat);
+            const auto width_of = [&](u32 id) {
+                for (const auto& words : floats) {
+                    if (words[0] == id) {
+                        return words[1];
+                    }
+                }
+                return 0U;
+            };
+            std::array<u32, 3> widths{};
+            for (const auto& words : types) {
+                REQUIRE(words.size() == 6);
+                widths[std::min<size_t>(&words - &types[0], 2)] = width_of(words[1]);
+            }
+            std::ranges::sort(widths);
+            REQUIRE(widths == std::array<u32, 3>{16, 16, 32});
+            // The rounding between K halves converts natively, with no mode the device lacks.
+            REQUIRE_FALSE(Instructions(code, OpFConvert).empty());
+            REQUIRE_FALSE(HasExecutionMode(code, ExecutionModeDenormPreserve, 16));
+        }
+    }
+}
+
+TEST_CASE("8x8x8 cooperative HMMA needs warps as subgroups and native fp16 rounding",
+          "[video_core][tensor][ampere]") {
+    SECTION("Subgroups that may not be warps") {
+        TensorProgram fixture{1, 16};
+        Apple8x8x8(fixture);
+        fixture.profile.compute_subgroups_are_guest_warps = false;
+        const auto code = fixture.Emit();
+        REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_MUL_ADD).empty());
+        REQUIRE(fixture.program.shared_memory_size == 0);
+    }
+    SECTION("No native fp16 rounding") {
+        TensorProgram fixture{1, 16};
+        Apple8x8x8(fixture);
+        fixture.profile.fp16_conversion_rounds_rte_with_denorms = false;
+        REQUIRE(Instructions(fixture.Emit(), OP_COOPERATIVE_MATRIX_MUL_ADD).empty());
+    }
+    SECTION("16x16x16 matrices come first") {
+        TensorProgram fixture{1, 16};
+        Apple8x8x8(fixture);
+        fixture.profile.support_cooperative_hmma_16x16x16 = true;
+        fixture.Emit();
+        REQUIRE(fixture.program.shared_memory_size == 2 * 384 * 4);
+    }
+    SECTION("Emitted twice, one area") {
+        TensorProgram fixture{1, 16};
+        Apple8x8x8(fixture);
+        const auto first = fixture.Emit();
+        REQUIRE(fixture.Emit() == first);
+        REQUIRE(fixture.program.shared_memory_size == Hmma8x8x8Bytes);
+    }
+}
+
+TEST_CASE("8x8x8 cooperative HMMA self-test runs the guest lowering in two warps",
+          "[video_core][tensor][ampere]") {
+    TensorProgram fixture{0};
+    Apple8x8x8(fixture);
+    const auto code = Backend::SPIRV::EmitCooperativeHmma8x8x8Test(fixture.profile);
+    REQUIRE(HasCapability(code, CAPABILITY_COOPERATIVE_MATRIX));
+    RequireVulkanMemoryModel(code);
+    // One HMMA.16816: two 8-row halves, each with one product per K half.
+    REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_MUL_ADD).size() == 4);
+    REQUIRE_FALSE(Shuffles(code));
+    const auto modes = Instructions(code, 16); // OpExecutionMode
+    REQUIRE(std::ranges::any_of(modes, [](const auto& words) {
+        return words.size() == 5 && words[1] == 17 && // LocalSize
+               words[2] == Backend::SPIRV::COOPERATIVE_HMMA_8X8X8_TEST_LANES && words[3] == 1 &&
+               words[4] == 1;
+    }));
+    if (const char* directory = std::getenv("EDEN_TENSOR_TEST_OUTPUT")) {
+        std::filesystem::create_directories(directory);
+        std::ofstream file{std::filesystem::path{directory} / "cooperative-8x8x8-self-test.spv",
+                           std::ios::binary};
+        file.write(reinterpret_cast<const char*>(code.data()),
+                   static_cast<std::streamsize>(code.size() * sizeof(u32)));
+        REQUIRE(file.good());
+    }
+}
+
+TEST_CASE("8x8x8 cooperative HMMA self-test needs a profile that runs HMMA on 8x8x8 matrices",
+          "[video_core][tensor][ampere]") {
+    TensorProgram fixture{0};
+    Apple8x8x8(fixture);
+    SECTION("No 8x8x8 matrices") {
+        fixture.profile.support_cooperative_hmma_8x8x8 = false;
+    }
+    SECTION("Subgroups that may not be warps") {
+        fixture.profile.compute_subgroups_are_guest_warps = false;
+    }
+    SECTION("16x16x16 matrices come first") {
+        fixture.profile.support_cooperative_hmma_16x16x16 = true;
+    }
+    REQUIRE_THROWS_AS(Backend::SPIRV::EmitCooperativeHmma8x8x8Test(fixture.profile),
+                      Shader::LogicError);
+}

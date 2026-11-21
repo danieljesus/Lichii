@@ -18,10 +18,8 @@
 namespace Vulkan {
 namespace {
 
+using Shader::Backend::SPIRV::COOPERATIVE_HMMA_8X8X8_TEST_LANES;
 using Shader::Backend::SPIRV::COOPERATIVE_HMMA_TEST_LANE_WORDS;
-
-constexpr u32 LANES = GuestWarpSize;
-constexpr u32 BUFFER_WORDS = LANES * COOPERATIVE_HMMA_TEST_LANE_WORDS;
 
 /// The half-precision encoding of a small integer. Products and sums of the test's integers stay
 /// exact in half precision, so the results compare bit for bit, without any rounding involved.
@@ -82,8 +80,10 @@ Matrices MakeMatrices() {
 }
 
 /// Writes one lane's guest registers, in the layout of mma.m16n8k16: with g = lane / 4 and
-/// t = lane % 4, a lane holds rows g and g + 8 of A, C and D, and column g of B.
+/// t = lane % 4, a lane holds rows g and g + 8 of A, C and D, and column g of B. Every warp of
+/// the workgroup gets the same matrices.
 void WriteLane(const Matrices& m, u32 lane, std::span<u32> words) {
+    lane %= GuestWarpSize;
     const size_t g = lane >> 2;
     const size_t t = lane & 3;
     const size_t k = t * 2;
@@ -105,10 +105,10 @@ bool SameHalf(u32 got, s32 expected) {
     return got == want || (expected == 0 && (got & 0x7fff) == 0);
 }
 
-u32 CountWrongLanes(const Matrices& m, std::span<const u32> words) {
+u32 CountWrongLanes(const Matrices& m, u32 lanes, std::span<const u32> words) {
     u32 wrong = 0;
-    for (u32 lane = 0; lane < LANES; ++lane) {
-        const size_t g = lane >> 2;
+    for (u32 lane = 0; lane < lanes; ++lane) {
+        const size_t g = (lane % GuestWarpSize) >> 2;
         const size_t k = (lane & 3) * 2;
         const auto lane_words = words.subspan(lane * COOPERATIVE_HMMA_TEST_LANE_WORDS);
         const u32 d0 = lane_words[8];
@@ -121,26 +121,46 @@ u32 CountWrongLanes(const Matrices& m, std::span<const u32> words) {
     return wrong;
 }
 
-bool RunTest(const Device& device) {
-    const std::vector<u32> code =
-        Shader::Backend::SPIRV::EmitCooperativeHmmaTest(device.SupportedSpirvVersion());
+/// Runs `code` on the test's matrices in `lanes` lanes and counts the lanes with a wrong result.
+u32 RunAndCountWrongLanes(const Device& device, std::span<const u32> code, u32 lanes) {
     const Matrices matrices = MakeMatrices();
-    std::array<u32, BUFFER_WORDS> words{};
-    for (u32 lane = 0; lane < LANES; ++lane) {
+    std::vector<u32> words(lanes * COOPERATIVE_HMMA_TEST_LANE_WORDS);
+    for (u32 lane = 0; lane < lanes; ++lane) {
         WriteLane(matrices, lane,
                   std::span{words}.subspan(lane * COOPERATIVE_HMMA_TEST_LANE_WORDS,
                                            COOPERATIVE_HMMA_TEST_LANE_WORDS));
     }
     RunComputeProbe(device, code, words);
-    const u32 wrong = CountWrongLanes(matrices, words);
+    return CountWrongLanes(matrices, lanes, words);
+}
+
+bool RunTest(const Device& device) {
+    const std::vector<u32> code =
+        Shader::Backend::SPIRV::EmitCooperativeHmmaTest(device.SupportedSpirvVersion());
+    const u32 wrong = RunAndCountWrongLanes(device, code, GuestWarpSize);
     if (wrong != 0) {
         LOG_WARNING(Render_Vulkan,
                     "Cooperative matrices lay out elements differently on this driver ({} of {} "
                     "lanes wrong): guest tensor operations stay in shader emulation",
-                    wrong, LANES);
+                    wrong, GuestWarpSize);
         return false;
     }
     LOG_INFO(Render_Vulkan, "Guest tensor operations run on cooperative matrices");
+    return true;
+}
+
+bool Run8x8x8Test(const Device& device, const Shader::Profile& profile) {
+    const std::vector<u32> code =
+        Shader::Backend::SPIRV::EmitCooperativeHmma8x8x8Test(profile);
+    const u32 wrong = RunAndCountWrongLanes(device, code, COOPERATIVE_HMMA_8X8X8_TEST_LANES);
+    if (wrong != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "8x8x8 cooperative matrices gave wrong HMMA results on this driver ({} of {} "
+                    "lanes wrong): guest tensor operations stay in shader emulation",
+                    wrong, COOPERATIVE_HMMA_8X8X8_TEST_LANES);
+        return false;
+    }
+    LOG_INFO(Render_Vulkan, "Guest tensor operations run on 8x8x8 cooperative matrices");
     return true;
 }
 
@@ -153,6 +173,18 @@ bool TestCooperativeHmma(const Device& device) {
         LOG_WARNING(Render_Vulkan,
                     "Cooperative matrix self-test failed ({}): guest tensor operations stay in "
                     "shader emulation",
+                    exception.what());
+        return false;
+    }
+}
+
+bool TestCooperativeHmma8x8x8(const Device& device, const Shader::Profile& profile) {
+    try {
+        return Run8x8x8Test(device, profile);
+    } catch (const std::exception& exception) {
+        LOG_WARNING(Render_Vulkan,
+                    "8x8x8 cooperative matrix self-test failed ({}): guest tensor operations stay "
+                    "in shader emulation",
                     exception.what());
         return false;
     }
