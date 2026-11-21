@@ -307,8 +307,9 @@ TEST_CASE("PrecompiledStore: read errors after opening keep the files", "[video_
     }
     const auto data_size = std::filesystem::file_size(dir.Data());
     const auto index_size = std::filesystem::file_size(dir.Index());
-    // A directory in a file's place: on Linux it opens for reading and every read fails (EISDIR),
-    // elsewhere it does not open. Either way the other file must stay as it is.
+    // A directory in a file's place: on Linux and macOS it opens for reading, and its reads fail
+    // (EISDIR) with libstdc++ throwing and libc++ returning no bytes as if the file were empty;
+    // on Windows it does not open. Either way the other file must stay as it is.
     for (const auto& file : {dir.Index(), dir.Data()}) {
         INFO(file.filename().string());
         const auto aside = dir.path / "aside.bin";
@@ -342,3 +343,42 @@ TEST_CASE("PrecompiledStore: no start marker once the store is closed", "[video_
     store.Close();
     REQUIRE_FALSE(store.MarkStarted(1));
 }
+
+#if !defined(_WIN32)
+TEST_CASE("PrecompiledStore: a file that is not a regular file keeps the other", "[video_core]") {
+    // A device in a file's place reads no bytes, with no error, from every standard library, and
+    // opens for writing: taken for an empty index, the store started again, emptying the data
+    // file and writing its new index into the device.
+    TempDir dir;
+    {
+        PrecompiledStore store;
+        PrecompiledStore::Loaded loaded;
+        REQUIRE(store.Open(dir.Data(), dir.Index(), "stamp", 4, loaded));
+        REQUIRE(store.AddRecord(PreparedRecord(1, store.AddBlob(Kind::Info, 1, Bytes("info")),
+                                               PrecompiledStore::NoBlob)));
+    }
+    const auto data_size = std::filesystem::file_size(dir.Data());
+    const auto index_size = std::filesystem::file_size(dir.Index());
+    for (const auto& file : {dir.Index(), dir.Data()}) {
+        INFO(file.filename().string());
+        const auto aside = dir.path / "aside.bin";
+        std::filesystem::rename(file, aside);
+        std::filesystem::create_symlink("/dev/null", file);
+        {
+            PrecompiledStore store;
+            PrecompiledStore::Loaded loaded;
+            REQUIRE_FALSE(store.Open(dir.Data(), dir.Index(), "stamp", 4, loaded));
+            REQUIRE(loaded.records.empty());
+        }
+        std::filesystem::remove(file);
+        std::filesystem::rename(aside, file);
+        REQUIRE(std::filesystem::file_size(dir.Data()) == data_size);
+        REQUIRE(std::filesystem::file_size(dir.Index()) == index_size);
+    }
+    PrecompiledStore store;
+    PrecompiledStore::Loaded loaded;
+    REQUIRE(store.Open(dir.Data(), dir.Index(), "stamp", 4, loaded));
+    REQUIRE(loaded.resumed);
+    REQUIRE(loaded.records.size() == 1);
+}
+#endif

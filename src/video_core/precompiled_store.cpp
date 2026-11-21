@@ -33,24 +33,33 @@ T Get(const std::vector<char>& bytes, size_t offset) {
 }
 
 /// The bytes of `path` (none when it is missing), or nothing when it is there but cannot be read:
-/// a store that can't be read is kept, not started again.
+/// a store that can't be read is kept, not started again. A read error does not always say so:
+/// libc++ reads a directory, or a file whose read fails, as having no bytes, with no exception and
+/// no badbit. So anything but a regular file is not read, and a read that returns fewer bytes than
+/// the file's size is an error. The store's lock is held while it is read (PreparePrecompiled), so
+/// no other emulator changes the file between its size and the read.
 std::optional<std::vector<char>> ReadAll(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        std::error_code error;
-        if (!std::filesystem::exists(path, error) && !error) {
+    std::error_code error;
+    if (!std::filesystem::exists(path, error)) {
+        if (!error) {
             return std::vector<char>{};
         }
         return std::nullopt;
     }
-    std::vector<char> bytes;
-    try {
-        // The iterators read the file buffer directly, which throws on a read error (libstdc++).
-        bytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-    } catch (const std::ios_base::failure&) {
+    if (!std::filesystem::is_regular_file(path, error) || error) {
         return std::nullopt;
     }
-    if (file.bad()) {
+    const u64 size = std::filesystem::file_size(path, error);
+    if (error) {
+        return std::nullopt;
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return std::nullopt;
+    }
+    std::vector<char> bytes(static_cast<size_t>(size));
+    file.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (file.bad() || static_cast<u64>(file.gcount()) != size) {
         return std::nullopt;
     }
     return bytes;
@@ -132,18 +141,31 @@ PrecompiledStore::ResumeResult PrecompiledStore::Resume(const std::filesystem::p
         const bool missing = !std::filesystem::exists(data_path, exists_error) && !exists_error;
         return missing ? ResumeResult::Mismatch : ResumeResult::Failed;
     }
-    // The data file's header: its stamp must be this one too.
+    // The data file's header: its stamp must be this one too. A read error is not always reported
+    // as one (see ReadAll): a read that returns fewer bytes than the file holds from there is an
+    // error, and the store is kept; only a file shorter than the header is one to start again.
     {
+        if (!std::filesystem::is_regular_file(data_path, error) || error) {
+            return ResumeResult::Failed;
+        }
         std::ifstream file(data_path, std::ios::binary);
         if (!file) {
             return ResumeResult::Failed; // it is there (its size was read), but can't be read
         }
+        const auto read_failed = [&file, data_size](std::streamsize wanted, u64 at) {
+            const u64 left = data_size > at ? data_size - at : 0;
+            return file.bad() ||
+                   static_cast<u64>(file.gcount()) < (std::min)(static_cast<u64>(wanted), left);
+        };
         std::array<char, 8> magic{};
         u32 stamp_size{};
         file.read(magic.data(), magic.size());
+        if (read_failed(static_cast<std::streamsize>(magic.size()), 0)) {
+            return ResumeResult::Failed;
+        }
         file.read(reinterpret_cast<char*>(&stamp_size), sizeof(stamp_size));
-        if (file.bad()) {
-            return ResumeResult::Failed; // a read error, not a short or different header
+        if (read_failed(sizeof(stamp_size), magic.size())) {
+            return ResumeResult::Failed;
         }
         if (!file || std::string_view{magic.data(), magic.size()} != DataMagic ||
             stamp_size != stamp.size()) {
@@ -151,7 +173,7 @@ PrecompiledStore::ResumeResult PrecompiledStore::Resume(const std::filesystem::p
         }
         std::string file_stamp(stamp_size, '\0');
         file.read(file_stamp.data(), stamp_size);
-        if (file.bad()) {
+        if (read_failed(stamp_size, magic.size() + sizeof(stamp_size))) {
             return ResumeResult::Failed;
         }
         if (!file || file_stamp != stamp) {
