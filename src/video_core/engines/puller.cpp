@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <optional>
+#include <string>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -131,8 +133,23 @@ enum class AcquireCheck {
 // may also go down: only what it holds once the back ran everything sent so far decides one
 // (GpuSplit::SettledWordAt), and where the front can't tell that, or it doesn't meet it, it
 // drains as before.
+// TEMPORARY (verify diagnostics): what decided the last equal or mask acquire met by a queued
+// release, for VerifyWithoutDrain's report of one not in the word after a drain.
+struct QueuedDecision {
+    bool equal_path{};
+    bool diverted{};
+    std::optional<VideoCommon::GpuSplit::QueuedSemaphoreWrite> direct;
+    std::optional<VideoCommon::GpuSplit::QueuedSemaphoreWrite> mirrored;
+    u32 guest_before{};
+};
+QueuedDecision g_queued_decision;
+std::atomic<u64> g_equal_unlanded{};
+std::atomic<u64> g_equal_unlanded_diverted{};
+std::atomic<u64> g_equal_queued_verified{};
+
 AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
                                u64& release) {
+    g_queued_decision = {};
     auto& split = VideoCommon::GpuSplit::Get();
     auto& stats = VideoCommon::g_acquire_stats;
     if (!split.Active() || !split.FrontMacros() || !ReleasesLandAtOnce()) {
@@ -157,6 +174,11 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
                 return AcquireCheck::Met;
             }
             release = *settled->release;
+            if (VideoCommon::g_acquire_verify) {
+                g_queued_decision = {true, settled->diverted, split.QueuedSemaphoreWriteAt(*device),
+                                     split.QueuedMirroredReleaseAt(*device),
+                                     dma_pusher.memory_manager.Read<u32>(acquire.address)};
+            }
             return AcquireCheck::MetByQueued;
         }
         if (settled && settled->diverted) {
@@ -215,6 +237,9 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     DrainBack();
     const u32 word = ReadSemaphoreWord(dma_pusher, acquire.address);
     auto& stats = VideoCommon::g_acquire_stats;
+    if (decided == AcquireCheck::MetByQueued && g_queued_decision.equal_path) {
+        g_equal_queued_verified.fetch_add(1, std::memory_order_relaxed);
+    }
     if (acquire.Matches(word)) {
         if (decided == AcquireCheck::NotMet) {
             VideoCommon::Count(stats.late);
@@ -224,6 +249,29 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
     if (decided == AcquireCheck::MetByQueued) {
         // A fence-flagged release writes memory once the host GPU passed it.
         VideoCommon::Count(stats.unlanded);
+        if (g_queued_decision.equal_path) {
+            const QueuedDecision& d = g_queued_decision;
+            const u64 n = g_equal_unlanded.fetch_add(1, std::memory_order_relaxed) + 1;
+            const u64 nd = d.diverted
+                               ? g_equal_unlanded_diverted.fetch_add(1, std::memory_order_relaxed) + 1
+                               : g_equal_unlanded_diverted.load(std::memory_order_relaxed);
+            if (n <= 40 || n % 1000 == 0) {
+                const auto note = [](const auto& write) {
+                    return write ? fmt::format("payload {:#x} known {} at_least {} fenced {} pos {}",
+                                               write->payload, write->known, write->at_least,
+                                               write->fenced, write->position)
+                                 : std::string{"none"};
+                };
+                LOG_WARNING(HW_GPU,
+                            "Acquire verify (equal path) #{} ({} diverted, of {} verified): {:#x} op "
+                            "{} value {:#x}: word after the drain {:#x}, guest now {:#x}, guest "
+                            "before {:#x}; diverted {}; direct [{}]; mirrored [{}]",
+                            n, nd, g_equal_queued_verified.load(std::memory_order_relaxed),
+                            acquire.address, acquire.operation, acquire.value, word,
+                            dma_pusher.memory_manager.Read<u32>(acquire.address), d.guest_before,
+                            d.diverted, note(d.direct), note(d.mirrored));
+            }
+        }
         return;
     }
     if (decided != AcquireCheck::Met) {
