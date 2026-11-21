@@ -278,6 +278,12 @@ protected:
         return false;
     }
 
+    /// Count as a request, so that a renderer waiting for queue space starts counting idle checks
+    /// again: for a backend just published or started, which the checks before were not about.
+    void RestartStallCount() {
+        output_requests.fetch_add(1, std::memory_order_relaxed);
+    }
+
 protected:
     /// Core system
     Core::System& system;

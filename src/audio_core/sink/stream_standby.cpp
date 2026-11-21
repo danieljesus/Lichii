@@ -109,6 +109,10 @@ bool StandbySinkStream::RenderFromBackend(const void* backend, std::span<s16> ou
     if (!backend_asked.load(std::memory_order_acquire)) {
         first_ask.store(now, std::memory_order_relaxed);
         backend_asked.store(true, std::memory_order_release);
+        if (left_to_start.exchange(false)) {
+            // It started after all: should it stall again, it is reopened once more.
+            stall_level.store(max_stall_level, std::memory_order_relaxed);
+        }
     } else if (const u32 level = stall_level.load(std::memory_order_relaxed); level != 0) {
         const auto sustained = timing.stall_check * StallThreshold(true, level);
         if (now - first_ask.load(std::memory_order_relaxed) >=
@@ -138,6 +142,7 @@ void StandbySinkStream::OpenInitialBackend() {
             published = opened && losses == 0;
             if (published) {
                 backend_asked = false;
+                RestartStallCount();
                 live_backend = opened;
                 state = State::Live;
             } else {
@@ -206,7 +211,18 @@ bool StandbySinkStream::BackendIdle(u32 idle_checks) {
         if (idle_checks < StallThreshold(asked, level)) {
             return false;
         }
-        stall_level = (std::min)(level + 1, max_stall_level);
+        if (level > max_stall_level) {
+            // Reopened at every threshold already, and slower than all of them: leave it to
+            // start, or to report an error, rather than reopen it for ever.
+            if (!left_to_start.exchange(true)) {
+                LOG_WARNING(Audio_Sink,
+                            "Stream {}: the backend has not asked for audio after {} reopens; "
+                            "leaving it to start",
+                            name, max_stall_level + 1);
+            }
+            return false;
+        }
+        stall_level = level + 1;
         state = State::Lost;
         // Unpublished now, so that its callbacks, should they come back, play silence; the worker
         // destroys it off the locks, as it may not respond.
@@ -264,6 +280,7 @@ void StandbySinkStream::Start(bool) {
     // A started backend may take a while to ask for audio again: it gets the grace of one that
     // has not asked yet.
     backend_asked = false;
+    RestartStallCount();
     if (!StartBackend(current)) {
         LOG_ERROR(Audio_Sink, "Error starting stream {}", name);
         // A stream that stands in plays into nothing until it reopens; others stay not ready
@@ -368,7 +385,9 @@ void StandbySinkStream::Run(std::stop_token stop_token) {
             stalled = std::exchange(stalled_backend, nullptr);
         }
         if (stalled) {
-            RetireStalled(stalled);
+            if (!RetireStalled(stop_token, stalled)) {
+                break;
+            }
         } else {
             ReleaseBackend();
         }
@@ -427,11 +446,27 @@ void StandbySinkStream::ReleaseBackend() {
     }
 }
 
-void StandbySinkStream::RetireStalled(void* backend) {
+bool StandbySinkStream::RetireStalled(std::stop_token stop_token, void* backend) {
     // Unpublished under state_mutex before this: a callback counted before that may still be
-    // playing the stream, and none after it will.
+    // playing the stream, and none after it will. The stand-in cannot play the stream until it
+    // ends, as the stream has one consumer at a time; it runs only this stream's code, so it ends
+    // within a block unless its thread is held, as by a debugger. Wait for it asleep, and give up
+    // only when stopping, leaving the backend to Finalize.
+    const auto warn_at = std::chrono::steady_clock::now() + timing.stall_check * StallChecks;
+    bool warned = false;
     while (rendering.load() != 0) {
-        std::this_thread::yield();
+        if (!warned && std::chrono::steady_clock::now() >= warn_at) {
+            warned = true;
+            LOG_WARNING(Audio_Sink,
+                        "Stream {}: a callback of its stalled backend is still playing it; waiting "
+                        "for it before standing in",
+                        name);
+        }
+        if (!Common::StoppableTimedWait(stop_token, std::chrono::milliseconds{1})) {
+            std::scoped_lock lock{state_mutex};
+            stalled_backend = backend;
+            return false;
+        }
     }
     retired = false;
     const auto destroy = [this, backend] {
@@ -453,6 +488,7 @@ void StandbySinkStream::RetireStalled(void* backend) {
                   name, error.what());
         destroy();
     }
+    return true;
 }
 
 StandbySinkStream::Reopen StandbySinkStream::TryReopen(std::stop_token stop_token, u32 attempt) {
@@ -513,7 +549,10 @@ StandbySinkStream::Reopen StandbySinkStream::TryReopen(std::stop_token stop_toke
                 std::scoped_lock lock{state_mutex};
                 published = state == State::Reopening && losses == seen && !failed;
                 if (published) {
+                    // The checks a waiting renderer counted while this one opened and started,
+                    // during which nothing played the stream, are not its own.
                     backend_asked = false;
+                    RestartStallCount();
                     live_backend = opened;
                     state = State::Live;
                 }

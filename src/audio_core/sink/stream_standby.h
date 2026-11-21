@@ -187,10 +187,12 @@ protected:
      * yet, as a device waking up (a Bluetooth sink, an HDMI receiver, a suspended PulseAudio or
      * PipeWire stream, a resume from sleep) can take longer to start than a running one to resume.
      * Doubled again after each stall that reopened the stream, as the reopen delay doubles, over
-     * as many doublings as that delay has (first_retry to max_retry: three by default), so that a
-     * device slower to start than the threshold is reopened a few times at most and then left to
-     * start. The doublings are forgotten once a backend has asked for audio for as long as the
-     * threshold they reached.
+     * as many doublings as that delay has (first_retry to max_retry: three by default). A backend
+     * found stalled once more after the last doubling is not reopened again, but left to start
+     * (BackendIdle): so a device slower to start than every threshold is reopened that many times
+     * plus one at most. Its first request clears that, with one stall left at the longest
+     * threshold, and the doublings are forgotten once a backend has asked for audio for as long as
+     * the threshold they reached.
      */
     u32 StallThreshold(bool asked, u32 level) const {
         return (asked ? StallChecks : 2 * StallChecks) << (std::min)(level, max_stall_level);
@@ -229,8 +231,9 @@ private:
                  const std::atomic<bool>* done = nullptr);
     void ReleaseBackend();
     /// Destroy a stalled backend, already unpublished, on a thread of its own once no callback of
-    /// it plays the stream, so that the stand-in plays meanwhile. Worker thread only.
-    void RetireStalled(void* backend);
+    /// it plays the stream, so that the stand-in plays meanwhile. False if the stream stops before
+    /// that callback ends: the backend is then left for Finalize. Worker thread only.
+    bool RetireStalled(std::stop_token stop_token, void* backend);
     Reopen TryReopen(std::stop_token stop_token, u32 attempt);
     /// Mark the stream finalized and pause it, so that nothing waits for queue space meanwhile,
     /// then stop and join the worker, which waits for an open under way. Returns the state before.
@@ -269,6 +272,8 @@ private:
     std::atomic<s64> first_ask{};
     /// See StallThreshold.
     std::atomic<u32> stall_level{};
+    /// Found stalled past the last doubling and left to start, until its first request.
+    std::atomic<bool> left_to_start{};
 
     /// Worker only: the block it plays, and when the next one is due.
     std::vector<s16> stand_in_block;
