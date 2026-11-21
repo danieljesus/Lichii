@@ -3,6 +3,7 @@
 #pragma once
 
 #include <concepts>
+#include <functional>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -30,7 +31,13 @@ class UniqueFunction {
         ~Callable() override = default;
 
         ResultType operator()(Args&&... args) override {
-            return functor(std::forward<Args>(args)...);
+            // As the constructor's constraint: any callable std::invoke takes, and a result
+            // that is dropped when the wrapper returns nothing.
+            if constexpr (std::is_void_v<ResultType>) {
+                std::invoke(functor, std::forward<Args>(args)...);
+            } else {
+                return std::invoke(functor, std::forward<Args>(args)...);
+            }
         }
 
     private:

@@ -167,6 +167,26 @@ TEST_CASE("UniqueFunction", "[common]") {
         func();
         REQUIRE(counter.calls == 2);
     }
+    SECTION("Drops the result of a callable when it returns nothing") {
+        int calls = 0;
+        Common::UniqueFunction<void> func{[&calls] { return ++calls; }};
+        func();
+        REQUIRE(calls == 1);
+    }
+    SECTION("Calls a member function through its pointer") {
+        struct Receiver {
+            int Add(int amount) {
+                return total += amount;
+            }
+            int total = 0;
+        };
+        Receiver receiver;
+        Common::UniqueFunction<int, Receiver&, int> func{&Receiver::Add};
+        REQUIRE(func(receiver, 4) == 4);
+        Common::UniqueFunction<void, Receiver&, int> dropped{&Receiver::Add};
+        dropped(receiver, 5);
+        REQUIRE(receiver.total == 9);
+    }
     SECTION("Is not constructible from what it cannot own or call") {
         struct MoveOnly {
             MoveOnly() = default;
