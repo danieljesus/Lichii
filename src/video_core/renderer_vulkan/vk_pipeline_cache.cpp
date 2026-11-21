@@ -3845,6 +3845,24 @@ bool PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
     return true;
 }
 
+PipelineCacheDataOrigin PipelineCacheDataMadeBy(std::span<const char> data, u32 vendor_id,
+                                                u32 device_id,
+                                                std::span<const u8, VK_UUID_SIZE> uuid) {
+    // Its fields are little endian whatever the host, as every host Lichii runs on is.
+    VkPipelineCacheHeaderVersionOne header;
+    if (data.size() < sizeof(header)) {
+        return PipelineCacheDataOrigin::Unknown;
+    }
+    std::memcpy(&header, data.data(), sizeof(header));
+    if (header.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+        header.headerSize < sizeof(header)) {
+        return PipelineCacheDataOrigin::Unknown;
+    }
+    const bool same = header.vendorID == vendor_id && header.deviceID == device_id &&
+                      std::ranges::equal(header.pipelineCacheUUID, uuid);
+    return same ? PipelineCacheDataOrigin::ThisDriver : PipelineCacheDataOrigin::OtherDriver;
+}
+
 vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::path& filename,
                                                          u32 expected_cache_version) {
     const auto create_pipeline_cache = [this](size_t data_size, const void* data) {
@@ -3899,6 +3917,18 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         const size_t cache_size = static_cast<size_t>(end) - header_size;
         std::vector<char> cache_data(cache_size);
         file.read(cache_data.data(), cache_size);
+
+        // The driver would accept data another driver version made and silently start empty;
+        // the cache is not restored then, so the precache progress that relied on it goes too.
+        // The file is replaced at the next save.
+        if (PipelineCacheDataMadeBy(cache_data, device.GetVendorID(), device.GetDeviceID(),
+                                    device.GetPipelineCacheUUID()) ==
+            PipelineCacheDataOrigin::OtherDriver) {
+            LOG_INFO(Render_Vulkan,
+                     "Vulkan driver pipeline cache discarded: made by another driver version: {}",
+                     Common::FS::PathToUTF8String(filename));
+            return create_pipeline_cache(0, nullptr);
+        }
 
         LOG_INFO(Render_Vulkan,
                  "Loaded Vulkan driver pipeline cache: {}", Common::FS::PathToUTF8String(filename));
