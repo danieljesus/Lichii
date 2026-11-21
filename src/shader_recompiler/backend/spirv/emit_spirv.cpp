@@ -673,6 +673,7 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
 namespace {
 struct HmmaPlan {
     std::optional<u32> tensor_scratch_word;
+    bool tensor_8x8x8; ///< That area is the 8x8x8 path's
     bool cooperative_hmma;
     std::optional<u32> software_hmma_scratch_word;
 };
@@ -680,7 +681,10 @@ struct HmmaPlan {
 HmmaPlan PlanHmma(const Profile& profile, IR::Program& program) {
     // Looked at again for each plan, in case the IR changed since the last one.
     program.hmma_summary.reset();
-    const std::optional<u32> tensor_scratch_word{ReserveCooperativeHmmaScratch(profile, program)};
+    std::optional<u32> tensor_scratch_word{ReserveCooperativeHmmaScratch(profile, program)};
+    const bool tensor_8x8x8{!tensor_scratch_word &&
+                            (tensor_scratch_word = ReserveCooperativeHmma8x8x8Scratch(profile, program))
+                                .has_value()};
     const bool cooperative_hmma{tensor_scratch_word.has_value() ||
                                 UsesCooperativeHmma(profile, program)};
     const std::optional<u32> software_hmma_scratch_word{
@@ -691,6 +695,7 @@ HmmaPlan PlanHmma(const Profile& profile, IR::Program& program) {
     }
     return {
         .tensor_scratch_word = tensor_scratch_word,
+        .tensor_8x8x8 = tensor_8x8x8,
         .cooperative_hmma = cooperative_hmma,
         .software_hmma_scratch_word = software_hmma_scratch_word,
     };
@@ -719,15 +724,17 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     } else {
         SetHmmaRequirements(program, plan);
     }
-    const auto [tensor_scratch_word, cooperative_hmma, software_hmma_scratch_word] = plan;
+    const auto [tensor_scratch_word, tensor_8x8x8, cooperative_hmma, software_hmma_scratch_word] =
+        plan;
     EmitContext ctx{profile, runtime_info, program, bindings, cooperative_hmma};
     ctx.tensor_scratch_word = tensor_scratch_word;
+    ctx.tensor_scratch_8x8x8 = tensor_8x8x8;
     ctx.software_hmma_scratch_word = software_hmma_scratch_word;
     DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program, ctx, main);
-    if (software_hmma_scratch_word && profile.support_maximal_reconvergence) {
-        // The staged HMMA exchange waits on subgroup barriers: lanes that took different paths
+    if ((software_hmma_scratch_word || tensor_8x8x8) && profile.support_maximal_reconvergence) {
+        // The staged HMMA exchange and the 8x8x8 path wait on subgroup barriers: lanes that took different paths
         // through the ifs and loops before it meet again there (HmmaInConvergedFlow keeps every
         // HMMA itself out of them).
         ctx.AddExtension("SPV_KHR_maximal_reconvergence");

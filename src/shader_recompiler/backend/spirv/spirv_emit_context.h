@@ -421,6 +421,8 @@ public:
     /// Set when HMMA runs on 16x16x16 matrices: each 32-lane subgroup owns 384 words of shared
     /// memory from this word (A, B and C/D tiles of 16x16 fp16, 128 words each).
     std::optional<u32> tensor_scratch_word;
+    /// That memory is the 8x8x8 path's (320 words a subgroup, Hmma8x8x8WordsPerWarp)
+    bool tensor_scratch_8x8x8{};
     /// First shared memory word of the software HMMA's per-warp fragment exchange
     std::optional<u32> software_hmma_scratch_word;
     Id tensor_subgroup_id{};
