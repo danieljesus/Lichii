@@ -4,12 +4,14 @@
 #include <array>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/common_funcs.h"
 #include "common/scope_exit.h"
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/file_sys/vfs/vfs_vector.h"
@@ -72,7 +74,7 @@ FileSys::VirtualFile MakeStoredNso(const std::array<Segment, 3>& segments) {
 }
 
 // Loads `nso` without mapping it into the process.
-std::optional<VAddr> Load(const FileSys::VirtualFile& nso) {
+std::optional<VAddr> Load(const FileSys::VirtualFile& nso, bool pass_arguments = false) {
     ScopedSystemTestContext environment;
     Core::System system;
     system.Initialize();
@@ -92,8 +94,24 @@ std::optional<VAddr> Load(const FileSys::VirtualFile& nso) {
     SCOPE_EXIT {
         kernel.UnregisterKernelObject(&process);
     };
-    return Loader::AppLoader_NSO::LoadModule(process, system, *nso, 0x8000000, false, false);
+    return Loader::AppLoader_NSO::LoadModule(process, system, *nso, 0x8000000, pass_arguments,
+                                             false);
 }
+
+// Sets the program arguments for the scope.
+class ProgramArguments {
+public:
+    explicit ProgramArguments(std::string arguments)
+        : saved{Settings::values.program_args.GetValue()} {
+        Settings::values.program_args.SetValue(std::move(arguments));
+    }
+    ~ProgramArguments() {
+        Settings::values.program_args.SetValue(saved);
+    }
+
+private:
+    std::string saved;
+};
 
 } // Anonymous namespace
 
@@ -137,4 +155,33 @@ TEST_CASE("NSO rejects segments that end past a 32-bit image", "[core][loader]")
     CHECK_FALSE(Load(MakeStoredNso({{{0xfffffff0, 0x20, 0x20}, {0x1000, 0x10, 0x10},
                                      {0x2000, 0x10, 0x10}}}))
                     .has_value());
+}
+
+TEST_CASE("NSO argument block is sized for its arguments", "[core][loader]") {
+    const auto nso = [] {
+        return MakeStoredNso({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10}, {0x2000, 0x10, 0x10}}});
+    };
+    const auto without = Load(nso());
+    REQUIRE(without);
+    // Sized as the console's loader sizes it: room for the arguments twice over and 32 KiB more,
+    // page aligned. Short arguments get the 0x9000 bytes they always did.
+    {
+        const ProgramArguments arguments{"homebrew --flag"};
+        const auto with = Load(nso(), true);
+        REQUIRE(with);
+        CHECK(*with - *without == 0x9000);
+    }
+    {
+        const ProgramArguments arguments{std::string(0x7FFF, 'a')};
+        const auto with = Load(nso(), true);
+        REQUIRE(with);
+        CHECK(*with - *without == 0x19000); // AlignUp(8 + 2 * 0x7FFF + 0x8000)
+    }
+}
+
+TEST_CASE("NSO refuses arguments longer than the console accepts", "[core][loader]") {
+    // Longer than the 0x9000 byte block they were copied into whatever their length.
+    const ProgramArguments arguments{std::string(0x9000, 'a')};
+    CHECK_FALSE(Load(
+        MakeStoredNso({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10}, {0x2000, 0x10, 0x10}}}), true));
 }
