@@ -29,6 +29,10 @@ std::vector<u8> MakeKip(std::string_view name, std::string_view text) {
     std::memcpy(bytes.data() + 4, name.data(), name.size());
     Put32(bytes, 0x24, static_cast<u32>(text.size()));
     Put32(bytes, 0x28, static_cast<u32>(text.size()));
+    // A layout the kernel accepts: .rodata, .data and .bss each on a page after .text.
+    Put32(bytes, 0x30, 0x1000);
+    Put32(bytes, 0x40, 0x2000);
+    Put32(bytes, 0x50, 0x3000);
     bytes.insert(bytes.end(), text.begin(), text.end());
     return bytes;
 }

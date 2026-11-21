@@ -3,22 +3,29 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <climits>
 #include <cstring>
+#include "common/assert.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "common/random.h"
 #include "core/file_sys/kernel_executable.h"
 #include "core/file_sys/program_metadata.h"
+#include "core/core.h"
 #include "core/hle/kernel/code_set.h"
+#include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/kernel.h"
 #include "core/loader/kip.h"
 #include "core/memory.h"
 
 namespace Loader {
 
 namespace {
-constexpr u32 PageAlignSize(u32 size) {
-    return static_cast<u32>((size + Core::Memory::LICHII_PAGEMASK) & ~Core::Memory::LICHII_PAGEMASK);
+// 64-bit: a 32-bit size from the header near 4 GiB would wrap.
+constexpr u64 PageAlignSize(u64 size) {
+    return (size + Core::Memory::LICHII_PAGEMASK) & ~Core::Memory::LICHII_PAGEMASK;
 }
 } // Anonymous namespace
 
@@ -74,18 +81,44 @@ AppLoader::LoadResult AppLoader_KIP::Load(Kernel::KProcess& process,
                         kip->GetTitleID(), 0xFFFFFFFFFFFFFFFF, 0x1FE00000,
                         kip->GetKernelCapabilities());
 
+    // The KIP's constructor checked the layout in 64-bit arithmetic: .text at 0, .rodata, .data
+    // and .bss after it in order, each section's bytes no more than its size, all inside
+    // GetImageSize(). The loader used to size and fill the code set from the header's 32-bit
+    // values without checking them, so a damaged or crafted .kip could make it copy outside the
+    // buffer when launched. What is left to check is that the process can hold the image, before
+    // anything is allocated: the code region counts pages in an s32, and the image cannot be
+    // larger than the memory of the pool the process is created in.
+    const u64 image_size = kip->GetImageSize();
+    const auto pool = static_cast<Kernel::KMemoryManager::Pool>(
+        FileSys::ProgramMetadata::GetDefault().GetPoolPartition());
+    if (image_size == 0 || image_size / Core::Memory::LICHII_PAGESIZE > INT32_MAX ||
+        image_size > system.Kernel().MemoryManager().GetSize(pool)) {
+        LOG_ERROR(Loader, "KIP {} needs a {:#x} byte image, which the process cannot hold",
+                  kip->GetName(), image_size);
+        return {ResultStatus::ErrorBadKIPHeader, {}};
+    }
+
     Kernel::CodeSet codeset;
-    codeset.memory.resize(PageAlignSize(kip->GetBSSOffset()) + kip->GetBSSSize());
-    const auto load_segment = [&codeset](Kernel::CodeSet::Segment& segment, std::span<const u8> data, u32 offset) {
+    codeset.memory.resize(static_cast<std::size_t>(image_size));
+    // Each segment spans its section's size from the header; the bytes the KIP holds for it may
+    // be fewer, and the rest stays zero.
+    const auto load_segment = [&codeset](Kernel::CodeSet::Segment& segment,
+                                         std::span<const u8> data, u64 offset, u64 size) {
+        ASSERT(data.size() <= size && offset + size <= codeset.memory.size());
         segment.addr = offset;
         segment.offset = offset;
-        segment.size = PageAlignSize(u32(data.size()));
+        segment.size = static_cast<u32>(size);
         std::memcpy(codeset.memory.data() + offset, data.data(), data.size());
     };
-    load_segment(codeset.CodeSegment(), kip->GetTextSection(), kip->GetTextOffset());
-    load_segment(codeset.RODataSegment(), kip->GetRODataSection(), kip->GetRODataOffset());
-    load_segment(codeset.DataSegment(), kip->GetDataSection(), kip->GetDataOffset());
-    codeset.DataSegment().size += kip->GetBSSSize();
+    const u64 rx = kip->GetTextOffset();
+    const u64 ro = kip->GetRODataOffset();
+    const u64 rw = kip->GetDataOffset();
+    load_segment(codeset.CodeSegment(), kip->GetTextSection(), rx,
+                 PageAlignSize(kip->GetSectionSize(0)));
+    load_segment(codeset.RODataSegment(), kip->GetRODataSection(), ro,
+                 PageAlignSize(kip->GetSectionSize(1)));
+    // .data and .bss share the last segment, to the end of the image.
+    load_segment(codeset.DataSegment(), kip->GetDataSection(), rw, image_size - rw);
 
     // TODO: this is bad form of ASLR, it sucks
     std::uintptr_t aslr_offset = ((::Settings::values.rng_seed_enabled.GetValue()

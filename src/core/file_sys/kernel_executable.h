@@ -84,14 +84,29 @@ public:
     u32 GetBSSSize() const;
     u32 GetBSSOffset() const;
 
+    /// The size .text, .rodata or .data (0 to 2) has in memory, from the header. The section's
+    /// bytes may be fewer (a section stored raw with fewer bytes than its size): the rest of the
+    /// segment is zero. Only what the file stores or decompresses to is kept.
+    u32 GetSectionSize(u8 index) const;
+
+    /// The size of the process image, .text to the end of .bss, page aligned. With Success, the
+    /// sections lie inside it in order, as the kernel requires (see the constructor).
+    u64 GetImageSize() const;
+
     // The header and the stored sections, which is where the next KIP of an INI1 starts.
     u64 GetSize() const;
+
+    /// Whether GetSize() can be relied on: the header was read and the file holds every stored
+    /// section, whatever else is wrong with the KIP.
+    bool IsSizeKnown() const;
 
 private:
     Loader::ResultStatus status;
 
     KIPHeader header{};
     std::array<std::vector<u8>, 6> decompressed_sections;
+    u64 image_size{};
+    bool size_known{};
 };
 
 class INI {
