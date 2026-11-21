@@ -36,8 +36,8 @@ public:
     };
 
     LosableStream(Core::System& emu_system, StreamType stream_type, int failed_opens,
-                  bool open = true)
-        : StandbySinkStream{emu_system, stream_type, {50ms, 200ms}} {
+                  bool open = true, std::chrono::milliseconds stall_check = 1000ms)
+        : StandbySinkStream{emu_system, stream_type, {50ms, 200ms, stall_check}} {
         device_channels = 2;
         SetSystemChannels(2);
         SetRingSize(4);
@@ -807,4 +807,58 @@ TEST_CASE("An error during a backend's open is handled by exactly one of the ope
         UNSCOPED_INFO("handled by the open " << handled_by_open << ", by the callback "
                                              << handled_by_callback);
     }
+}
+
+TEST_CASE("A stream whose backend stops asking for audio without an error reopens",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, 20ms);
+    stream->Start();
+    REQUIRE(stream->Only() != nullptr);
+    REQUIRE(stream->published == 1);
+    // Its backend never calls back, and reports nothing: the renderer, waiting for space, finds
+    // that it stopped, and the stand-in plays the stream until it reopens. The reopened backend
+    // calls back as a working device does, and plays the stream.
+    std::atomic<u64> played{};
+    std::jthread callback([&](std::stop_token stop_token) {
+        std::array<s16, 480> output{};
+        while (!stop_token.stop_requested()) {
+            // Not the first backend: the one published by a reopen (a new one may reuse its address).
+            auto* const current = stream->published >= 2 ? stream->Only() : nullptr;
+            if (current != nullptr && stream->RenderFromBackend(current, output, 240)) {
+                ++played;
+            }
+            std::this_thread::sleep_for(5ms);
+        }
+    });
+    CHECK(Render(*stream, 64));
+    CHECK(WaitFor([&] { return played.load() > 0; }));
+    callback.request_stop();
+    callback.join();
+    CHECK(stream->Reopens() == 1);
+    CHECK(stream->published == 2);
+    CHECK(stream->Running());
+}
+
+TEST_CASE("A stream whose backend asks for audio slowly is not reopened",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, 20ms);
+    stream->Start();
+    auto* const backend = stream->Only();
+    REQUIRE(backend != nullptr);
+    // A callback every 30 ms: never three checks of 20 ms in a row without one.
+    std::jthread callback([&](std::stop_token stop_token) {
+        std::array<s16, 480> output{};
+        while (!stop_token.stop_requested()) {
+            stream->RenderFromBackend(backend, output, 240);
+            std::this_thread::sleep_for(30ms);
+        }
+    });
+    CHECK(Render(*stream, 32));
+    callback.request_stop();
+    callback.join();
+    CHECK(stream->ReopenAttempts() == 0);
+    CHECK_FALSE(stream->IsStandingIn());
+    CHECK(stream->Only() == backend);
 }

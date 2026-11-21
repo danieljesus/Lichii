@@ -259,6 +259,25 @@ protected:
      */
     void SignalPause();
 
+    /**
+     * The backend asked for no audio during StallChecks checks in a row while the renderer waited
+     * for queue space with the stream playing, as a backend does whose callback stopped without
+     * reporting an error. Called on the renderer's thread without the stream's locks. Streams that
+     * can reopen their backend do; others keep waiting, as before.
+     *
+     * @param idle - At least this long without a request.
+     */
+    virtual void BackendStalled([[maybe_unused]] std::chrono::milliseconds idle) {}
+
+    /// How often a renderer waiting for queue space checks that the backend still asks for audio,
+    /// and how many checks in a row without a request mean it stopped. These are cubeb's WASAPI
+    /// backend's own rule until 2025, which treated three waits of a second with no event as an
+    /// error: counting waits rather than measuring time keeps one wait across a system sleep from
+    /// counting as a stall. A working backend asks at least once per period, 171 ms at most
+    /// (PipeWire's largest quantum, 8192 frames at 48 kHz), and once a re-route has reopened it.
+    std::chrono::milliseconds stall_check_interval{1000};
+    static constexpr u32 StallChecks = 3;
+
 protected:
     /// Core system
     Core::System& system;
@@ -297,6 +316,9 @@ private:
     u64 level_max_missing_frames{};
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
+    /// Times anything played the stream, its backend or a stand-in: what a renderer waiting for
+    /// queue space checks for.
+    std::atomic<u64> output_requests{};
     /// Largest number of frames the host device has asked for in one callback (sysmix streams)
     std::atomic<u64> largest_request_frames{};
     /// The ring size for audio out buffers (usually 4, rarely 2 or 8)

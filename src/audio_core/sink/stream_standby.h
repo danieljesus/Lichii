@@ -91,6 +91,8 @@ public:
     struct Timing {
         std::chrono::milliseconds first_retry{500};
         std::chrono::milliseconds max_retry{4000};
+        /// See SinkStream::stall_check_interval.
+        std::chrono::milliseconds stall_check{1000};
     };
 
     /// Reopens on a configured device before the backend should try the default one.
@@ -144,6 +146,9 @@ protected:
 
     /// Open the first backend. Renderer and audio out streams with no device yet stand in.
     void OpenInitialBackend();
+
+    /// A published backend that stopped asking for audio is treated as one that lost its device.
+    void BackendStalled(std::chrono::milliseconds idle) override;
 
     /// The backend lost its device. Takes no lock held around backend calls, so its callbacks can
     /// report it. Ignored once the stream is finalized.

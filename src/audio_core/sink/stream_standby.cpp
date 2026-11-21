@@ -54,7 +54,9 @@ StandbySinkStream::DeviceChoice StandbySinkStream::ChooseDevice(u32 attempt, boo
 }
 
 StandbySinkStream::StandbySinkStream(Core::System& system_, StreamType type_, Timing timing_)
-    : SinkStream{system_, type_}, timing{timing_} {}
+    : SinkStream{system_, type_}, timing{timing_} {
+    stall_check_interval = timing.stall_check;
+}
 
 StandbySinkStream::~StandbySinkStream() {
     ASSERT_MSG(!worker.joinable(), "Stream {}: the derived destructor must call Finalize", name);
@@ -155,6 +157,21 @@ void StandbySinkStream::BackendLost() {
         }
     }
     wake.notify_all();
+}
+
+void StandbySinkStream::BackendStalled(std::chrono::milliseconds idle) {
+    {
+        std::scoped_lock lock{state_mutex};
+        // A stand-in or a reopen under way plays the stream; a paused or faulted one is not
+        // expected to be asked for audio.
+        if (state != State::Live || !StandsIn() || paused || failed || system.IsShuttingDown()) {
+            return;
+        }
+    }
+    LOG_WARNING(Audio_Sink,
+                "Stream {}: the backend stopped asking for audio at least {} ms ago; reopening",
+                name, idle.count());
+    BackendLost();
 }
 
 void StandbySinkStream::Start(bool) {
