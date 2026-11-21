@@ -9,7 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "video_core/renderer_vulkan/pipeline_cache_load.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache_load.h"
 
 namespace {
 

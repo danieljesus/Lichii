@@ -217,7 +217,6 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_build_failure.h
     renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_eviction_policy.h
-    renderer_vulkan/pipeline_cache_load.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_shader_emission.h
@@ -268,6 +267,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_master_semaphore.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
+    renderer_vulkan/vk_pipeline_cache_load.h
     renderer_vulkan/vk_pipeline_cache_records.cpp
     renderer_vulkan/vk_pipeline_cache_records.h
     renderer_vulkan/vk_pipeline_binaries.cpp
