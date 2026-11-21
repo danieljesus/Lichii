@@ -4,15 +4,19 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/pipeline_cache_load.h"
 
 namespace {
 
 using Vulkan::PipelineCacheDataOrigin;
+using Vulkan::VulkanCacheLoad;
+
+constexpr size_t Header = sizeof(VkPipelineCacheHeaderVersionOne);
 
 constexpr u32 Vendor = 0x106B;
 constexpr u32 DeviceId = 0x1A020209;
@@ -77,4 +81,48 @@ TEST_CASE("Driver pipeline cache data with a header of another version is left t
     const u32 size = 16;
     std::memcpy(short_header.data(), &size, sizeof(size));
     CHECK(Origin(short_header) == PipelineCacheDataOrigin::Unknown);
+}
+
+TEST_CASE("A driver pipeline cache the driver kept is restored",
+          "[video_core][vulkan_pipeline_cache]") {
+    // The driver reports more than an empty cache of its own (MoltenVK: 36 bytes).
+    const auto load = Vulkan::DecideVulkanCacheLoad(127845708, 127845708, 36);
+    CHECK(load == VulkanCacheLoad::Restored);
+    const auto actions = Vulkan::ActionsFor(load);
+    CHECK(actions.restored);
+    CHECK_FALSE(actions.remove_file);
+    // A size query that failed tells nothing: taken as kept, as before.
+    CHECK(Vulkan::DecideVulkanCacheLoad(4096, std::nullopt, 36) == VulkanCacheLoad::Restored);
+}
+
+TEST_CASE("A driver pipeline cache the driver kept none of is not restored, and goes",
+          "[video_core][vulkan_pipeline_cache]") {
+    // MoltenVK given 128 MB made by another build of it holds an empty cache's 36 bytes; so does
+    // any driver that drops data for a reason of its own, whatever its header says.
+    const auto load = Vulkan::DecideVulkanCacheLoad(127845708, 36, 36);
+    CHECK(load == VulkanCacheLoad::DriverKeptNothing);
+    const auto actions = Vulkan::ActionsFor(load);
+    CHECK_FALSE(actions.restored);
+    CHECK(actions.remove_file);
+}
+
+TEST_CASE("A driver pipeline cache file with no driver data is not restored, and goes",
+          "[video_core][vulkan_pipeline_cache]") {
+    // Lichii's header alone, as a save that read nothing left it, or less than Vulkan's header:
+    // decided without giving it to the driver.
+    for (const size_t size : {size_t{0}, Header - 1}) {
+        const auto load = Vulkan::DecideVulkanCacheLoad(size, std::nullopt, 0);
+        CHECK(load == VulkanCacheLoad::NoData);
+        const auto actions = Vulkan::ActionsFor(load);
+        CHECK_FALSE(actions.restored);
+        CHECK(actions.remove_file);
+    }
+    CHECK(Vulkan::DecideVulkanCacheLoad(Header, 64, 36) == VulkanCacheLoad::Restored);
+}
+
+TEST_CASE("No driver pipeline cache file is not restored, and nothing is removed",
+          "[video_core][vulkan_pipeline_cache]") {
+    const auto actions = Vulkan::ActionsFor(VulkanCacheLoad::None);
+    CHECK_FALSE(actions.restored);
+    CHECK_FALSE(actions.remove_file);
 }

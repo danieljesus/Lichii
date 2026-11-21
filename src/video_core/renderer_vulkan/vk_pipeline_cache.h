@@ -17,7 +17,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -128,17 +127,6 @@ struct ComputePipelineCacheEntry {
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
 };
-
-/// Whether driver pipeline cache data was made by the driver it is given back to. Vulkan starts
-/// the data with a header naming the vendor, device and pipelineCacheUUID it was made for, and a
-/// driver discards data made for another (MoltenVK's UUID changes with each build of it), though
-/// vkCreatePipelineCache still succeeds. NoData for data shorter than that header, which restores
-/// nothing (a file holding only Lichii's own header among them); Unknown for a header of another
-/// version.
-enum class PipelineCacheDataOrigin { ThisDriver, OtherDriver, NoData, Unknown };
-PipelineCacheDataOrigin PipelineCacheDataMadeBy(std::span<const char> data, u32 vendor_id,
-                                                u32 device_id,
-                                                std::span<const u8, VK_UUID_SIZE> uuid);
 
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
