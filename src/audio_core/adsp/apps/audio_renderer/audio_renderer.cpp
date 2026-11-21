@@ -45,11 +45,12 @@ void AudioRenderer::Stop() {
         return;
     }
 
+    // A render waits for its stream to free queue space, which a stream whose backend stopped
+    // asking for audio without an error never does: that wait ends on the thread's stop token.
+    // So request it before joining, instead of first waiting for a reply to the shutdown, which
+    // such a render would never send. Either way the thread ends: at the shutdown message, or
+    // after the render it is in, before taking another message.
     mailbox.Send(Direction::DSP, Message::Shutdown);
-    if (mailbox.Receive(Direction::Host) != Message::Shutdown) {
-        LOG_ERROR(Service_Audio, "Host Audio Renderer -- Failed to receive shutdown "
-                                 "message response from ADSP!");
-    }
     main_thread.request_stop();
     main_thread.join();
 
@@ -68,8 +69,12 @@ void AudioRenderer::Signal() {
     Send(Direction::DSP, Message::Render);
 }
 
-void AudioRenderer::Wait() {
-    auto msg = Receive(Direction::Host);
+void AudioRenderer::Wait(std::stop_token stop_token) {
+    auto msg = mailbox.Receive(Direction::Host, stop_token);
+    if (stop_token.stop_requested()) {
+        // Stopping while the render may still be running: leave its command buffers to it.
+        return;
+    }
     if (msg != Message::RenderResponse) {
         LOG_ERROR(Service_Audio,
                   "Did not receive the expected render response from the AudioRenderer! Expected "
