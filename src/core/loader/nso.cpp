@@ -213,6 +213,10 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         return std::nullopt;
     }
     Kernel::CodeSet codeset;
+    // The image grows in place below, the argument block, .bss and a patch section appended, up
+    // to the extent checked above: reserved now, as growing a vector past its capacity doubles
+    // it, and an image near the largest pool asked for twice that.
+    codeset.memory.reserve(static_cast<size_t>(image_extent));
     codeset.memory.resize(module_start + segments_end);
     // Each segment is read inside this loop, from extents the header checks found inside the
     // file: a raw one straight into the image, a compressed one's stored bytes into one buffer,
