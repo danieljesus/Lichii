@@ -118,7 +118,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     // The whole image, the argument block and .bss included, is sized and aligned in u32 below:
     // check its extent in 64 bits before allocating, so a segment near the top of the address
     // space can neither wrap that arithmetic nor ask for gigabytes.
-    const auto& arg_data = Settings::values.program_args.GetValue();
+    // One copy, taken once: the setting can be assigned from the UI thread while this runs, and
+    // the block is sized from the same bytes it is filled with.
+    const std::string arg_data = Settings::values.program_args.GetValue();
     const bool pass_arguments = should_pass_arguments && !arg_data.empty();
     // Sized as the console's loader sizes it, which also refuses longer arguments: the block,
     // its header included, then always holds them, and libnx has the room it needs after them
