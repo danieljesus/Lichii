@@ -45,14 +45,17 @@ void AudioRenderer::Stop() {
         return;
     }
 
-    // A render waits for its stream to free queue space, which a stream whose backend stopped
-    // asking for audio without an error never does: that wait ends on the thread's stop token.
-    // So request it before joining, instead of first waiting for a reply to the shutdown, which
-    // such a render would never send. Either way the thread ends: at the shutdown message, or
-    // after the render it is in, before taking another message.
-    mailbox.Send(Direction::DSP, Message::Shutdown);
+    // The thread's one exit is its stop token, which ends both its wait for a message and a
+    // render's wait for its stream to free queue space; a stream whose backend stopped asking for
+    // audio without an error never frees any, so waiting for a reply to a shutdown message hung.
     main_thread.request_stop();
     main_thread.join();
+
+    // A render the stop ended may have left its list part done, and the host may have set command
+    // buffers it never took: none of it may reach the next Start, whose systems and process may
+    // differ. The mailbox too: neither side reads what the other left.
+    command_buffers = {};
+    mailbox.Reset();
 
     for (auto& stream : streams) {
         if (stream) {
@@ -151,12 +154,11 @@ void AudioRenderer::Main(std::stop_token stop_token) {
     constexpr u64 max_process_time{2'304'000ULL};
 
     while (!stop_token.stop_requested()) {
-        auto msg{mailbox.Receive(Direction::DSP)};
-        switch (msg) {
-        case Message::Shutdown:
-            mailbox.Send(Direction::Host, Message::Shutdown);
+        auto msg{mailbox.Receive(Direction::DSP, stop_token)};
+        if (stop_token.stop_requested()) {
             return;
-
+        }
+        switch (msg) {
         case Message::Render: {
             if (system.IsShuttingDown()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
