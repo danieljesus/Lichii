@@ -65,7 +65,9 @@ enum class DrainSite : u32 {
 /// Why the front can't tell what an equal or mask acquire's word holds once the back ran what was
 /// sent (GpuSplit::SettledWordAt), counted with the acquires.
 enum class AcquireUnsettled : u32 {
-    Elsewhere, ///< Acquires read it from the syncpoint shim or the mirror shadow
+    /// Acquires read it from the syncpoint shim (or from the mirror shadow, with
+    /// EDEN_NX2_SETTLE_DIVERTED=0)
+    Elsewhere,
     Unknown,   ///< The last release noted there has an unknown value or a lower bound
     Writes,    ///< The back has yet to run another write sent there, or one after the note
     Unnoted,   ///< A release the front did not note may land yet
@@ -127,6 +129,13 @@ struct AcquireStats {
     std::atomic<u64> back_waits{};      ///< The back ran out of work
     std::atomic<u64> back_sleeps{};     ///< Of those: it went to sleep
     std::atomic<u64> back_spin_ns{};    ///< How long it spun for more work before that
+    /// Equal or mask acquires of a word mirrored releases go beside (Nx2MirrorShadow) met
+    /// without a drain, and those that drained: the word settled but doesn't meet it, or queued
+    /// work may still change it
+    std::atomic<u64> diverted_met{};
+    std::atomic<u64> diverted_short{};
+    std::atomic<u64> diverted_unsettled{};
+    std::atomic<u64> diverted_mismatches{}; ///< VERIFY: of mismatches, on such a word
     std::atomic<u64> mismatches{}; ///< VERIFY: passed, yet the word after a drain doesn't meet it
     std::atomic<u64> unlanded{};   ///< VERIFY: met by a queued release not in memory after a drain
     std::atomic<u64> late{};       ///< VERIFY: a poll kept waiting, yet a drain meets it
@@ -492,9 +501,40 @@ public:
     /// yet.
     [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedSemaphoreWriteAt(
         u64 device_address) const;
+    /// A mirrored release was just sent into the word at `device_address`, which diverts
+    /// (Nx2MirrorShadow::Diverts): once it landed, acquires read `payload` there, and guest
+    /// memory is as it was. Kept apart from NoteSemaphoreWrite's notes, which tell what memory
+    /// holds (FrontQmdView::WordAt, the acquires that wait to reach a value).
+    void NoteMirroredRelease(u64 device_address, u32 payload, Landing landing = Landing::AtRun);
+    /// The last mirrored release noted into the word at `device_address`, if it may not have
+    /// landed yet.
+    [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedMirroredReleaseAt(
+        u64 device_address) const;
+    /// What decides what acquires read at a word mirrored releases go beside, once everything
+    /// sent so far landed. Direct releases (NoteSemaphoreWrite) and mirrored ones
+    /// (NoteMirroredRelease) both replace it, and a combining release combines with it
+    /// (Nx2MirrorShadow::NoteCombinedRelease), so the last of them to land decides: `write` is
+    /// the last one sent while both land as the back runs them; no `write` and `settled` when
+    /// each one sent has landed (the shadow and memory hold it now); not `settled`, with `why`,
+    /// while one lands by a fence, which may be after a later one.
+    struct DivertedWrites {
+        std::optional<QueuedSemaphoreWrite> write;
+        bool settled;
+        AcquireUnsettled why;
+    };
+    [[nodiscard]] DivertedWrites QueuedDivertedWritesAt(u64 device_address) const;
+    /// EDEN_NX2_SETTLE_DIVERTED=0: equal and mask acquires of a word mirrored releases go beside
+    /// drain as before, and those releases are placed and noted as before.
+    [[nodiscard]] static bool SettlesDiverted();
+    /// EDEN_NX2_SETTLE_DIVERTED=2, an experiment: such a word is settled although draws the back
+    /// has yet to run may store anywhere through the caches (NoteCacheWrite), as long as GPU work
+    /// never wrote its page. Nothing proves that none of them stores there; the acquires that
+    /// wait to reach a value make the same assumption (CheckWithoutDrain).
+    [[nodiscard]] static bool SettlesDivertedPastCacheWrites();
     struct SettledWord {
         u32 value;
         std::optional<u64> release; ///< The position the back runs the noted release by
+        bool diverted{}; ///< A word mirrored releases go beside
     };
     /// What an acquire of the word at `address` (`device_address`) finds once the back ran
     /// everything sent so far, where the front knows that exactly, as FrontQmdView::WordAt values
@@ -503,6 +543,9 @@ public:
     /// every write sent there, shader stores included, and each landed. None, with `why`, where
     /// queued work may still change it or acquires read it elsewhere. Every release the front did
     /// not note must have landed for either. Sends the state writes gathered so far first.
+    /// A word mirrored releases go beside (Nx2MirrorShadow) is valued the same way from the
+    /// direct and the mirrored releases noted there (QueuedDivertedWritesAt), or from the shadow
+    /// over memory once each landed.
     [[nodiscard]] std::optional<SettledWord> SettledWordAt(const Tegra::MemoryManager& memory,
                                                            GPUVAddr address, u64 device_address,
                                                            AcquireUnsettled& why);
@@ -815,6 +858,12 @@ private:
     /// The front's NoteSemaphoreWrite, by word address.
     Common::unordered_map<u64, SemaphoreWrite> semaphore_writes;
     size_t semaphore_writes_limit = 1024; ///< Forget what the back ran past this many
+    /// The front's NoteMirroredRelease, by word address.
+    Common::unordered_map<u64, SemaphoreWrite> mirrored_writes;
+    size_t mirrored_writes_limit = 1024;
+    /// Notes `write` to `word` in `writes`, forgetting landed ones past `limit`.
+    void NoteWordWrite(Common::unordered_map<u64, SemaphoreWrite>& writes, size_t& limit, u64 word,
+                       u32 payload, bool known, bool at_least, Landing landing);
     /// After the last entry that may write guest memory anywhere, the caches included
     /// (NoteCacheWrite) or not (NoteUnplacedWrite), the last one that may change the mappings
     /// (NoteAnyWrite), the last one NoteWrite placed, and the placed writes by granule.

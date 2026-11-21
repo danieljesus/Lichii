@@ -150,6 +150,9 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
         const auto settled =
             split.SettledWordAt(dma_pusher.memory_manager, acquire.address, *device, why);
         if (settled && acquire.Matches(settled->value)) {
+            if (settled->diverted) {
+                VideoCommon::Count(stats.diverted_met);
+            }
             if (!settled->release) {
                 return AcquireCheck::Met;
             }
@@ -159,6 +162,9 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
         VideoCommon::Count(stats.drain_operation);
         if (!settled) {
             VideoCommon::Count(stats.unsettled[static_cast<size_t>(why)]);
+        }
+        if (VideoCommon::g_acquire_counting && Nx2MirrorShadow::Get().Diverts(*device)) {
+            VideoCommon::Count(settled ? stats.diverted_short : stats.diverted_unsettled);
         }
         return AcquireCheck::Drain;
     }
@@ -215,6 +221,10 @@ void VerifyWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
         return;
     }
     VideoCommon::Count(stats.mismatches);
+    if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        device && Nx2MirrorShadow::Get().Diverts(*device)) {
+        VideoCommon::Count(stats.diverted_mismatches);
+    }
     if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 16) {
         LOG_WARNING(HW_GPU,
                     "Acquire verify: channel {} passed semaphore {:#x} (op {}, {:#x}) without a "
@@ -468,13 +478,24 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         NoteRelease(dma_pusher, sequence_address, payload, four_words, landing);
         if (auto& split = VideoCommon::GpuSplit::Get(); mirror != 0 && split.Active()) {
             const u64 size = four_words ? 16 : 4;
-            split.NoteWrite(dma_pusher.memory_manager, mirror, size);
-            // It lands in guest memory as the release does, unless mirrored releases into the
-            // word go to Nx2MirrorShadow (which only grows): unvalued, it keeps QMD reductions
-            // there from taking memory for their base until it landed.
-            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(mirror);
-                device && !Nx2MirrorShadow::Get().Diverts(*device)) {
-                split.NoteUnknownWrites(*device, size, landing);
+            const auto device = dma_pusher.memory_manager.GpuToCpuAddress(mirror);
+            const bool diverted = device && Nx2MirrorShadow::Get().Diverts(*device);
+            if (diverted && VideoCommon::GpuSplit::SettlesDiverted()) {
+                // It goes to Nx2MirrorShadow, whatever its size (the shadow only grows, so the
+                // word still diverts when the back runs it), and writes no guest memory: placed
+                // as a one-word release, so that it does not count among the other writes of its
+                // neighbours' granule (GpuSplit::OtherWritesTarget), and noted with its payload
+                // for the acquires of the word (GpuSplit::SettledWordAt).
+                split.NoteSemaphoreRelease(dma_pusher.memory_manager, mirror);
+                split.NoteMirroredRelease(*device, payload, landing);
+            } else {
+                split.NoteWrite(dma_pusher.memory_manager, mirror, size);
+                // It lands in guest memory as the release does, unless mirrored releases into the
+                // word go to Nx2MirrorShadow (which only grows): unvalued, it keeps QMD
+                // reductions there from taking memory for their base until it landed.
+                if (device && !diverted) {
+                    split.NoteUnknownWrites(*device, size, landing);
+                }
             }
         }
     } else if (g_nx2_ampere) {

@@ -1190,6 +1190,160 @@ TEST_CASE("Split keeps a mirror pending until its own fenced report completes",
     REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x2000).has_value());
 }
 
+TEST_CASE("Split tells what decides a word mirrored releases go beside",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Landing = VideoCommon::GpuSplit::Landing;
+    using Unsettled = VideoCommon::AcquireUnsettled;
+    Fixture f;
+    f.system.Initialize();
+    const auto split_owner = std::make_unique<VideoCommon::GpuSplit>(); // Too big for the stack
+    VideoCommon::GpuSplit& split = *split_owner;
+    std::atomic<bool> release{};
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    // Runs before Stop: a failed check must not leave the back in the entry below.
+    SCOPE_EXIT {
+        release = true;
+    };
+    const auto block = [&] {
+        release = false;
+        split.Defer([&release] {
+            while (!release.load()) {
+                std::this_thread::yield();
+            }
+        });
+    };
+    const auto run = [&] {
+        release = true;
+        split.Drain(VideoCommon::DrainSite::Other);
+    };
+    // Nothing sent there: what the shadow and memory hold now decides.
+    auto writes = split.QueuedDivertedWritesAt(0x1000);
+    REQUIRE(writes.settled);
+    REQUIRE_FALSE(writes.write.has_value());
+    // A mirrored release the back has not run: acquires read its payload once it has. It is no
+    // write to memory, so the notes of those stay as they were.
+    block();
+    split.Defer([] {});
+    split.NoteMirroredRelease(0x1000, 5);
+    split.Publish();
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x1000).has_value());
+    auto mirrored = split.QueuedMirroredReleaseAt(0x1000);
+    REQUIRE(mirrored.has_value());
+    REQUIRE(mirrored->known);
+    REQUIRE(mirrored->payload == 5);
+    REQUIRE_FALSE(split.QueuedMirroredReleaseAt(0x1004).has_value());
+    writes = split.QueuedDivertedWritesAt(0x1000);
+    REQUIRE(writes.settled);
+    REQUIRE(writes.write.has_value());
+    REQUIRE(writes.write->payload == 5);
+    REQUIRE(writes.write->position == mirrored->position);
+    // A direct release sent after it replaces what acquires read, and a mirrored one after that
+    // again: the last one sent decides while each lands as the back runs it.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 7, true);
+    split.Publish();
+    writes = split.QueuedDivertedWritesAt(0x1000);
+    REQUIRE(writes.settled);
+    REQUIRE(writes.write->payload == 7);
+    split.Defer([] {});
+    split.NoteMirroredRelease(0x1000, 9);
+    split.Publish();
+    writes = split.QueuedDivertedWritesAt(0x1000);
+    REQUIRE(writes.settled);
+    REQUIRE(writes.write->payload == 9);
+    // A direct release of a value the front can't tell, sent last, decides too: the caller
+    // drains for it as for any other.
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x1000, 0, false);
+    split.Publish();
+    writes = split.QueuedDivertedWritesAt(0x1000);
+    REQUIRE(writes.settled);
+    REQUIRE_FALSE(writes.write->known);
+    // Both kinds in one entry: the notes do not tell which the back runs last.
+    split.Defer([] {});
+    split.NoteMirroredRelease(0x2000, 1);
+    split.NoteSemaphoreWrite(0x2000, 2, true);
+    split.Publish();
+    writes = split.QueuedDivertedWritesAt(0x2000);
+    REQUIRE_FALSE(writes.settled);
+    REQUIRE(writes.why == Unsettled::Unknown);
+    // Unaligned, the front does not value it.
+    split.Defer([] {});
+    split.NoteMirroredRelease(0x3002, 4);
+    split.Publish();
+    mirrored = split.QueuedMirroredReleaseAt(0x3000);
+    REQUIRE(mirrored.has_value());
+    REQUIRE_FALSE(mirrored->known);
+    // Once the back ran them all, nothing is queued for any of the words.
+    run();
+    for (const u64 word : {0x1000, 0x2000, 0x3000}) {
+        writes = split.QueuedDivertedWritesAt(word);
+        REQUIRE(writes.settled);
+        REQUIRE_FALSE(writes.write.has_value());
+        REQUIRE_FALSE(split.QueuedMirroredReleaseAt(word).has_value());
+    }
+
+    // A mirrored release that lands by its fence, which has yet to run though the back ran its
+    // entry, and a direct one sent after it that lands as the back runs it: the fenced one may
+    // land last, so neither decides.
+    VideoCommon::GpuSplit::FencedHold fence;
+    block();
+    split.Defer([&] { fence = split.TrackFencedWrite(); });
+    split.NoteMirroredRelease(0x4000, 11, Landing::Fenced);
+    split.Defer([] {});
+    split.NoteSemaphoreWrite(0x4000, 12, true);
+    split.Publish();
+    writes = split.QueuedDivertedWritesAt(0x4000);
+    REQUIRE_FALSE(writes.settled);
+    REQUIRE(writes.why == Unsettled::Fenced);
+    // The back ran both: the direct one is in memory, the mirrored one still waits for its fence
+    // and is what the caller is told of, fenced.
+    run();
+    REQUIRE(static_cast<bool>(fence));
+    REQUIRE_FALSE(split.QueuedSemaphoreWriteAt(0x4000).has_value());
+    writes = split.QueuedDivertedWritesAt(0x4000);
+    REQUIRE(writes.settled);
+    REQUIRE(writes.write.has_value());
+    REQUIRE(writes.write->fenced);
+    // A mirrored release that lands as the back runs it, sent before that fence ran: the word
+    // reads either until it did.
+    split.Defer([] {});
+    split.NoteMirroredRelease(0x4000, 13);
+    split.Drain(VideoCommon::DrainSite::Other);
+    mirrored = split.QueuedMirroredReleaseAt(0x4000);
+    REQUIRE(mirrored.has_value());
+    REQUIRE(mirrored->fenced);
+    REQUIRE_FALSE(mirrored->known);
+    fence.Release();
+    writes = split.QueuedDivertedWritesAt(0x4000);
+    REQUIRE(writes.settled);
+    REQUIRE_FALSE(writes.write.has_value());
+    // The other way round: a direct release that lands by its fence, then a mirrored one.
+    block();
+    split.Defer([&] { fence = split.TrackFencedWrite(); });
+    split.NoteSemaphoreWrite(0x5000, 14, true, false, Landing::Fenced);
+    split.Defer([] {});
+    split.NoteMirroredRelease(0x5000, 15);
+    split.Publish();
+    writes = split.QueuedDivertedWritesAt(0x5000);
+    REQUIRE_FALSE(writes.settled);
+    REQUIRE(writes.why == Unsettled::Fenced);
+    run();
+    writes = split.QueuedDivertedWritesAt(0x5000);
+    REQUIRE(writes.settled);
+    REQUIRE(writes.write.has_value());
+    REQUIRE(writes.write->fenced);
+    REQUIRE(writes.write->payload == 14);
+    fence.Release();
+    writes = split.QueuedDivertedWritesAt(0x5000);
+    REQUIRE(writes.settled);
+    REQUIRE_FALSE(writes.write.has_value());
+}
+
 TEST_CASE("Split seals fenced reports and discards stale completions across starts",
           "[video_core][gpu_split_dependencies]") {
     using Access = VideoCommon::GpuSplitTestAccess;

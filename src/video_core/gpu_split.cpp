@@ -229,6 +229,8 @@ void GpuSplit::Stop() {
     }
     semaphore_writes.clear();
     semaphore_writes_limit = 1024;
+    mirrored_writes.clear();
+    mirrored_writes_limit = 1024;
     last_any_write = 0;
     last_unplaced_write = 0;
     last_mapping_change = 0;
@@ -372,11 +374,24 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, b
         NoteSemaphoreWrite(word + sizeof(u32), 0, false, false, landing);
         return;
     }
-    if (semaphore_writes.size() >= semaphore_writes_limit) {
+    NoteWordWrite(semaphore_writes, semaphore_writes_limit, device_address, payload, known,
+                  at_least, landing);
+}
+
+void GpuSplit::NoteMirroredRelease(u64 device_address, u32 payload, Landing landing) {
+    // The shadow keys a release by the word its address is in. Unaligned, the front does not
+    // value it.
+    NoteWordWrite(mirrored_writes, mirrored_writes_limit, device_address & ~u64{3}, payload,
+                  device_address % sizeof(u32) == 0, false, landing);
+}
+
+void GpuSplit::NoteWordWrite(Common::unordered_map<u64, SemaphoreWrite>& writes, size_t& limit,
+                             u64 word, u32 payload, bool known, bool at_least, Landing landing) {
+    if (writes.size() >= limit) {
         // The words of releases in memory hold their values.
-        boost::unordered::erase_if(semaphore_writes,
+        boost::unordered::erase_if(writes,
                                    [this](const auto& entry) { return InMemory(entry.second); });
-        semaphore_writes_limit = std::max<size_t>(1024, semaphore_writes.size() * 2);
+        limit = std::max<size_t>(1024, writes.size() * 2);
     }
     // The release is in the last entry sent, or in an earlier one (a copy engine launch in a long
     // multi-method run): then it counts as landed later, never too early.
@@ -388,10 +403,8 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, b
         .at_least = at_least,
         .fenced = landing == Landing::Fenced,
     };
-    const u64 word = device_address & ~u64{3};
-    if (const auto it = semaphore_writes.find(word); !write.fenced &&
-                                                     it != semaphore_writes.end() &&
-                                                     it->second.fenced && !InMemory(it->second)) {
+    if (const auto it = writes.find(word);
+        !write.fenced && it != writes.end() && it->second.fenced && !InMemory(it->second)) {
         // A fenced write sent before may land after this one: until it did, the word holds
         // either.
         write.entry = it->second.entry;
@@ -399,7 +412,7 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, b
         write.at_least = false;
         write.fenced = true;
     }
-    semaphore_writes.insert_or_assign(word, write);
+    writes.insert_or_assign(word, write);
 }
 
 std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
@@ -412,6 +425,54 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
                                 it->second.fenced, it->second.position};
 }
 
+std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedMirroredReleaseAt(
+    u64 device_address) const {
+    const auto it = mirrored_writes.find(device_address & ~u64{3});
+    if (it == mirrored_writes.end() || InMemory(it->second)) {
+        return std::nullopt;
+    }
+    return QueuedSemaphoreWrite{it->second.payload, it->second.known, it->second.at_least,
+                                it->second.fenced, it->second.position};
+}
+
+GpuSplit::DivertedWrites GpuSplit::QueuedDivertedWritesAt(u64 device_address) const {
+    const auto direct = QueuedSemaphoreWriteAt(device_address);
+    const auto mirrored = QueuedMirroredReleaseAt(device_address);
+    if (!direct || !mirrored) {
+        // One kind at most is queued: the other's notes landed before it lands, unless it is
+        // fenced, and then the caller waits for it as for any fenced release.
+        return {direct ? direct : mirrored, true, AcquireUnsettled::Unknown};
+    }
+    if (direct->fenced || mirrored->fenced) {
+        // Whichever lands by its fence may land after the other, though sent before it.
+        return {std::nullopt, false, AcquireUnsettled::Fenced};
+    }
+    if (direct->position == mirrored->position) {
+        // Both in one entry: the notes do not tell which the back runs last.
+        return {std::nullopt, false, AcquireUnsettled::Unknown};
+    }
+    return {direct->position > mirrored->position ? direct : mirrored, true,
+            AcquireUnsettled::Unknown};
+}
+
+namespace {
+char SettleDivertedMode() {
+    static const char mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_SETTLE_DIVERTED");
+        return value == nullptr ? '1' : value[0];
+    }();
+    return mode;
+}
+} // Anonymous namespace
+
+bool GpuSplit::SettlesDiverted() {
+    return SettleDivertedMode() != '0';
+}
+
+bool GpuSplit::SettlesDivertedPastCacheWrites() {
+    return SettleDivertedMode() == '2';
+}
+
 std::optional<GpuSplit::SettledWord> GpuSplit::SettledWordAt(const Tegra::MemoryManager& memory,
                                                              GPUVAddr address, u64 device_address,
                                                              AcquireUnsettled& why) {
@@ -421,8 +482,13 @@ std::optional<GpuSplit::SettledWord> GpuSplit::SettledWordAt(const Tegra::Memory
         return std::nullopt;
     }
     auto& shadow = Tegra::Nx2MirrorShadow::Get();
-    // Mirrored releases into a diverted word change what acquires read there without a note.
-    if (memory.OverlapsSyncpointShim(address, sizeof(u32)) || shadow.Diverts(device_address)) {
+    // Acquires read a diverted word through the shadow: the mirrored releases sent into it are
+    // noted apart (NoteMirroredRelease). The shadow only grows, so a word that diverts now did
+    // not stop since any of them was sent; one sent before it began to was noted as a write of
+    // an unknown value to memory (Puller::ProcessSemaphoreTriggerMethod), which waits as well.
+    const bool shim = memory.OverlapsSyncpointShim(address, sizeof(u32));
+    const bool diverted = !shim && shadow.Diverts(device_address);
+    if (shim || (diverted && !SettlesDiverted())) {
         why = AcquireUnsettled::Elsewhere;
         return std::nullopt;
     }
@@ -433,9 +499,21 @@ std::optional<GpuSplit::SettledWord> GpuSplit::SettledWordAt(const Tegra::Memory
     FlushState();
     // Shader stores are placed nowhere, and the back marks the pages they write GPU-written only
     // as it runs them (NoteCacheWrite): each one sent may write the word.
-    const u64 others =
-        (std::max)(OtherWritesTarget(memory, address), (std::min)(last_any_write, write_position));
-    const auto queued = QueuedSemaphoreWriteAt(device_address);
+    const u64 cache_writes = diverted && SettlesDivertedPastCacheWrites()
+                                 ? 0
+                                 : (std::min)(last_any_write, write_position);
+    const u64 others = (std::max)(OtherWritesTarget(memory, address), cache_writes);
+    std::optional<QueuedSemaphoreWrite> queued;
+    if (diverted) {
+        const DivertedWrites writes = QueuedDivertedWritesAt(device_address);
+        if (!writes.settled) {
+            why = writes.why;
+            return std::nullopt;
+        }
+        queued = writes.write;
+    } else {
+        queued = QueuedSemaphoreWriteAt(device_address);
+    }
     if (queued && (!queued->known || queued->at_least)) {
         why = AcquireUnsettled::Unknown;
         return std::nullopt;
@@ -451,14 +529,14 @@ std::optional<GpuSplit::SettledWord> GpuSplit::SettledWordAt(const Tegra::Memory
             why = AcquireUnsettled::Fenced;
             return std::nullopt;
         }
-        return SettledWord{queued->payload, queued->position};
+        return SettledWord{queued->payload, queued->position, diverted};
     }
     const u32 guest = memory.Read<u32>(address);
     if (Tegra::Nx2ListIndirect::IsPlaceholder(guest)) {
         why = AcquireUnsettled::Writes;
         return std::nullopt;
     }
-    return SettledWord{shadow.Read(device_address, guest).value_or(guest), std::nullopt};
+    return SettledWord{shadow.Read(device_address, guest).value_or(guest), std::nullopt, diverted};
 }
 
 GpuSplit::FencedHold GpuSplit::TrackFencedWrite() {
@@ -1245,6 +1323,17 @@ void GpuSplit::ReportAcquire() {
         qmd_valued, qmd_waits, qmd_late, qmd_unvalued, qmd_inline_reads, qmd_patched_reads,
         qmd_takeovers, qmd_losses[0], qmd_losses[1], qmd_losses[2], qmd_losses[3], qmd_losses[4],
         bases[0], bases[1], bases[2], bases[3] + bases[4], bases[4]);
+    const u64 diverted_met = take(stats.diverted_met);
+    const u64 diverted_short = take(stats.diverted_short);
+    const u64 diverted_unsettled = take(stats.diverted_unsettled);
+    const u64 diverted_mismatches = take(stats.diverted_mismatches);
+    if (diverted_met != 0 || diverted_short != 0 || diverted_unsettled != 0) {
+        LOG_INFO(HW_GPU,
+                 "Equal or mask acquires of words mirrored releases go beside in 10 s: {} met "
+                 "without a drain, {} drained with the word settled short, {} drained unsettled; "
+                 "verify: {} passed but not met after a drain",
+                 diverted_met, diverted_short, diverted_unsettled, diverted_mismatches);
+    }
     const u64 mismatches = take(stats.mismatches);
     const u64 unlanded = take(stats.unlanded);
     const u64 late = take(stats.late);
