@@ -117,7 +117,8 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
         const auto& segment = nso_header.segments[i];
         const u64 stored = nso_header.segments_compressed_size[i];
-        if (u64{segment.offset} + stored > file_size) {
+        // A segment with no stored bytes reads nothing, wherever its offset points.
+        if (stored != 0 && u64{segment.offset} + stored > file_size) {
             LOG_ERROR(Loader, "{}: segment {} is past the end of the file", nso_file.GetName(),
                       i);
             return std::nullopt;
@@ -130,6 +131,13 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                           nso_file.GetName(), i);
                 return std::nullopt;
             }
+        } else if (segment.size > static_cast<u32>(std::numeric_limits<int>::max()) ||
+                   stored > static_cast<u32>(std::numeric_limits<int>::max())) {
+            // The decompressors take and return sizes as int, so such a segment could never
+            // decompress to its size; the console's loader refuses one past this too.
+            LOG_ERROR(Loader, "{}: compressed segment {} is too large to decompress",
+                      nso_file.GetName(), i);
+            return std::nullopt;
         } else if (!nso_header.IsZBICCompressed() && segment.size > stored * MaxLz4Expansion) {
             LOG_ERROR(Loader, "{}: segment {} is larger than its compressed data can hold",
                       nso_file.GetName(), i);
@@ -166,50 +174,49 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         return std::nullopt;
     }
     // Nor more than the memory of the largest pool a process can be created in: the metadata,
-    // which picks the pool, is applied once every module's size is known. A kernel not set up
-    // yet has no memory manager, and sets no bound.
+    // which picks the pool, is applied once every module's size is known. Every caller loads
+    // modules into a kernel it has initialized.
     u64 largest_pool = 0;
-    if (system.Kernel().HasMemoryManager()) {
-        for (const auto pool : {Kernel::KMemoryManager::Pool::Application,
-                                Kernel::KMemoryManager::Pool::Applet,
-                                Kernel::KMemoryManager::Pool::System,
-                                Kernel::KMemoryManager::Pool::SystemNonSecure}) {
-            largest_pool =
-                (std::max<u64>)(largest_pool, system.Kernel().MemoryManager().GetSize(pool));
-        }
+    for (const auto pool :
+         {Kernel::KMemoryManager::Pool::Application, Kernel::KMemoryManager::Pool::Applet,
+          Kernel::KMemoryManager::Pool::System, Kernel::KMemoryManager::Pool::SystemNonSecure}) {
+        largest_pool = (std::max<u64>)(largest_pool, system.Kernel().MemoryManager().GetSize(pool));
     }
-    if (largest_pool != 0 && image_extent > largest_pool) {
+    if (image_extent > largest_pool) {
         LOG_ERROR(Loader, "{}: needs a {:#x} byte image, which no process can hold",
                   nso_file.GetName(), image_extent);
         return std::nullopt;
     }
-    // The stored bytes, read before the image is allocated: the file bounds them. A ZBIC
-    // segment may decompress to fewer bytes than its size, the rest left zero, as the loader
-    // always took, so its size is bounded only by the image, into which it decompresses.
-    std::array<std::vector<u8>, 3> stored_data;
-    for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
-        auto& data = stored_data[i];
-        data.resize(nso_header.segments_compressed_size[i]);
-        if (nso_file.Read(data.data(), data.size(), nso_header.segments[i].offset) != data.size()) {
-            LOG_ERROR(Loader, "{}: segment {} is past the end of the file", nso_file.GetName(),
-                      i);
-            return std::nullopt;
-        }
-    }
-
     Kernel::CodeSet codeset;
     codeset.memory.resize(module_start + segments_end);
     for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
         const auto& segment = nso_header.segments[i];
         const std::span<u8> target{codeset.memory.data() + module_start + segment.location,
                                    segment.size};
-        const auto& data = stored_data[i];
+        // Read one segment at a time, from extents the header checks found inside the file: a raw
+        // segment straight into the image, a compressed one's stored bytes into a buffer that
+        // size. A ZBIC segment may decompress to fewer bytes than its size, the rest left zero,
+        // as the loader always took, so its size is bounded only by the image.
+        const auto short_read = [&] {
+            LOG_ERROR(Loader, "{}: short read of segment {}", nso_file.GetName(), i);
+            return std::nullopt;
+        };
         if (!nso_header.IsSegmentCompressed(i)) {
-            // An empty one has nothing to copy, and an empty vector's data() may be null.
-            if (!target.empty()) {
-                std::memcpy(target.data(), data.data(), target.size());
+            // An empty one has nothing to read.
+            if (!target.empty() &&
+                nso_file.Read(target.data(), target.size(), segment.offset) != target.size()) {
+                return short_read();
             }
-        } else if (nso_header.IsZBICCompressed()) {
+            codeset.segments[i].addr = module_start + segment.location;
+            codeset.segments[i].offset = module_start + segment.location;
+            codeset.segments[i].size = segment.size;
+            continue;
+        }
+        std::vector<u8> data(nso_header.segments_compressed_size[i]);
+        if (!data.empty() && nso_file.Read(data.data(), data.size(), segment.offset) != data.size()) {
+            return short_read();
+        }
+        if (nso_header.IsZBICCompressed()) {
             const int r = Common::Compression::DecompressDataZBIC(target, data);
             // A failed segment would boot a corrupt image that hangs without presenting; refuse
             // to load instead.

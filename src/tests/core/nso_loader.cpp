@@ -29,6 +29,12 @@ void Put32(std::vector<u8>& out, std::size_t offset, u32 value) {
     std::memcpy(out.data() + offset, &value, sizeof(value));
 }
 
+u32 Get32(const std::vector<u8>& in, std::size_t offset) {
+    u32 value;
+    std::memcpy(&value, in.data() + offset, sizeof(value));
+    return value;
+}
+
 // An NSO whose text segment is LZ4-compressed as `text` and decompresses to `text_size` bytes,
 // with stored 0x10-byte rodata and data segments.
 FileSys::VirtualFile MakeNso(const std::vector<u8>& text, u32 text_size) {
@@ -203,7 +209,9 @@ TEST_CASE("NSO rejects an image no process can hold", "[core][loader]") {
 TEST_CASE("NSO allocates nothing for segments its file cannot hold", "[core][loader]") {
     // Stored sizes far past a file of a few hundred bytes, which the loader used to allocate
     // buffers for, and fill, before reading the file: refused without the process's memory
-    // growing by anything like them.
+    // growing by anything like them. The peak is the whole process's: if an earlier test in the
+    // same run already peaked above what the old loader allocated here (several GB), this cannot
+    // tell the difference, and passes either way.
     auto bytes = StoredNsoBytes({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10}, {0x2000, 0x10, 0x10}}});
     for (std::size_t i = 0; i < 3; ++i) {
         Put32(bytes, 0x60 + i * 4, 0x60000000);
@@ -232,16 +240,20 @@ TEST_CASE("NSO keeps the rule for an empty LZ4 segment", "[core][loader]") {
     CHECK_FALSE(Load(MakeNso({}, 0)).has_value());
 }
 
-TEST_CASE("NSO loads on a kernel that is not set up", "[core][loader]") {
-    // No memory manager yet, so no pool to bound the image by: the loader does not ask for one.
-    ScopedSystemTestContext environment;
-    Core::System system;
-    system.Initialize();
-    REQUIRE_FALSE(system.Kernel().HasMemoryManager());
-    Kernel::KProcess process{system.Kernel()};
-    CHECK(Loader::AppLoader_NSO::LoadModule(
-              process, system,
-              *MakeStoredNso({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10}, {0x2000, 0x10, 0x10}}}),
-              0x8000000, false, false)
-              .has_value());
+
+TEST_CASE("NSO loads an empty segment whose offset lies past the file", "[core][loader]") {
+    // It reads no bytes, as it always did, wherever its offset points.
+    auto bytes = StoredNsoBytes({{{0, 0x10, 0x10}, {0x1000, 0, 0}, {0x2000, 0x10, 0x10}}});
+    Put32(bytes, 0x20, 0x7FFFFFF0); // .rodata's file offset
+    CHECK(Load(AsFile(std::move(bytes))).has_value());
+}
+
+TEST_CASE("NSO refuses a compressed segment too large to decompress", "[core][loader]") {
+    // The decompressors count in int: a segment past INT_MAX could never decompress to its size,
+    // and is refused before anything is allocated for it.
+    const std::vector<u8> text{0x80, 'N', 'S', 'O', 't', 'e', 'x', 't', '!'};
+    auto bytes = MakeNso(text, 8)->ReadAllBytes();
+    Put32(bytes, 0x0C, Get32(bytes, 0x0C) | (1u << 7)); // ZBIC, which has no ratio bound
+    Put32(bytes, 0x18, 0x80000000);                       // .text's size
+    CHECK_FALSE(Load(AsFile(std::move(bytes))).has_value());
 }

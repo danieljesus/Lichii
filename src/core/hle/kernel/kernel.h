@@ -227,10 +227,6 @@ public:
     /// Gets the virtual memory manager for the kernel.
     const KMemoryManager& MemoryManager() const;
 
-    /// Whether the memory manager exists yet: it is made when the kernel is initialized, and
-    /// MemoryManager() may not be called before.
-    bool HasMemoryManager() const;
-
     /// Gets the application resource manager.
     KSystemResource& GetAppSystemResource();
 
