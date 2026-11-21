@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 #include "audio_core/common/common.h"
@@ -22,6 +23,20 @@ namespace AudioCore::Sink {
 namespace {
 constexpr std::chrono::microseconds BlockPeriod{TargetSampleCount * 1'000'000ULL /
                                                 TargetSampleRate};
+
+u32 Doublings(std::chrono::milliseconds from, std::chrono::milliseconds to) {
+    u32 count = 0;
+    for (auto delay = from; delay.count() > 0 && delay * 2 <= to; delay *= 2) {
+        ++count;
+    }
+    return count;
+}
+
+s64 SteadyNow() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 /// For the backend calls made on the stream's own threads.
 struct ComScope {
@@ -54,9 +69,8 @@ StandbySinkStream::DeviceChoice StandbySinkStream::ChooseDevice(u32 attempt, boo
 }
 
 StandbySinkStream::StandbySinkStream(Core::System& system_, StreamType type_, Timing timing_)
-    : SinkStream{system_, type_}, timing{timing_} {
-    stall_check_interval = timing.stall_check;
-}
+    : SinkStream{system_, type_}, timing{timing_},
+      max_stall_level{Doublings(timing_.first_retry, timing_.max_retry)} {}
 
 StandbySinkStream::~StandbySinkStream() {
     ASSERT_MSG(!worker.joinable(), "Stream {}: the derived destructor must call Finalize", name);
@@ -81,12 +95,29 @@ bool StandbySinkStream::IsReady() const {
 
 bool StandbySinkStream::RenderFromBackend(const void* backend, std::span<s16> output,
                                           std::size_t num_frames) {
-    if (!IsPublished(backend)) {
-        // Opening or starting during a reopen, while the stand-in may play the stream.
+    // Counted before the check, so that once a stalled backend is unpublished and no callback is
+    // counted, none plays the stream any more (RetireStalled).
+    rendering.fetch_add(1);
+    if (backend == nullptr || backend != live_backend.load()) {
+        rendering.fetch_sub(1);
+        // Opening or starting during a reopen, or unpublished as stalled, while the stand-in may
+        // play the stream.
         std::fill(output.begin(), output.end(), s16{0});
         return false;
     }
+    const s64 now = SteadyNow();
+    if (!backend_asked.load(std::memory_order_acquire)) {
+        first_ask.store(now, std::memory_order_relaxed);
+        backend_asked.store(true, std::memory_order_release);
+    } else if (const u32 level = stall_level.load(std::memory_order_relaxed); level != 0) {
+        const auto sustained = timing.stall_check * StallThreshold(true, level);
+        if (now - first_ask.load(std::memory_order_relaxed) >=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(sustained).count()) {
+            stall_level.store(0, std::memory_order_relaxed);
+        }
+    }
     ProcessAudioOutAndRender(output, num_frames);
+    rendering.fetch_sub(1);
     return true;
 }
 
@@ -106,6 +137,7 @@ void StandbySinkStream::OpenInitialBackend() {
             std::scoped_lock lock{state_mutex};
             published = opened && losses == 0;
             if (published) {
+                backend_asked = false;
                 live_backend = opened;
                 state = State::Live;
             } else {
@@ -159,19 +191,43 @@ void StandbySinkStream::BackendLost() {
     wake.notify_all();
 }
 
-void StandbySinkStream::BackendStalled(std::chrono::milliseconds idle) {
+bool StandbySinkStream::BackendIdle(u32 idle_checks) {
     {
+        // The check and the transition under one lock: a loss reported meanwhile finds the
+        // stream lost already, or this finds it no longer live.
         std::scoped_lock lock{state_mutex};
         // A stand-in or a reopen under way plays the stream; a paused or faulted one is not
         // expected to be asked for audio.
         if (state != State::Live || !StandsIn() || paused || failed || system.IsShuttingDown()) {
-            return;
+            return false;
+        }
+        const bool asked = backend_asked.load();
+        const u32 level = stall_level.load();
+        if (idle_checks < StallThreshold(asked, level)) {
+            return false;
+        }
+        stall_level = (std::min)(level + 1, max_stall_level);
+        state = State::Lost;
+        // Unpublished now, so that its callbacks, should they come back, play silence; the worker
+        // destroys it off the locks, as it may not respond.
+        stalled_backend = live_backend.exchange(nullptr);
+        const auto idle_ms = timing.stall_check.count() * idle_checks;
+        if (asked) {
+            LOG_WARNING(Audio_Sink,
+                        "Stream {}: the backend stopped asking for audio {} ms ago; reopening",
+                        name, idle_ms);
+        } else {
+            LOG_WARNING(Audio_Sink,
+                        "Stream {}: the backend has not asked for audio in the {} ms since it "
+                        "started; reopening",
+                        name, idle_ms);
+        }
+        if (!worker.joinable()) {
+            worker = std::jthread([this](std::stop_token stop_token) { Run(stop_token); });
         }
     }
-    LOG_WARNING(Audio_Sink,
-                "Stream {}: the backend stopped asking for audio at least {} ms ago; reopening",
-                name, idle.count());
-    BackendLost();
+    wake.notify_all();
+    return true;
 }
 
 void StandbySinkStream::Start(bool) {
@@ -205,6 +261,9 @@ void StandbySinkStream::Start(bool) {
             paused = false;
         }
     };
+    // A started backend may take a while to ask for audio again: it gets the grace of one that
+    // has not asked yet.
+    backend_asked = false;
     if (!StartBackend(current)) {
         LOG_ERROR(Audio_Sink, "Error starting stream {}", name);
         // A stream that stands in plays into nothing until it reopens; others stay not ready
@@ -244,15 +303,22 @@ void StandbySinkStream::Finalize() {
     const State before = StopWorker();
     std::scoped_lock control{control_mutex};
     void* current{};
+    void* stalled{};
     {
         std::scoped_lock lock{state_mutex};
         current = live_backend.exchange(nullptr);
+        stalled = std::exchange(stalled_backend, nullptr);
     }
     if (current) {
         if (playing && before == State::Live) {
             StopBackend(current);
         }
         DestroyBackend(current);
+    }
+    if (stalled) {
+        // Found stalled just before the close, so the worker never took it. Its destroy may
+        // block, as a close already waits for an open under way.
+        DestroyBackend(stalled);
     }
 }
 
@@ -294,14 +360,35 @@ void StandbySinkStream::Run(std::stop_token stop_token) {
             break;
         }
         // Destroying the lost backend stops its callbacks: from here on only this thread
-        // consumes the stream, until a new backend is started.
-        ReleaseBackend();
+        // consumes the stream, until a new backend is started. A stalled one may not respond, so
+        // it is destroyed on a thread of its own while this one stands in.
+        void* stalled{};
+        {
+            std::scoped_lock lock{state_mutex};
+            stalled = std::exchange(stalled_backend, nullptr);
+        }
+        if (stalled) {
+            RetireStalled(stalled);
+        } else {
+            ReleaseBackend();
+        }
         next_block = std::chrono::steady_clock::now();
         auto delay = timing.first_retry;
         for (u32 attempt = 1;; ++attempt) {
             if (!StandIn(stop_token, std::chrono::steady_clock::now() + delay)) {
                 running = false;
                 break;
+            }
+            // No other open while a stalled backend is being destroyed: its device's driver may
+            // be what holds it, and an error it reports on the way must come before the reopen
+            // counts losses. The stand-in plays on meanwhile.
+            if (!retired && !StandIn(stop_token, std::chrono::steady_clock::time_point::max(),
+                                     &retired)) {
+                running = false;
+                break;
+            }
+            if (retired && retiring.joinable()) {
+                retiring.join();
             }
             if (failed) {
                 // Faulted while standing in: stand down, and pause the stream so that nothing is
@@ -322,6 +409,10 @@ void StandbySinkStream::Run(std::stop_token stop_token) {
             delay = (std::min)(delay * 2, timing.max_retry);
         }
     }
+    // A destroy that never returns holds the close here, as an open under way does.
+    if (retiring.joinable()) {
+        retiring.join();
+    }
 }
 
 void StandbySinkStream::ReleaseBackend() {
@@ -333,6 +424,34 @@ void StandbySinkStream::ReleaseBackend() {
     }
     if (current) {
         DestroyBackend(current);
+    }
+}
+
+void StandbySinkStream::RetireStalled(void* backend) {
+    // Unpublished under state_mutex before this: a callback counted before that may still be
+    // playing the stream, and none after it will.
+    while (rendering.load() != 0) {
+        std::this_thread::yield();
+    }
+    retired = false;
+    const auto destroy = [this, backend] {
+        DestroyBackend(backend);
+        {
+            std::scoped_lock lock{state_mutex};
+            retired = true;
+        }
+        wake.notify_all();
+    };
+    try {
+        retiring = std::jthread([destroy] {
+            Common::SetCurrentThreadName("AudioRetire");
+            [[maybe_unused]] ComScope com;
+            destroy();
+        });
+    } catch (const std::system_error& error) {
+        LOG_ERROR(Audio_Sink, "Stream {} could not start a thread to destroy its backend: {}",
+                  name, error.what());
+        destroy();
     }
 }
 
@@ -394,6 +513,7 @@ StandbySinkStream::Reopen StandbySinkStream::TryReopen(std::stop_token stop_toke
                 std::scoped_lock lock{state_mutex};
                 published = state == State::Reopening && losses == seen && !failed;
                 if (published) {
+                    backend_asked = false;
                     live_backend = opened;
                     state = State::Live;
                 }

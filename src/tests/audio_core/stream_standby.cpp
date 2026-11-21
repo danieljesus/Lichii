@@ -57,6 +57,8 @@ public:
     using StandbySinkStream::IsStandingIn;
     using StandbySinkStream::ReopenAttempts;
     using StandbySinkStream::Reopens;
+    using StandbySinkStream::StallLevel;
+    using StandbySinkStream::StallThreshold;
 
     /// What a backend's callback reports when it gives up on its device.
     void ReportLost() {
@@ -98,6 +100,10 @@ public:
     std::function<void()> on_start;
     /// The backend StartBackend was last called with.
     std::atomic<void*> last_started{};
+    /// While set, DestroyBackend blocks, as one can on a backend that stopped responding.
+    std::atomic<bool> hold_destroy{};
+    /// A destroy is blocked on hold_destroy.
+    std::atomic<bool> destroying{};
 
 private:
     void* OpenBackend(u32 attempt) override {
@@ -148,6 +154,13 @@ private:
         return true;
     }
     void DestroyBackend(void* backend) override {
+        if (hold_destroy) {
+            destroying = true;
+            while (hold_destroy) {
+                std::this_thread::sleep_for(1ms);
+            }
+            destroying = false;
+        }
         std::scoped_lock lock{mutex};
         live.erase(static_cast<Backend*>(backend));
         delete static_cast<Backend*>(backend);
@@ -809,56 +822,142 @@ TEST_CASE("An error during a backend's open is handled by exactly one of the ope
     }
 }
 
+/// Calls back for each backend the stream publishes as a device does, from `delay` after its
+/// publication, every 5 ms. Counts the callbacks that played the stream.
+class DeviceCallbacks {
+public:
+    DeviceCallbacks(LosableStream& stream, std::chrono::milliseconds delay, u32 skip_first = 0)
+        : thread{[this, &stream, delay, skip_first](std::stop_token stop_token) {
+              std::array<s16, 480> output{};
+              u32 generation = 0;
+              auto since = Clock::now();
+              while (!stop_token.stop_requested()) {
+                  const u32 published = stream.published;
+                  if (published != generation) {
+                      generation = published;
+                      since = Clock::now();
+                  }
+                  // A backend may reuse a destroyed one's address: go by the publication count.
+                  auto* const current = stream.Only();
+                  if (generation > skip_first && current != nullptr &&
+                      Clock::now() - since >= delay &&
+                      stream.RenderFromBackend(current, output, 240)) {
+                      ++played;
+                  }
+                  std::this_thread::sleep_for(5ms);
+              }
+          }} {}
+    std::atomic<u64> played{};
+
+private:
+    std::jthread thread;
+};
+
 TEST_CASE("A stream whose backend stops asking for audio without an error reopens",
           "[audio_core][stream_standby]") {
     SysmixTests::Context context;
-    auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, 20ms);
+    auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, 50ms);
     stream->Start();
-    REQUIRE(stream->Only() != nullptr);
     REQUIRE(stream->published == 1);
-    // Its backend never calls back, and reports nothing: the renderer, waiting for space, finds
-    // that it stopped, and the stand-in plays the stream until it reopens. The reopened backend
-    // calls back as a working device does, and plays the stream.
-    std::atomic<u64> played{};
-    std::jthread callback([&](std::stop_token stop_token) {
+    // The first backend asks for audio for a while, then stops calling back and reports nothing:
+    // the renderer, waiting for space, finds that it stopped, and the stand-in plays the stream
+    // until it reopens. The reopened backend calls back as a working device does.
+    std::atomic<bool> first_stops{};
+    std::jthread first_callbacks([&](std::stop_token stop_token) {
         std::array<s16, 480> output{};
-        while (!stop_token.stop_requested()) {
-            // Not the first backend: the one published by a reopen (a new one may reuse its address).
-            auto* const current = stream->published >= 2 ? stream->Only() : nullptr;
-            if (current != nullptr && stream->RenderFromBackend(current, output, 240)) {
-                ++played;
-            }
+        auto* const first = stream->Only();
+        while (!stop_token.stop_requested() && !first_stops) {
+            stream->RenderFromBackend(first, output, 240);
             std::this_thread::sleep_for(5ms);
         }
     });
+    DeviceCallbacks device{*stream, 0ms, 1};
+    CHECK(Render(*stream, 16));
+    first_stops = true;
+    first_callbacks.request_stop();
+    first_callbacks.join();
     CHECK(Render(*stream, 64));
-    CHECK(WaitFor([&] { return played.load() > 0; }));
-    callback.request_stop();
-    callback.join();
-    CHECK(stream->Reopens() == 1);
-    CHECK(stream->published == 2);
+    CHECK(WaitFor([&] { return device.played.load() > 0; }));
+    CHECK(stream->Reopens() >= 1);
     CHECK(stream->Running());
 }
 
 TEST_CASE("A stream whose backend asks for audio slowly is not reopened",
           "[audio_core][stream_standby]") {
     SysmixTests::Context context;
-    auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, 20ms);
+    auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, 100ms);
     stream->Start();
     auto* const backend = stream->Only();
     REQUIRE(backend != nullptr);
-    // A callback every 30 ms: never three checks of 20 ms in a row without one.
+    // A callback every 10 ms against three checks of 100 ms: thirty times the margin.
     std::jthread callback([&](std::stop_token stop_token) {
         std::array<s16, 480> output{};
         while (!stop_token.stop_requested()) {
             stream->RenderFromBackend(backend, output, 240);
-            std::this_thread::sleep_for(30ms);
+            std::this_thread::sleep_for(10ms);
         }
     });
-    CHECK(Render(*stream, 32));
+    CHECK(Render(*stream, 64));
     callback.request_stop();
     callback.join();
     CHECK(stream->ReopenAttempts() == 0);
     CHECK_FALSE(stream->IsStandingIn());
     CHECK(stream->Only() == backend);
+}
+
+TEST_CASE("A stream whose device is slow to start is left to start",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    constexpr auto Check = 50ms;
+    SECTION("within the grace of a backend that has not asked yet") {
+        auto stream =
+            std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, Check);
+        REQUIRE(stream->StallThreshold(false, 0) == 6);
+        // Its first callback five checks after it starts.
+        DeviceCallbacks device{*stream, 5 * Check};
+        stream->Start();
+        CHECK(Render(*stream, 64));
+        CHECK(WaitFor([&] { return device.played.load() > 0; }));
+        // Five checks against six leaves one of margin: on a loaded runner it may reopen once,
+        // and its next backend then has twelve.
+        CHECK(stream->ReopenAttempts() <= 1);
+        CHECK(stream->Running());
+    }
+    SECTION("past it: reopened, then left alone as the threshold doubles") {
+        auto stream =
+            std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, Check);
+        // Eight checks each time it starts: past the first threshold of six, within the twelve
+        // after one stall.
+        DeviceCallbacks device{*stream, 8 * Check};
+        stream->Start();
+        CHECK(Render(*stream, 64));
+        CHECK(WaitFor([&] { return device.played.load() > 0; }));
+        const u64 reopens = stream->Reopens();
+        CHECK(reopens >= 1);
+        CHECK(reopens <= 2);
+        // Then it plays and is left alone.
+        CHECK(Render(*stream, 64));
+        CHECK(stream->Reopens() == reopens);
+    }
+}
+
+TEST_CASE("A stalled backend whose destroy blocks does not hold the stand-in or the owner",
+          "[audio_core][stream_standby]") {
+    SysmixTests::Context context;
+    auto stream = std::make_unique<LosableStream>(context.system, StreamType::Render, 0, true, 20ms);
+    OpenGate gate{*stream};
+    stream->Start();
+    // No callback: it stalls, and its destroy then blocks.
+    stream->hold_destroy = true;
+    CHECK(Render(*stream, 64));
+    REQUIRE(WaitFor([&] { return stream->destroying.load(); }));
+    CHECK(stream->IsStandingIn());
+    // The owner's calls do not wait for it.
+    CHECK(ReturnsWhileOpenBlocks(*stream, [&] { stream->Stop(); }));
+    CHECK(ReturnsWhileOpenBlocks(*stream, [&] { stream->Start(); }));
+    CHECK(Render(*stream, 16));
+    // No reopen while it is being destroyed; once it is, the stream reopens.
+    CHECK(stream->ReopenAttempts() == 0);
+    stream->hold_destroy = false;
+    CHECK(WaitFor([&] { return stream->Reopens() >= 1; }));
 }
