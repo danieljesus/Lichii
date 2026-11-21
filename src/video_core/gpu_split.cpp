@@ -470,7 +470,11 @@ bool GpuSplit::SettlesDiverted() {
 }
 
 bool GpuSplit::SettlesDivertedPastCacheWrites() {
-    return SettleDivertedMode() == '2';
+    return SettleDivertedMode() == '2' || SettleDivertedMode() == '4';
+}
+
+bool GpuSplit::DivertedShortWaits() {
+    return SettleDivertedMode() == '3' || SettleDivertedMode() == '4';
 }
 
 std::optional<GpuSplit::SettledWord> GpuSplit::SettledWordAt(const Tegra::MemoryManager& memory,
@@ -1330,7 +1334,7 @@ void GpuSplit::ReportAcquire() {
     if (diverted_met != 0 || diverted_short != 0 || diverted_unsettled != 0) {
         LOG_INFO(HW_GPU,
                  "Equal or mask acquires of words mirrored releases go beside in 10 s: {} met "
-                 "without a drain, {} drained with the word settled short, {} drained unsettled; "
+                 "without a drain, {} with the word settled short, {} drained unsettled; "
                  "verify: {} passed but not met after a drain",
                  diverted_met, diverted_short, diverted_unsettled, diverted_mismatches);
     }

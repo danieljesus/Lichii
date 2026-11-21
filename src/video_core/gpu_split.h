@@ -129,9 +129,9 @@ struct AcquireStats {
     std::atomic<u64> back_waits{};      ///< The back ran out of work
     std::atomic<u64> back_sleeps{};     ///< Of those: it went to sleep
     std::atomic<u64> back_spin_ns{};    ///< How long it spun for more work before that
-    /// Equal or mask acquires of a word mirrored releases go beside (Nx2MirrorShadow) met
-    /// without a drain, and those that drained: the word settled but doesn't meet it, or queued
-    /// work may still change it
+    /// Equal or mask acquires of a word mirrored releases go beside (Nx2MirrorShadow) and their
+    /// polls: met without a drain, the word settled but doesn't meet it, and drained because
+    /// queued work may still change it
     std::atomic<u64> diverted_met{};
     std::atomic<u64> diverted_short{};
     std::atomic<u64> diverted_unsettled{};
@@ -526,11 +526,15 @@ public:
     /// EDEN_NX2_SETTLE_DIVERTED=0: equal and mask acquires of a word mirrored releases go beside
     /// drain as before, and those releases are placed and noted as before.
     [[nodiscard]] static bool SettlesDiverted();
-    /// EDEN_NX2_SETTLE_DIVERTED=2, an experiment: such a word is settled although draws the back
-    /// has yet to run may store anywhere through the caches (NoteCacheWrite), as long as GPU work
-    /// never wrote its page. Nothing proves that none of them stores there; the acquires that
-    /// wait to reach a value make the same assumption (CheckWithoutDrain).
+    /// EDEN_NX2_SETTLE_DIVERTED=2 or 4, an experiment: such a word is settled although draws the
+    /// back has yet to run may store anywhere through the caches (NoteCacheWrite), as long as GPU
+    /// work never wrote its page. Nothing proves that none of them stores there; the acquires
+    /// that wait to reach a value make the same assumption (CheckWithoutDrain).
     [[nodiscard]] static bool SettlesDivertedPastCacheWrites();
+    /// EDEN_NX2_SETTLE_DIVERTED=3 or 4: an equal or mask acquire of such a word that settles to
+    /// a value that does not meet it waits as one nothing sent can meet yet (a release the back
+    /// runs latches it, the 1 ms valve drains), where 1 and 2 drain at each poll as before.
+    [[nodiscard]] static bool DivertedShortWaits();
     struct SettledWord {
         u32 value;
         std::optional<u64> release; ///< The position the back runs the noted release by

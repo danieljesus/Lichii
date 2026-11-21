@@ -159,12 +159,21 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
             release = *settled->release;
             return AcquireCheck::MetByQueued;
         }
+        if (settled && settled->diverted) {
+            VideoCommon::Count(stats.diverted_short);
+            if (VideoCommon::GpuSplit::DivertedShortWaits()) {
+                // What the word holds once the back ran everything sent does not meet it: a
+                // drain would find the same. A release that meets it on the way latches the
+                // waiter (Nx2SemaphoreWaiters::OnWrite).
+                return AcquireCheck::NotMet;
+            }
+        }
         VideoCommon::Count(stats.drain_operation);
         if (!settled) {
             VideoCommon::Count(stats.unsettled[static_cast<size_t>(why)]);
-        }
-        if (VideoCommon::g_acquire_counting && Nx2MirrorShadow::Get().Diverts(*device)) {
-            VideoCommon::Count(settled ? stats.diverted_short : stats.diverted_unsettled);
+            if (VideoCommon::g_acquire_counting && Nx2MirrorShadow::Get().Diverts(*device)) {
+                VideoCommon::Count(stats.diverted_unsettled);
+            }
         }
         return AcquireCheck::Drain;
     }
