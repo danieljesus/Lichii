@@ -4,9 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
-#include <streambuf>
-#include <istream>
 #include <fstream>
+#include <istream>
 #include <optional>
 #include <span>
 #include <string>
@@ -16,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/fs/file_lock.h"
+#include "tests/video_core/shader_cache_v2_cut_stream.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/shader_cache_v2/cache.h"
 #include "video_core/shader_cache_v2/cache_file.h"
@@ -130,36 +130,6 @@ std::vector<std::pair<u64, u64>> BlobRanges(const std::filesystem::path& file) {
     return ranges;
 }
 
-} // Anonymous namespace
-
-namespace {
-/// A stream over `bytes` that serves only the first `limit` of them, then either ends, as a read
-/// error does in libc++, or fails, as one does in libstdc++ (badbit).
-class CutStream final : public std::streambuf {
-public:
-    CutStream(std::span<const u8> bytes_, size_t limit_, bool fail_)
-        : bytes{bytes_}, limit{limit_}, fail{fail_} {}
-
-protected:
-    int_type underflow() override {
-        if (position >= limit) {
-            if (fail) {
-                throw std::ios_base::failure("read error");
-            }
-            return traits_type::eof();
-        }
-        current = static_cast<char>(bytes[position++]);
-        setg(&current, &current, &current + 1);
-        return traits_type::to_int_type(current);
-    }
-
-private:
-    std::span<const u8> bytes;
-    size_t limit;
-    bool fail;
-    size_t position{};
-    char current{};
-};
 } // Anonymous namespace
 
 TEST_CASE("Shader cache v2 driver blobs: payloads read back as written",
@@ -300,7 +270,7 @@ TEST_CASE("Shader cache v2 driver blobs: a file another emulator holds stays as 
     const Common::FS::FileLock lock{VideoCommon::PipelineCacheLockPath(file)};
     REQUIRE(lock.Held());
     {
-        V2::DriverBlobStore store{file, other, {.writer = FastWriter}};
+        V2::DriverBlobStore store{file, other, {.lock_wait = 10ms, .writer = FastWriter}};
         REQUIRE_FALSE(store.Active());
         REQUIRE(store.Discarded() == V2::DriverBlobDiscard::Failed);
         REQUIRE_FALSE(store.Find(TestKind(0), 0x100).has_value());
@@ -637,37 +607,81 @@ TEST_CASE("Shader cache v2 driver blobs: a session stores nothing past the ceili
     REQUIRE_FALSE(store.Find(RecordKind::GraphicsBinary, 5).has_value());
 }
 
-TEST_CASE("Shader cache v2 driver blobs: a read failing before the identity removes nothing",
+TEST_CASE("Shader cache v2 driver blobs: a read that fails decides nothing",
           "[video_core][shader_cache_v2]") {
     TempDir temp;
     const auto file = temp.path / V2::DriverFileName;
     StoreBlobs(file, 5);
     const std::vector<u8> before = ReadAll(file);
     const V2::DeviceIdentity identity = TestIdentity();
-    REQUIRE(V2::IdentityCheck(V2::ReadLogFile(file), identity) == V2::DriverBlobDiscard::None);
+    REQUIRE(V2::DecideDriverBlobs(V2::ReadLogFile(file), identity, true) ==
+            V2::DriverBlobDecision::Load);
+    const size_t cut = V2::FileHeaderSize + 1; // before the identity
     for (const bool fail : {false, true}) {
         INFO((fail ? "fails" : "ends") << " after the header");
-        const size_t cut = V2::FileHeaderSize + 1;
-        // Read without the lock, a read that ends there gives a log with a header and no identity,
-        // and the store would remove the file: so it reads again with the lock held, where the
-        // same failure is a failed read. (One that fails loses what it read, which reads as no
-        // file at all.)
-        if (!fail) {
-            CutStream tolerant_buffer{before, cut, fail};
-            std::istream tolerant_stream{&tolerant_buffer};
-            const V2::LogFile tolerant = V2::ReadLog(tolerant_stream, before.size());
-            REQUIRE(V2::IdentityCheck(tolerant, identity) == V2::DriverBlobDiscard::NoIdentity);
-        }
-        CutStream strict_buffer{before, cut, fail};
+        // With the lock held, a read that stops there is a failed read, whichever way it stops.
+        ShaderCacheV2Test::CutStream strict_buffer{before, cut, fail};
         std::istream strict_stream{&strict_buffer};
         const V2::LogFile strict =
             V2::ReadLog(strict_stream, before.size(), {}, V2::ReadMode::Strict);
-        REQUIRE(strict.read_failed);
+        REQUIRE(V2::DecideDriverBlobs(strict, identity, true) ==
+                V2::DriverBlobDecision::LeaveAlone);
+        // Without the lock, one that fails is known to have failed; one that only ends early
+        // reads as a file without this device's identity, which is begun again. That case is
+        // closed only where the lock can be held.
+        ShaderCacheV2Test::CutStream tolerant_buffer{before, cut, fail};
+        std::istream tolerant_stream{&tolerant_buffer};
+        const V2::LogFile tolerant = V2::ReadLog(tolerant_stream, before.size());
+        REQUIRE(V2::DecideDriverBlobs(tolerant, identity, true) ==
+                (fail ? V2::DriverBlobDecision::LeaveAlone : V2::DriverBlobDecision::StartNew));
     }
-    // Read whole, the same file keeps its blobs.
+    // A read that gave nothing is a new file only when there is nothing on disk.
+    const V2::LogFile none = V2::ReadLogFile(temp.path / "missing.bin");
+    REQUIRE(V2::DecideDriverBlobs(none, identity, false) == V2::DriverBlobDecision::StartNew);
+    REQUIRE(V2::DecideDriverBlobs(none, identity, true) == V2::DriverBlobDecision::LeaveAlone);
+}
+
+TEST_CASE("Shader cache v2 driver blobs: a store whose file is not a regular one stays off",
+          "[video_core][shader_cache_v2]") {
+    TempDir temp;
+    const auto file = temp.path / V2::DriverFileName;
+    std::filesystem::create_directory(file);
+    for (const bool other_holds_lock : {false, true}) {
+        INFO((other_holds_lock ? "another holds the lock" : "the lock is free"));
+        std::optional<Common::FS::FileLock> other;
+        if (other_holds_lock) {
+            other.emplace(VideoCommon::PipelineCacheLockPath(file));
+            REQUIRE(other->Held());
+        }
+        {
+            V2::DriverBlobStore store{file, TestIdentity(),
+                                      {.lock_wait = 10ms, .writer = FastWriter}};
+            REQUIRE_FALSE(store.Active());
+            REQUIRE(store.Discarded() == V2::DriverBlobDiscard::Failed);
+            store.Store(RecordKind::GraphicsBinary, 0x500, TestPayload(50));
+        }
+        REQUIRE(std::filesystem::is_directory(file));
+        REQUIRE(std::filesystem::is_empty(file));
+    }
+}
+
+TEST_CASE("Shader cache v2 driver blobs: a file another emulator holds through the wait is used "
+          "as before",
+          "[video_core][shader_cache_v2]") {
+    TempDir temp;
+    const auto file = temp.path / V2::DriverFileName;
+    StoreBlobs(file, 3);
+    const std::vector<u8> before = ReadAll(file);
+    std::optional<Common::FS::FileLock> other{VideoCommon::PipelineCacheLockPath(file)};
+    REQUIRE(other->Held());
     {
-        V2::DriverBlobStore store{file, identity, {.writer = FastWriter}};
+        // Read without the lock, as before this check: this device's blobs are found.
+        V2::DriverBlobStore store{file, TestIdentity(), {.lock_wait = 10ms, .writer = FastWriter}};
+        REQUIRE(store.Active());
         REQUIRE(store.Discarded() == V2::DriverBlobDiscard::None);
-        REQUIRE(store.Counts().loaded == 5);
+        REQUIRE(store.Counts().loaded == 3);
+        REQUIRE(store.Find(TestKind(0), 0x100) == TestPayload(0));
+        other.reset();
     }
+    REQUIRE(ReadAll(file) == before);
 }

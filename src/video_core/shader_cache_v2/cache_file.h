@@ -25,8 +25,10 @@ namespace VideoCommon::ShaderCacheV2 {
 struct LogFile {
     std::vector<u8> bytes;
     ParsedLog parsed;
-    /// A strict read returned fewer bytes than the log's size: a read error. Nothing read may then
-    /// decide a rewrite or a removal.
+    /// The read hit an error. Strict: fewer bytes than the log's size, a failed size or seek, or a
+    /// file that is not a regular one; nothing was kept, and nothing may decide a rewrite or a
+    /// removal. Tolerant: the stream reported one (libc++ may not), and what was read before it
+    /// is parsed.
     bool read_failed{};
 
     LogFile() = default;
@@ -41,8 +43,9 @@ enum class ReadMode {
     /// Without the log's lock: another emulator may compact it meanwhile, so fewer bytes than its
     /// size are a file that shrank, and what was read is parsed.
     Tolerant,
-    /// With the log's lock held: nothing else changes it, so fewer bytes than its size, or a file
-    /// that is not a regular one, are a read error (LogFile::read_failed).
+    /// Only with the log's lock held (FileLock::Held): nothing else changes it, so fewer bytes than
+    /// its size, a failed size or seek, or a file that is not a regular one, are a read error
+    /// (LogFile::read_failed).
     Strict,
 };
 
@@ -51,8 +54,9 @@ enum class ReadMode {
                               ReadMode mode = ReadMode::Tolerant);
 
 /// Reads the whole log, by default without its lock: records are only appended under it, and the
-/// reader ignores one cut off by an append still in progress. A missing file reads as empty. See
-/// ParseLog for `for_each`.
+/// reader ignores one cut off by an append still in progress. A missing file reads as empty, and
+/// so does one that is not a regular file without the lock (with a warning). See ParseLog for
+/// `for_each`.
 [[nodiscard]] LogFile ReadLogFile(const std::filesystem::path& file, const ForEach& for_each = {},
                                   ReadMode mode = ReadMode::Tolerant);
 

@@ -106,48 +106,74 @@ DriverBlobDiscard IdentityCheck(const LogFile& log, const DeviceIdentity& identi
     return has_identity ? DriverBlobDiscard::OtherIdentity : DriverBlobDiscard::NoIdentity;
 }
 
+namespace {
+
+/// Whether something is at `file` that a read giving no bytes failed to read: a file that isn't
+/// empty, or anything other than a regular file.
+bool HasBytesOnDisk(const std::filesystem::path& file) {
+    std::error_code error;
+    const std::filesystem::file_status status = std::filesystem::status(file, error);
+    if (status.type() == std::filesystem::file_type::not_found) {
+        return false;
+    }
+    if (error || status.type() != std::filesystem::file_type::regular) {
+        return true;
+    }
+    const u64 size = std::filesystem::file_size(file, error);
+    return error || size != 0;
+}
+
+} // Anonymous namespace
+
+DriverBlobDecision DecideDriverBlobs(const LogFile& log, const DeviceIdentity& identity,
+                                     bool has_bytes_on_disk) {
+    if (log.read_failed || (log.parsed.header == HeaderStatus::Empty && has_bytes_on_disk)) {
+        return DriverBlobDecision::LeaveAlone;
+    }
+    if (log.parsed.header == HeaderStatus::Empty ||
+        IdentityCheck(log, identity) != DriverBlobDiscard::None) {
+        return DriverBlobDecision::StartNew;
+    }
+    return DriverBlobDecision::Load;
+}
+
 DriverBlobStore::DriverBlobStore(std::filesystem::path file_, const DeviceIdentity& identity,
                                  DriverBlobOptions options_)
     : file{std::move(file_)}, options{options_} {
     {
-        // Read without the lock, as the v2 log is: appends are complete records or a cut-off tail.
-        LogFile log = ReadLogFile(file);
-        if (IdentityCheck(log, identity) != DriverBlobDiscard::None) {
-            const Common::FS::FileLock lock{PipelineCacheLockPath(file)};
-            if (lock.Busy()) {
-                LOG_WARNING(Render_Vulkan,
-                            "Driver blobs: can't remove {}, made for another device or driver: "
-                            "another emulator holds it",
-                            Common::FS::PathToUTF8String(file));
-                discarded = DriverBlobDiscard::Failed;
-                return;
-            }
-            // Read again with the lock held, whole: the read without it may be cut short by
-            // another emulator's compaction, and one failing partway hides the identity after
-            // the failure. Neither may remove the driver's blobs.
-            log = ReadLogFile(file, {}, ReadMode::Strict);
-            if (log.read_failed) {
-                LOG_WARNING(Render_Vulkan,
-                            "Driver blobs: can't read {} whole; the store stays off this session",
-                            Common::FS::PathToUTF8String(file));
-                discarded = DriverBlobDiscard::Failed;
-                return;
-            }
-            discarded = IdentityCheck(log, identity);
-            if (discarded != DriverBlobDiscard::None) {
+        // With the lock held nothing changes the file, so the read that decides whether it is
+        // loaded, removed or begun again is made whole, and a read error decides nothing. When it
+        // can't be held (another emulator held it through the wait, or the file system has no
+        // working locks) the file is read without it, as before: then only a read that gives
+        // nothing from a file that has bytes is known to have failed.
+        const Common::FS::FileLock lock{PipelineCacheLockPath(file), options.lock_wait};
+        const LogFile log =
+            ReadLogFile(file, {}, lock.Held() ? ReadMode::Strict : ReadMode::Tolerant);
+        switch (DecideDriverBlobs(log, identity, HasBytesOnDisk(file))) {
+        case DriverBlobDecision::LeaveAlone:
+            LOG_WARNING(Render_Vulkan, "Driver blobs: can't read {} whole; off this session",
+                        Common::FS::PathToUTF8String(file));
+            discarded = DriverBlobDiscard::Failed;
+            return;
+        case DriverBlobDecision::StartNew:
+            if (log.parsed.header != HeaderStatus::Empty) {
+                discarded = IdentityCheck(log, identity);
                 std::error_code error;
-                std::filesystem::remove(file, error);
-                if (error) {
+                if (!lock.Busy()) {
+                    std::filesystem::remove(file, error);
+                }
+                if (lock.Busy() || error) {
                     LOG_WARNING(Render_Vulkan,
                                 "Driver blobs: can't remove {}, made for another device or "
                                 "driver: {}",
-                                Common::FS::PathToUTF8String(file), error.message());
+                                Common::FS::PathToUTF8String(file),
+                                lock.Busy() ? "another emulator holds it" : error.message());
                     discarded = DriverBlobDiscard::Failed;
                     return;
                 }
             }
-        }
-        if (discarded == DriverBlobDiscard::None && log.parsed.header != HeaderStatus::Empty) {
+            break;
+        case DriverBlobDecision::Load:
             for (const LogRecord& record : log.parsed.live) {
                 if (!IsBlobKind(record.kind)) {
                     continue;
@@ -164,6 +190,7 @@ DriverBlobStore::DriverBlobStore(std::filesystem::path file_, const DeviceIdenti
             dead_bytes = log.parsed.stats.dead_bytes;
             reader.Open(file, Common::FS::FileAccessMode::Read, Common::FS::FileType::BinaryFile,
                         Common::FS::FileShareFlag::ShareReadWrite);
+            break;
         }
     }
     writer.emplace(file, options.writer,

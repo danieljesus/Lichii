@@ -1280,6 +1280,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
              "damaged headers, {} damaged records, {} bytes skipped, {} bytes cut off",
              stats.file_size, stats.live, stats.superseded, stats.tombstones, stats.bad_headers,
              stats.bad_payloads, stats.skipped_bytes, stats.torn_tail_bytes);
+    if (log_v2->read_failed) {
+        LOG_WARNING(Render_Vulkan, "Shader cache v2: a read error cut the log short");
+    }
     std::vector<u64> expired_sessions;
     used_pipelines =
         UsedPipelinesFromLog(log_v2->parsed.live, MaxUsedPipelineAge(device), expired_sessions);

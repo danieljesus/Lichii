@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -14,6 +15,7 @@
 
 #include "common/common_types.h"
 #include "common/fs/file.h"
+#include "video_core/pipeline_cache_files.h"
 #include "video_core/shader_cache_v2/cache_format.h"
 #include "video_core/shader_cache_v2/cache_writer.h"
 
@@ -74,6 +76,8 @@ struct DriverBlobOptions {
     /// When above max_bytes, closing keeps every blob the session used or wrote up to this many
     /// bytes, past max_bytes and target_bytes if they need it: the limit follows what the game uses
     u64 session_cap_bytes{0};
+    /// How long opening waits for the file's lock while another emulator holds it
+    std::chrono::milliseconds lock_wait{PipelineCacheLockWait};
     WriterOptions writer{};
 };
 
@@ -92,13 +96,29 @@ enum class DriverBlobDiscard {
     None,
     OtherIdentity, ///< They were made on another device or driver
     NoIdentity,    ///< The file names no identity, or it is another format version's
-    Failed,        ///< Such a file couldn't be removed: the store stays off for the session
+    Failed, ///< The file couldn't be locked, read whole or removed: the store stays off for the
+            ///< session, and the file stays as it is
 };
 
-/// What a store does with its file when its log reads as `log`: keeps it (None: no file yet, or
-/// one of `identity`), or discards it, saying why. A log a read error cut short can lack the
-/// identity it holds: decide a removal only on one read whole (ReadMode::Strict).
+/// Why a file whose log reads as `log` is discarded, or None when it is kept: no file yet, or one
+/// of `identity`.
 [[nodiscard]] DriverBlobDiscard IdentityCheck(const LogFile& log, const DeviceIdentity& identity);
+
+/// What a store does with its file
+enum class DriverBlobDecision {
+    Load,       ///< It is this device's: its blobs are found, and new ones appended
+    StartNew,   ///< There is none, or it is another device's or names none: it is removed and
+                ///< begun again with this device's identity
+    LeaveAlone, ///< It couldn't be read whole: nothing is read from it or written to it
+};
+
+/// The decision on a store's file from `log`, read with ReadMode::Strict when the file's lock is
+/// held. A read error can hide the identity a file holds, so a failed read decides nothing, and
+/// neither does one that gave no bytes from a file that has some (`has_bytes_on_disk`), the one
+/// failure a read without the lock can tell.
+[[nodiscard]] DriverBlobDecision DecideDriverBlobs(const LogFile& log,
+                                                   const DeviceIdentity& identity,
+                                                   bool has_bytes_on_disk);
 
 /// A driver blob file. Any thread looks blobs up, rejects and stores them; the writer thread alone
 /// writes the file. Only an index stays in memory: Find reads the blob from the file.

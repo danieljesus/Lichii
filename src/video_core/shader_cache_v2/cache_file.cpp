@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
-#include <sstream>
 #include <system_error>
 
 #include "common/fs/file.h"
@@ -64,63 +63,86 @@ u64 UnixNow() {
                                 .count());
 }
 
-LogFile ReadLog(std::istream& stream, u64 size, const ForEach& for_each, ReadMode mode) {
+namespace {
+
+LogFile EmptyLog(const ForEach& for_each) {
     LogFile log;
-    if (size > 0) {
-        log.bytes.resize(static_cast<size_t>(size));
-        // In chunks: MinGW's libstdc++ hands one read to the CRT's _read, which aborts the
-        // process (invalid parameter) on a count above INT_MAX, a cache past 2 GiB
-        constexpr u64 Chunk = u64{256} << 20;
-        u64 done = 0;
-        while (done < size) {
-            const u64 want = std::min(Chunk, size - done);
-            stream.read(reinterpret_cast<char*>(log.bytes.data()) + done,
-                        static_cast<std::streamsize>(want));
-            done += static_cast<u64>(stream.gcount());
-            if (static_cast<u64>(stream.gcount()) != want) {
-                break;
-            }
-        }
-        // A read error is not always reported as one: libc++ returns fewer bytes with no badbit.
-        // Under the lock nothing shrinks the file, so fewer bytes are an error, and nothing read
-        // may decide a rewrite or a removal. Without it, the file shrank since (a compaction
-        // replaced it).
-        if (mode == ReadMode::Strict && (done < size || stream.bad())) {
-            log.bytes.clear();
-            log.read_failed = true;
-            return log;
-        }
-        log.bytes.resize(static_cast<size_t>(done));
+    log.parsed = ParseLog(log.bytes, for_each);
+    return log;
+}
+
+// Nothing kept, and parsed as no log: a caller that missed read_failed still finds nothing to
+// rewrite, and no records to drop.
+LogFile FailedRead() {
+    LogFile log = EmptyLog({});
+    log.read_failed = true;
+    return log;
+}
+
+} // Anonymous namespace
+
+LogFile ReadLog(std::istream& stream, u64 size, const ForEach& for_each, ReadMode mode) {
+    if (size == 0) {
+        return EmptyLog(for_each);
     }
+    LogFile log;
+    log.bytes.resize(static_cast<size_t>(size));
+    // In chunks: MinGW's libstdc++ hands one read to the CRT's _read, which aborts the process
+    // (invalid parameter) on a count above INT_MAX, a cache past 2 GiB
+    constexpr u64 Chunk = u64{256} << 20;
+    u64 done = 0;
+    while (done < size) {
+        const u64 want = std::min(Chunk, size - done);
+        stream.read(reinterpret_cast<char*>(log.bytes.data()) + done,
+                    static_cast<std::streamsize>(want));
+        done += static_cast<u64>(stream.gcount());
+        if (static_cast<u64>(stream.gcount()) != want) {
+            break;
+        }
+    }
+    // A read error is not always reported as one: libc++ returns fewer bytes with no badbit.
+    // Under the lock nothing shrinks the file, so fewer bytes are an error, and nothing read may
+    // decide a rewrite or a removal. Without it, the file shrank since (a compaction replaced it).
+    if (mode == ReadMode::Strict && (done < size || stream.bad())) {
+        return FailedRead();
+    }
+    log.read_failed = stream.bad();
+    log.bytes.resize(static_cast<size_t>(done));
     log.parsed = ParseLog(log.bytes, for_each);
     return log;
 }
 
 LogFile ReadLogFile(const std::filesystem::path& file, const ForEach& for_each, ReadMode mode) {
-    if (mode == ReadMode::Strict) {
-        std::error_code error;
-        if (!std::filesystem::exists(file, error) && !error) {
-            std::istringstream none; // a missing file reads as empty
-            return ReadLog(none, 0, for_each, mode);
+    const bool strict = mode == ReadMode::Strict;
+    std::error_code error;
+    const std::filesystem::file_status status = std::filesystem::status(file, error);
+    if (status.type() == std::filesystem::file_type::not_found) {
+        return EmptyLog(for_each);
+    }
+    // A directory or a device at the path could report any size; only a regular file is a log.
+    if (error || status.type() != std::filesystem::file_type::regular) {
+        if (strict) {
+            return FailedRead();
         }
-        if (!std::filesystem::is_regular_file(file, error) || error) {
-            LogFile log;
-            log.read_failed = true;
-            return log;
+        LOG_WARNING(Common_Filesystem, "Shader cache {} is not a regular file; read as empty",
+                    Common::FS::PathToUTF8String(file));
+        return EmptyLog(for_each);
+    }
+    const u64 size = std::filesystem::file_size(file, error);
+    std::ifstream stream(file, std::ios::binary);
+    if (error || !stream.is_open()) {
+        return strict ? FailedRead() : EmptyLog(for_each);
+    }
+    if (strict) {
+        // Under the lock the stream must see the size file_size gave.
+        stream.seekg(0, std::ios::end);
+        const std::streamoff end = stream.tellg();
+        stream.seekg(0);
+        if (!stream || end < 0 || static_cast<u64>(end) != size) {
+            return FailedRead();
         }
     }
-    std::ifstream stream(file, std::ios::binary | std::ios::ate);
-    if (!stream.is_open()) {
-        if (mode == ReadMode::Strict) {
-            LogFile log;
-            log.read_failed = true;
-            return log;
-        }
-        return ReadLog(stream, 0, for_each, mode);
-    }
-    const std::streamoff size = stream.tellg();
-    stream.seekg(0);
-    return ReadLog(stream, size > 0 ? static_cast<u64>(size) : 0, for_each, mode);
+    return ReadLog(stream, size, for_each, mode);
 }
 
 std::optional<std::vector<u8>> ReadRecordPayload(const std::filesystem::path& file,
