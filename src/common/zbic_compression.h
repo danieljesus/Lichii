@@ -12,8 +12,4 @@ namespace Common::Compression {
 
 [[nodiscard]] int DecompressDataZBIC(std::span<u8> dst, std::span<const u8> src);
 
-/// The most bytes `src`, a ZBIC frame, can decompress to, worked out from its block headers; 0 if
-/// it is not a valid frame.
-[[nodiscard]] u64 DecompressBoundZBIC(std::span<const u8> src);
-
 } // namespace Common::Compression

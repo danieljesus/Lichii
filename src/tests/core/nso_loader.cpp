@@ -224,3 +224,24 @@ TEST_CASE("NSO allocates nothing for segments its file cannot hold", "[core][loa
     CHECK(peak() - before < u64{256} << 20);
 }
 #endif
+
+TEST_CASE("NSO keeps the rule for an empty LZ4 segment", "[core][loader]") {
+    // As before: an empty segment decompresses from a stream of one empty sequence, and with no
+    // stored bytes at all it is refused.
+    CHECK(Load(MakeNso({0x00}, 0)).has_value());
+    CHECK_FALSE(Load(MakeNso({}, 0)).has_value());
+}
+
+TEST_CASE("NSO loads on a kernel that is not set up", "[core][loader]") {
+    // No memory manager yet, so no pool to bound the image by: the loader does not ask for one.
+    ScopedSystemTestContext environment;
+    Core::System system;
+    system.Initialize();
+    REQUIRE_FALSE(system.Kernel().HasMemoryManager());
+    Kernel::KProcess process{system.Kernel()};
+    CHECK(Loader::AppLoader_NSO::LoadModule(
+              process, system,
+              *MakeStoredNso({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10}, {0x2000, 0x10, 0x10}}}),
+              0x8000000, false, false)
+              .has_value());
+}

@@ -167,12 +167,16 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }
     // Nor more than the memory of the largest pool a process can be created in: the metadata,
     // which picks the pool, is applied once every module's size is known. A kernel not set up
-    // yet has no pool, and sets no bound.
+    // yet has no memory manager, and sets no bound.
     u64 largest_pool = 0;
-    for (const auto pool :
-         {Kernel::KMemoryManager::Pool::Application, Kernel::KMemoryManager::Pool::Applet,
-          Kernel::KMemoryManager::Pool::System, Kernel::KMemoryManager::Pool::SystemNonSecure}) {
-        largest_pool = (std::max<u64>)(largest_pool, system.Kernel().MemoryManager().GetSize(pool));
+    if (system.Kernel().HasMemoryManager()) {
+        for (const auto pool : {Kernel::KMemoryManager::Pool::Application,
+                                Kernel::KMemoryManager::Pool::Applet,
+                                Kernel::KMemoryManager::Pool::System,
+                                Kernel::KMemoryManager::Pool::SystemNonSecure}) {
+            largest_pool =
+                (std::max<u64>)(largest_pool, system.Kernel().MemoryManager().GetSize(pool));
+        }
     }
     if (largest_pool != 0 && image_extent > largest_pool) {
         LOG_ERROR(Loader, "{}: needs a {:#x} byte image, which no process can hold",
@@ -201,7 +205,10 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                                    segment.size};
         const auto& data = stored_data[i];
         if (!nso_header.IsSegmentCompressed(i)) {
-            std::memcpy(target.data(), data.data(), target.size());
+            // An empty one has nothing to copy, and an empty vector's data() may be null.
+            if (!target.empty()) {
+                std::memcpy(target.data(), data.data(), target.size());
+            }
         } else if (nso_header.IsZBICCompressed()) {
             const int r = Common::Compression::DecompressDataZBIC(target, data);
             // A failed segment would boot a corrupt image that hangs without presenting; refuse
