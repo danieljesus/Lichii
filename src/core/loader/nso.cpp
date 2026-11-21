@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -28,9 +29,9 @@
 #include "core/hle/kernel/code_set.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_page_table.h"
-#include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/kernel.h"
 #include "core/loader/nso.h"
 #include "core/memory.h"
 
@@ -124,20 +125,24 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             return std::nullopt;
         }
         segments_end = std::max<u64>(segments_end, u64{segment.location} + segment.size);
-        if (!nso_header.IsSegmentCompressed(i)) {
+        const bool compressed = nso_header.IsSegmentCompressed(i);
+        // The console's loader refuses a segment, or a compressed one's stored bytes, larger than
+        // INT32_MAX (Atmosphere's ldr, LoadAutoLoadModuleSegment); this does the same, a deliberate
+        // tightening: a raw segment that large, or a ZBIC one with a small stream, used to load.
+        // An LZ4 one never could: its decompressor counts in int.
+        constexpr u64 MaxSegmentSize = std::numeric_limits<s32>::max();
+        if (segment.size > MaxSegmentSize || (compressed && stored > MaxSegmentSize)) {
+            LOG_ERROR(Loader, "{}: segment {} is larger than the console loads",
+                      nso_file.GetName(), i);
+            return std::nullopt;
+        }
+        if (!compressed) {
             // A stored segment is copied from the bytes read for it.
             if (segment.size > stored) {
                 LOG_ERROR(Loader, "{}: stored segment {} is larger than its data",
                           nso_file.GetName(), i);
                 return std::nullopt;
             }
-        } else if (segment.size > static_cast<u32>(std::numeric_limits<int>::max()) ||
-                   stored > static_cast<u32>(std::numeric_limits<int>::max())) {
-            // The decompressors take and return sizes as int, so such a segment could never
-            // decompress to its size; the console's loader refuses one past this too.
-            LOG_ERROR(Loader, "{}: compressed segment {} is too large to decompress",
-                      nso_file.GetName(), i);
-            return std::nullopt;
         } else if (!nso_header.IsZBICCompressed() && segment.size > stored * MaxLz4Expansion) {
             LOG_ERROR(Loader, "{}: segment {} is larger than its compressed data can hold",
                       nso_file.GetName(), i);
@@ -180,7 +185,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     for (const auto pool :
          {Kernel::KMemoryManager::Pool::Application, Kernel::KMemoryManager::Pool::Applet,
           Kernel::KMemoryManager::Pool::System, Kernel::KMemoryManager::Pool::SystemNonSecure}) {
-        largest_pool = (std::max<u64>)(largest_pool, system.Kernel().MemoryManager().GetSize(pool));
+        largest_pool = std::max<u64>(largest_pool, system.Kernel().MemoryManager().GetSize(pool));
     }
     if (image_extent > largest_pool) {
         LOG_ERROR(Loader, "{}: needs a {:#x} byte image, which no process can hold",
@@ -189,35 +194,41 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }
     Kernel::CodeSet codeset;
     codeset.memory.resize(module_start + segments_end);
+    // Each segment is read inside this loop, from extents the header checks found inside the
+    // file: a raw one straight into the image, a compressed one's stored bytes into one buffer,
+    // left uninitialized, as large as the largest of them, which the file bounds. A ZBIC segment
+    // may decompress to fewer bytes than its size, the rest left zero, as the loader always took,
+    // so its size is bounded only by the image.
+    u64 largest_stored = 0;
+    for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
+        if (nso_header.IsSegmentCompressed(i)) {
+            largest_stored = std::max<u64>(largest_stored, nso_header.segments_compressed_size[i]);
+        }
+    }
+    const auto stored_buffer =
+        std::make_unique_for_overwrite<u8[]>(static_cast<size_t>(largest_stored));
     for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
         const auto& segment = nso_header.segments[i];
         const std::span<u8> target{codeset.memory.data() + module_start + segment.location,
                                    segment.size};
-        // Read one segment at a time, from extents the header checks found inside the file: a raw
-        // segment straight into the image, a compressed one's stored bytes into a buffer that
-        // size. A ZBIC segment may decompress to fewer bytes than its size, the rest left zero,
-        // as the loader always took, so its size is bounded only by the image.
-        const auto short_read = [&] {
-            LOG_ERROR(Loader, "{}: short read of segment {}", nso_file.GetName(), i);
-            return std::nullopt;
+        const std::span<u8> stored{stored_buffer.get(), nso_header.segments_compressed_size[i]};
+        const auto read = [&](std::span<u8> into) {
+            // An empty one has nothing to read.
+            if (!into.empty() && nso_file.Read(into.data(), into.size(), segment.offset) != into.size()) {
+                LOG_ERROR(Loader, "{}: short read of segment {}", nso_file.GetName(), i);
+                return false;
+            }
+            return true;
         };
         if (!nso_header.IsSegmentCompressed(i)) {
-            // An empty one has nothing to read.
-            if (!target.empty() &&
-                nso_file.Read(target.data(), target.size(), segment.offset) != target.size()) {
-                return short_read();
+            if (!read(target)) {
+                return std::nullopt;
             }
-            codeset.segments[i].addr = module_start + segment.location;
-            codeset.segments[i].offset = module_start + segment.location;
-            codeset.segments[i].size = segment.size;
-            continue;
-        }
-        std::vector<u8> data(nso_header.segments_compressed_size[i]);
-        if (!data.empty() && nso_file.Read(data.data(), data.size(), segment.offset) != data.size()) {
-            return short_read();
-        }
-        if (nso_header.IsZBICCompressed()) {
-            const int r = Common::Compression::DecompressDataZBIC(target, data);
+        } else if (nso_header.IsZBICCompressed()) {
+            if (!read(stored)) {
+                return std::nullopt;
+            }
+            const int r = Common::Compression::DecompressDataZBIC(target, stored);
             // A failed segment would boot a corrupt image that hangs without presenting; refuse
             // to load instead.
             if (r <= 0) {
@@ -232,8 +243,11 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                 std::fill(target.begin() + r, target.end(), u8{0});
             }
         } else {
+            if (!read(stored)) {
+                return std::nullopt;
+            }
             const int r = Common::Compression::DecompressDataLZ4(
-                target.data(), target.size(), data.data(), data.size());
+                target.data(), target.size(), stored.data(), stored.size());
             // As for ZBIC: a segment that does not decompress to its size would boot corrupt.
             if (r != static_cast<int>(segment.size)) {
                 LOG_ERROR(Loader, "{}: segment {} decompressed to {} of {:#x} bytes",

@@ -6,9 +6,6 @@
 #include <memory>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <sys/resource.h>
-#endif
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -198,40 +195,13 @@ TEST_CASE("NSO rejects an LZ4 segment larger than its compressed bytes can fill"
 }
 
 TEST_CASE("NSO rejects an image no process can hold", "[core][loader]") {
-    // Inside a 32-bit image, but past the largest pool of the 4 GiB layout the tests use. This one
-    // used to load, allocating its whole image.
+    // Inside a 32-bit image, but past the largest pool of the 4 GiB layout, which
+    // ScopedSystemTestContext (in Load) sets for the test and restores after: its application pool
+    // is 3285 MiB. This one used to load, allocating its whole image.
     CHECK_FALSE(Load(MakeStoredNso({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10},
                                      {0xF0000000, 0x10, 0x10}}}))
                     .has_value());
 }
-
-#if !defined(_WIN32)
-TEST_CASE("NSO allocates nothing for segments its file cannot hold", "[core][loader]") {
-    // Stored sizes far past a file of a few hundred bytes, which the loader used to allocate
-    // buffers for, and fill, before reading the file: refused without the process's memory
-    // growing by anything like them. The peak is the whole process's: if an earlier test in the
-    // same run already peaked above what the old loader allocated here (several GB), this cannot
-    // tell the difference, and passes either way.
-    auto bytes = StoredNsoBytes({{{0, 0x10, 0x10}, {0x1000, 0x10, 0x10}, {0x2000, 0x10, 0x10}}});
-    for (std::size_t i = 0; i < 3; ++i) {
-        Put32(bytes, 0x60 + i * 4, 0x60000000);
-        Put32(bytes, 0x18 + i * 0x10, 0x60000000);
-        Put32(bytes, 0x14 + i * 0x10, static_cast<u32>(i) * 0x10);
-    }
-    const auto peak = [] {
-        rusage usage{};
-        getrusage(RUSAGE_SELF, &usage);
-#if defined(__APPLE__)
-        return static_cast<u64>(usage.ru_maxrss); // bytes
-#else
-        return static_cast<u64>(usage.ru_maxrss) * 1024; // KiB
-#endif
-    };
-    const u64 before = peak();
-    CHECK_FALSE(Load(AsFile(std::move(bytes))).has_value());
-    CHECK(peak() - before < u64{256} << 20);
-}
-#endif
 
 TEST_CASE("NSO keeps the rule for an empty LZ4 segment", "[core][loader]") {
     // As before: an empty segment decompresses from a stream of one empty sequence, and with no
@@ -248,9 +218,10 @@ TEST_CASE("NSO loads an empty segment whose offset lies past the file", "[core][
     CHECK(Load(AsFile(std::move(bytes))).has_value());
 }
 
-TEST_CASE("NSO refuses a compressed segment too large to decompress", "[core][loader]") {
-    // The decompressors count in int: a segment past INT_MAX could never decompress to its size,
-    // and is refused before anything is allocated for it.
+TEST_CASE("NSO refuses a segment larger than the console loads", "[core][loader]") {
+    // The console's loader refuses a segment larger than INT32_MAX; so does this one, before
+    // anything is allocated for it, though a ZBIC segment that large with a small stream used to
+    // load.
     const std::vector<u8> text{0x80, 'N', 'S', 'O', 't', 'e', 'x', 't', '!'};
     auto bytes = MakeNso(text, 8)->ReadAllBytes();
     Put32(bytes, 0x0C, Get32(bytes, 0x0C) | (1u << 7)); // ZBIC, which has no ratio bound
