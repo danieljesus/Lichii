@@ -108,6 +108,14 @@ class Scheduler;
 
 using VideoCommon::ShaderInfo;
 
+/// Reads a driver pipeline cache's data whole through `read` (vkGetPipelineCacheData). Pipelines
+/// may build into the cache between asking for its size and reading it; the size is then stale,
+/// and the driver returns VK_INCOMPLETE with part of the data, or none of it (MoltenVK). The size
+/// is asked for again each time, up to `attempts` reads. Empty when no read got all of it, or a
+/// call failed.
+std::optional<std::vector<char>> ReadPipelineCacheData(
+    const std::function<VkResult(size_t* size, void* data)>& read, int attempts = 4);
+
 using VideoCommon::ShaderPools;
 
 struct ComputePipelineCacheEntry {
