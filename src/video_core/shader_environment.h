@@ -272,8 +272,22 @@ public:
     FileEnvironment& operator=(const FileEnvironment&) = delete;
     FileEnvironment(const FileEnvironment&) = delete;
 
+    /// Where a record comes from.
+    enum class RecordSource {
+        /// The pipeline cache recorded it while the game played: a texture classification the
+        /// header byte-offset rule makes stale is dropped, so the game records the pipeline again
+        /// when it draws it.
+        Played,
+        /// A precompiled file holds it: its classifications are the build's or the recording's
+        /// guesses either way. The preparation translates it as it is, and a draw uses what it
+        /// prepared only once AnswersHoldFor finds each classification holds for the game's state,
+        /// which a dropped one would never be checked against.
+        Precompiled,
+    };
+
     /// Reads an environment that must end before `end`, the end of the file
-    void Deserialize(std::istream& file, std::streampos end);
+    void Deserialize(std::istream& file, std::streampos end,
+                     RecordSource source = RecordSource::Played);
 
     [[nodiscard]] size_t MemorySize() const;
 

@@ -764,7 +764,8 @@ struct PipelineCache::PrecompiledPrep {
             file.clear();
             const auto [offset, size] = env_index[ids[i]];
             file.seekg(static_cast<std::streamoff>(offset));
-            envs[i].Deserialize(file, static_cast<std::streamoff>(offset + size));
+            envs[i].Deserialize(file, static_cast<std::streamoff>(offset + size),
+                                FileEnvironment::RecordSource::Precompiled);
         }
         return envs;
     }
@@ -3330,7 +3331,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
             const auto [offset, size] = precompiled_env_index.at(record.envs[i]);
             precompiled_file.seekg(static_cast<std::streamoff>(offset));
             (*recorded)[i].Deserialize(precompiled_file,
-                                       static_cast<std::streamoff>(offset + size));
+                                       static_cast<std::streamoff>(offset + size),
+                                       FileEnvironment::RecordSource::Precompiled);
         }
         if (!precompiled_infos_file.is_open()) {
             precompiled_infos_file.open(precompiled_infos_path, std::ios::binary);
@@ -3510,7 +3512,8 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
             const auto [env_offset, env_size] = precompiled_env_index.at(record.envs[0]);
             precompiled_file.seekg(static_cast<std::streamoff>(env_offset));
             recorded.Deserialize(precompiled_file,
-                                 static_cast<std::streamoff>(env_offset + env_size));
+                                 static_cast<std::streamoff>(env_offset + env_size),
+                                 FileEnvironment::RecordSource::Precompiled);
             if (!precompiled_infos_file.is_open()) {
                 precompiled_infos_file.open(precompiled_infos_path, std::ios::binary);
                 precompiled_infos_file.exceptions(std::ifstream::failbit |

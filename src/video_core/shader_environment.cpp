@@ -1240,7 +1240,7 @@ u32 ComputeEnvironment::ReadViewportTransformState() {
     return viewport_transform_state;
 }
 
-void FileEnvironment::Deserialize(std::istream& file, std::streampos end) {
+void FileEnvironment::Deserialize(std::istream& file, std::streampos end, RecordSource source) {
     u64 code_size{};
     u64 num_texture_types{};
     u64 num_texture_pixel_formats{};
@@ -1341,8 +1341,9 @@ void FileEnvironment::Deserialize(std::istream& file, std::streampos end) {
     }
     if (const auto it{cbuf_values.find(HEADER_BYTE_OFFSET_RULE_KEY)}; it != cbuf_values.end()) {
         cbuf_values.erase(it);
-    } else if (HasNativeInstructions() && !Tegra::Texture::UsesHeaderByteOffsetHandles(
-                                            true, Settings::GetCurrentProgramID())) {
+    } else if (source == RecordSource::Played && HasNativeInstructions() &&
+               !Tegra::Texture::UsesHeaderByteOffsetHandles(true,
+                                                            Settings::GetCurrentProgramID())) {
         const auto ambiguous = [this](const auto& entry) {
             if (entry.first == 0 || entry.first % 32 != 0) {
                 return false;
