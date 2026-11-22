@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <memory>
@@ -72,6 +73,9 @@ PipelineCacheData ReadPipelineCacheData(Read&& read, Progress&& progress) {
         auto bytes = std::make_unique_for_overwrite<char[]>(size);
         const VkResult result = read(&size, bytes.get());
         progress();
+        // Never more than the buffer, which is uninitialized: a driver that reports more would
+        // have the write read past it.
+        size = std::min(size, asked);
         if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
             return {.result = result, .reads = attempt};
         }
@@ -87,21 +91,40 @@ PipelineCacheData ReadPipelineCacheData(Read&& read, Progress&& progress) {
     return {.result = VK_INCOMPLETE, .reads = PipelineCacheReadAttempts};
 }
 
-/// The timed flush of the driver pipeline cache: not sooner than `interval` after the last save
-/// that worked (`last_saved`; the interval grows with the cache), nor than
-/// PipelineCacheFlushRetryFloor after the last attempt (`last_attempt`), so a flush that fails
-/// (a build overtook every read, a full disk) is not queued again as soon as it ends, though it
-/// does not wait out the whole interval. A default time point is "never".
+/// What the timed flush of the driver pipeline cache is decided on. A default time point is
+/// "never".
+struct PipelineCacheFlushState {
+    /// When the last save that worked was queued
+    std::chrono::steady_clock::time_point last_saved;
+    /// When the last attempt, timed flush or the save after the boot builds, ended
+    std::chrono::steady_clock::time_point last_attempt;
+    /// Whether that attempt failed
+    bool last_failed = false;
+    /// Pipelines built since the last flush was queued
+    size_t pipelines = 0;
+};
+
+/// A flush is due once `pipelines_needed` pipelines were built, `interval` after the last save
+/// that worked (the interval grows with the cache), and PipelineCacheFlushRetryFloor after the
+/// last attempt ended. After a failed attempt (a build overtook every read, a full disk) the floor
+/// alone spaces the next one: the pipelines built since may stay fewer than the count (the burst
+/// that overtook the reads ended), and everything since the last good save would then reach the
+/// file only on a clean close. The floor runs from the end of the attempt, so a failing save that
+/// itself takes longer than the floor is not queued again with no pause.
 inline constexpr std::chrono::seconds PipelineCacheFlushRetryFloor{30};
-[[nodiscard]] inline bool PipelineCacheFlushDue(std::chrono::steady_clock::time_point now,
-                                                std::chrono::steady_clock::time_point last_saved,
-                                                std::chrono::steady_clock::time_point last_attempt,
-                                                std::chrono::seconds interval) {
+[[nodiscard]] inline bool PipelineCacheFlushDue(const PipelineCacheFlushState& state,
+                                                std::chrono::steady_clock::time_point now,
+                                                std::chrono::seconds interval,
+                                                size_t pipelines_needed) {
     using TimePoint = std::chrono::steady_clock::time_point;
-    if (last_saved != TimePoint{} && now - last_saved < interval) {
+    if (!state.last_failed && state.pipelines < pipelines_needed) {
         return false;
     }
-    return last_attempt == TimePoint{} || now - last_attempt >= PipelineCacheFlushRetryFloor;
+    if (state.last_saved != TimePoint{} && now - state.last_saved < interval) {
+        return false;
+    }
+    return state.last_attempt == TimePoint{} ||
+           now - state.last_attempt >= PipelineCacheFlushRetryFloor;
 }
 
 } // namespace Vulkan

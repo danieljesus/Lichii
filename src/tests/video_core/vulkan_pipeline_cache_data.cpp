@@ -94,6 +94,39 @@ TEST_CASE("A driver pipeline cache that reads back fewer bytes than asked is who
     CHECK(calls == 2);
 }
 
+TEST_CASE("A driver pipeline cache read that returns less than a header is no data",
+          "[video_core][vulkan_pipeline_cache]") {
+    // The size query said a cache, the read gave less than its header: the file is kept.
+    int calls = 0;
+    const auto data = Vulkan::ReadPipelineCacheData(
+        [&](size_t* size, void* out) {
+            ++calls;
+            *size = out == nullptr ? Header + 64 : 16;
+            return VK_SUCCESS;
+        },
+        [] {});
+    CHECK_FALSE(data.Usable());
+    CHECK(data.result == VK_SUCCESS);
+    CHECK(calls == 2);
+}
+
+TEST_CASE("A driver pipeline cache read that reports more than its buffer is held to it",
+          "[video_core][vulkan_pipeline_cache]") {
+    const auto data = Vulkan::ReadPipelineCacheData(
+        [](size_t* size, void* out) {
+            if (out == nullptr) {
+                *size = Header + 8;
+            } else {
+                std::memset(out, 7, *size);
+                *size = Header + 4096;
+            }
+            return VK_SUCCESS;
+        },
+        [] {});
+    CHECK(data.Whole());
+    CHECK(data.size == Header + 8);
+}
+
 TEST_CASE("A driver pipeline cache smaller than a header is no data",
           "[video_core][vulkan_pipeline_cache]") {
     // A live cache always holds a header: a size of 0, or less than one, would replace a good
@@ -171,21 +204,53 @@ TEST_CASE("A driver pipeline cache whose read fails is not saved",
     CHECK(failing_size.result == VK_ERROR_OUT_OF_HOST_MEMORY);
 }
 
-TEST_CASE("A failed driver pipeline cache flush waits for the retry floor, not the interval",
+TEST_CASE("A driver pipeline cache flush waits for its pipelines and its interval",
           "[video_core][vulkan_pipeline_cache]") {
     using namespace std::chrono_literals;
     using Clock = std::chrono::steady_clock;
+    using Vulkan::PipelineCacheFlushDue;
     const Clock::time_point start = Clock::now();
     const std::chrono::seconds interval{300}; // a 300 MB cache
-    // Never saved nor tried: due.
-    CHECK(Vulkan::PipelineCacheFlushDue(start, {}, {}, interval));
+    constexpr size_t Needed = 128;
+    // Never saved nor tried: due once enough pipelines were built.
+    CHECK(PipelineCacheFlushDue({.pipelines = Needed}, start, interval, Needed));
+    CHECK_FALSE(PipelineCacheFlushDue({.pipelines = Needed - 1}, start, interval, Needed));
     // Saved a minute ago: not due until the interval has passed.
-    CHECK_FALSE(Vulkan::PipelineCacheFlushDue(start + 60s, start, start, interval));
-    CHECK(Vulkan::PipelineCacheFlushDue(start + 300s, start, start, interval));
-    // Tried and failed: another 128 pipelines inside the floor do not queue it again...
-    const auto failed = start + 400s;
-    CHECK_FALSE(Vulkan::PipelineCacheFlushDue(failed + 10s, start, failed, interval));
-    // ...the floor does, long before a whole interval from the failure.
-    CHECK(Vulkan::PipelineCacheFlushDue(failed + Vulkan::PipelineCacheFlushRetryFloor, start,
-                                        failed, interval));
+    const Vulkan::PipelineCacheFlushState saved{
+        .last_saved = start, .last_attempt = start, .pipelines = Needed};
+    CHECK_FALSE(PipelineCacheFlushDue(saved, start + 60s, interval, Needed));
+    CHECK(PipelineCacheFlushDue(saved, start + 300s, interval, Needed));
+}
+
+TEST_CASE("A failed driver pipeline cache flush is tried again after the retry floor",
+          "[video_core][vulkan_pipeline_cache]") {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    using Vulkan::PipelineCacheFlushDue;
+    using Vulkan::PipelineCacheFlushRetryFloor;
+    const Clock::time_point start = Clock::now();
+    const std::chrono::seconds interval{300};
+    constexpr size_t Needed = 128;
+    // A timed flush that failed 400 s after the last good save, ending at `ended`.
+    const auto ended = start + 400s;
+    const Vulkan::PipelineCacheFlushState failed{
+        .last_saved = start, .last_attempt = ended, .last_failed = true, .pipelines = 1};
+    // Inside the floor: not due, however many pipelines.
+    CHECK_FALSE(PipelineCacheFlushDue(failed, ended + 10s, interval, Needed));
+    CHECK_FALSE(PipelineCacheFlushDue({.last_saved = start,
+                                       .last_attempt = ended,
+                                       .last_failed = true,
+                                       .pipelines = Needed},
+                                      ended + 10s, interval, Needed));
+    // Past it: due with the next pipeline, though fewer than the count were built since.
+    CHECK(PipelineCacheFlushDue(failed, ended + PipelineCacheFlushRetryFloor, interval, Needed));
+    // Not failed, under the count: not due, the floor long past.
+    CHECK_FALSE(PipelineCacheFlushDue({.last_saved = start, .last_attempt = ended, .pipelines = 1},
+                                      ended + 600s, interval, Needed));
+    // The save after the boot builds failed, with none before it: the same floor.
+    const Vulkan::PipelineCacheFlushState boot_failed{
+        .last_attempt = start, .last_failed = true, .pipelines = 1};
+    CHECK_FALSE(PipelineCacheFlushDue(boot_failed, start + 10s, interval, Needed));
+    CHECK(PipelineCacheFlushDue(boot_failed, start + PipelineCacheFlushRetryFloor, interval,
+                                Needed));
 }

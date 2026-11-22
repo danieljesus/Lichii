@@ -1228,6 +1228,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     pipelines_since_flush = 0;
     last_flush.store({}, std::memory_order_relaxed);
     last_flush_attempt.store({}, std::memory_order_relaxed);
+    last_flush_failed.store(false, std::memory_order_relaxed);
     last_cache_size.store(0, std::memory_order_relaxed);
 
     namespace StutterTrace = VideoCommon::StutterTrace;
@@ -1971,14 +1972,17 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     // The boot builds have all ended (boot.Wait), and where reading the driver cache during a
     // build crashes the prebuild has not started yet (see PrebuildStartsWithBootBuilds).
     if (use_vulkan_pipeline_cache) {
-        // Counts as a flush only when it was saved: a failed one is retried by the next flush.
-        const auto now = std::chrono::steady_clock::now();
-        last_flush_attempt.store(now, std::memory_order_relaxed);
-        if (const auto saved = SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename,
-                                                            vulkan_pipeline_cache, CACHE_VERSION)) {
+        // Counts as a flush only when it was saved, stamped once it ended as nx2 did: a failed
+        // one is retried by the next flush after the retry floor.
+        const auto saved = SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename,
+                                                        vulkan_pipeline_cache, CACHE_VERSION);
+        const auto end = std::chrono::steady_clock::now();
+        if (saved) {
             last_cache_size.store(saved->bytes, std::memory_order_relaxed);
-            last_flush.store(now, std::memory_order_relaxed);
+            last_flush.store(end, std::memory_order_relaxed);
         }
+        last_flush_failed.store(!saved, std::memory_order_relaxed);
+        last_flush_attempt.store(end, std::memory_order_relaxed);
     }
     if (state.statistics) {
         state.statistics->Report();
@@ -2261,7 +2265,13 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
         !device.CanReadPipelineCacheDuringBuilds()) {
         return;
     }
-    if (++pipelines_since_flush < VULKAN_CACHE_FLUSH_PIPELINES) {
+    const PipelineCacheFlushState state{
+        .last_saved = last_flush.load(std::memory_order_relaxed),
+        .last_attempt = last_flush_attempt.load(std::memory_order_relaxed),
+        .last_failed = last_flush_failed.load(std::memory_order_relaxed),
+        .pipelines = ++pipelines_since_flush,
+    };
+    if (!state.last_failed && state.pipelines < VULKAN_CACHE_FLUSH_PIPELINES) {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -2269,22 +2279,25 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
     const std::chrono::seconds interval{
         std::max<size_t>(VULKAN_CACHE_FLUSH_MIN_SECONDS, megabytes)};
     // The interval runs from the last save that worked, and a failed flush is tried again after
-    // the retry floor, not a whole interval (tens of minutes for a large cache) later.
-    if (!PipelineCacheFlushDue(now, last_flush.load(std::memory_order_relaxed),
-                               last_flush_attempt.load(std::memory_order_relaxed), interval)) {
+    // the retry floor with the next pipeline, not a whole interval (tens of minutes for a large
+    // cache) or another VULKAN_CACHE_FLUSH_PIPELINES pipelines later.
+    if (!PipelineCacheFlushDue(state, now, interval, VULKAN_CACHE_FLUSH_PIPELINES)) {
         return;
     }
     if (flush_in_flight.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
     pipelines_since_flush = 0;
-    last_flush_attempt.store(now, std::memory_order_relaxed);
+    last_flush_failed.store(false, std::memory_order_relaxed);
     serialization_thread.QueueWork([this, now] {
-        if (const auto saved = SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename,
-                                                            vulkan_pipeline_cache, CACHE_VERSION)) {
+        const auto saved = SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename,
+                                                        vulkan_pipeline_cache, CACHE_VERSION);
+        if (saved) {
             last_cache_size.store(saved->bytes, std::memory_order_relaxed);
             last_flush.store(now, std::memory_order_relaxed);
         }
+        last_flush_failed.store(!saved, std::memory_order_relaxed);
+        last_flush_attempt.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
         flush_in_flight.store(false, std::memory_order_release);
     });
 }

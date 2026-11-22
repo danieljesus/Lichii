@@ -380,10 +380,12 @@ private:
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
     size_t pipelines_since_flush{};
-    /// When a save last worked, and when one was last tried (timed flush or the save after the
-    /// boot builds); written by the serialization thread and the loading thread
+    /// When a save last worked, when the last one tried (timed flush or the save after the boot
+    /// builds) ended, and whether it failed (PipelineCacheFlushState); written by the
+    /// serialization thread and the loading thread
     std::atomic<std::chrono::steady_clock::time_point> last_flush{};
     std::atomic<std::chrono::steady_clock::time_point> last_flush_attempt{};
+    std::atomic_bool last_flush_failed{};
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
 
