@@ -185,4 +185,13 @@ enum class PipelineCacheSaveOutcome {
     return record_held && can_read_during_builds;
 }
 
+/// Whether most records of a precompiled store were made on a device with other dynamic state
+/// (extended dynamic state, vertex input, color write enable), so this device can prepare only
+/// its compute pipelines and the few graphics ones that fit: a store made on a PC with extended
+/// dynamic state, read on MoltenVK, fits there in 4081 of 124129 records.
+[[nodiscard]] constexpr bool MostRecordsNotForDevice(size_t not_for_device,
+                                                     size_t total) noexcept {
+    return not_for_device > total - not_for_device;
+}
+
 } // namespace Vulkan

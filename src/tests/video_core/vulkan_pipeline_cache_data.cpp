@@ -393,3 +393,15 @@ TEST_CASE("The prebuild's end saves a held record only where the cache reads dur
     CHECK_FALSE(Vulkan::SavesRecordAfterPrebuild(false, true));
     CHECK_FALSE(Vulkan::SavesRecordAfterPrebuild(false, false));
 }
+
+TEST_CASE("A precompiled store is mostly not for the device when most records are",
+          "[video_core][vulkan_pipeline_cache]") {
+    // A PC store with extended dynamic state, read on MoltenVK: only its compute records fit.
+    CHECK(Vulkan::MostRecordsNotForDevice(120048, 124129));
+    // A store made on this device.
+    CHECK_FALSE(Vulkan::MostRecordsNotForDevice(0, 6841));
+    CHECK_FALSE(Vulkan::MostRecordsNotForDevice(0, 0));
+    // Half is not most.
+    CHECK_FALSE(Vulkan::MostRecordsNotForDevice(50, 100));
+    CHECK(Vulkan::MostRecordsNotForDevice(51, 100));
+}

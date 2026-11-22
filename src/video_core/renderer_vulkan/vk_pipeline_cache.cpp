@@ -3054,6 +3054,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     std::vector<Ordered> ordered;
     ordered.reserve(total);
     size_t done_before = 0;
+    size_t not_for_device = 0;
     for (u32 index = 0; index < total; ++index) {
         auto& record = records[index];
         if (loaded.states[index] != Store::RecordState::Pending) {
@@ -3062,7 +3063,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         }
         if (!record.compute && !KeyFitsDevice(record.graphics_key)) {
             // Made for a device with other dynamic state.
-            ++done_before;
+            ++not_for_device;
             continue;
         }
         const u8 group = record.compute ? 0
@@ -3077,15 +3078,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     for (const auto& entry : ordered) {
         prep.order.push_back(entry.index);
     }
-    prep.done = done_before;
+    prep.done = done_before + not_for_device;
     LOG_INFO(Render_Vulkan,
-             "Precompiled pipelines: {} records, {} prepared before ({} kept for draws), {} to "
-             "prepare{}",
-             total, done_before, precompiled_records.size() + precompiled_compute_records.size(),
-             prep.order.size(),
+             "Precompiled pipelines: {} records, {} not for this device (made with other dynamic "
+             "state), {} prepared before ({} kept for draws), {} to prepare{}",
+             total, not_for_device, done_before,
+             precompiled_records.size() + precompiled_compute_records.size(), prep.order.size(),
              loaded.interrupted != 0
                  ? fmt::format(", {} interrupted by an earlier run", loaded.interrupted)
                  : std::string{});
+    if (MostRecordsNotForDevice(not_for_device, total)) {
+        LOG_WARNING(Render_Vulkan,
+                    "Precompiled pipelines: {} of {} records were made on a device with other "
+                    "dynamic state (extended dynamic state, vertex input or color write enable); "
+                    "this device prepares only the rest, its compute pipelines among them",
+                    not_for_device, total);
+    }
     if (prep.order.empty()) {
         prep.store.Close();
         LOG_INFO(Render_Vulkan, "Precompiled pipelines already prepared for this driver");
