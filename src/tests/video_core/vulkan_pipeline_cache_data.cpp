@@ -357,8 +357,21 @@ TEST_CASE("A part saved while a precache's record waits is retried at the floor"
     CHECK(waiting.last_failed);
     CHECK(waiting.last_saved == saved);
     waiting.pipelines = 1;
+    CHECK_FALSE(Vulkan::PipelineCacheFlushDue(waiting, ended + 10s, std::chrono::seconds{300}, 128));
     CHECK(Vulkan::PipelineCacheFlushDue(waiting, ended + Vulkan::PipelineCacheFlushRetryFloor,
                                         std::chrono::seconds{300}, 128));
+    // A whole save writes the record and counts as a flush, record or not; nothing usable is
+    // retried at the floor either way.
+    const auto whole = Vulkan::AfterPipelineCacheSave(before, PipelineCacheSaveOutcome::Whole,
+                                                      queued, ended, true);
+    CHECK_FALSE(whole.last_failed);
+    CHECK(whole.last_saved == queued);
+    for (const bool record_waiting : {false, true}) {
+        const auto nothing = Vulkan::AfterPipelineCacheSave(
+            before, PipelineCacheSaveOutcome::NothingUsable, queued, ended, record_waiting);
+        CHECK(nothing.last_failed);
+        CHECK(nothing.last_saved == saved);
+    }
     // Nothing waits: a part counts as a flush, as on nx2.
     const auto plain = Vulkan::AfterPipelineCacheSave(before, PipelineCacheSaveOutcome::Partial,
                                                       queued, ended, false);

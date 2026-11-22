@@ -334,7 +334,13 @@ TEST_CASE("ShaderPrecache: a held record is replaced by the next one", "[video_c
         ++first;
         return std::string{"first"};
     });
+    // A save whose read began between the two holds writes neither: the first is gone, and
+    // the second was held after its read began.
+    const auto between = pending.TicketBeforeRead();
     pending.Hold(ShaderWarm::FinishedWarmRecord(file.warm, file.stamp));
+    REQUIRE_FALSE(pending.AfterSave(true, between).has_value());
+    REQUIRE(first == 0);
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(file.warm).has_value());
     REQUIRE(pending.AfterSave(true, pending.TicketBeforeRead()) ==
             std::optional<std::string>{"marker"});
     REQUIRE(first == 0);
@@ -346,9 +352,8 @@ TEST_CASE("ShaderPrecache: a skipped precache's progress is held like the marker
     REQUIRE(std::filesystem::remove(ShaderWarm::WarmProgressPath(file.warm)));
     ShaderWarm::PendingWarmRecord pending;
     const std::unordered_set<u64> built{0x10, 0x20, 0x30};
-    pending.Hold([&]() -> std::string {
-        return ShaderWarm::WriteWarmProgress(file.warm, *file.stamp, built) ? "progress" : "";
-    });
+    // The record the precache makes when it is skipped or stopped.
+    pending.Hold(ShaderWarm::SkippedWarmRecord(file.warm, *file.stamp, built));
     REQUIRE_FALSE(pending.AfterSave(false, pending.TicketBeforeRead()).has_value());
     REQUIRE(ShaderWarm::ReadWarmProgress(file.warm, *file.stamp).empty());
     REQUIRE(pending.AfterSave(true, pending.TicketBeforeRead()) ==

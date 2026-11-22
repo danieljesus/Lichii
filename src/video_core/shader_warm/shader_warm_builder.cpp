@@ -416,6 +416,18 @@ WarmRecord FinishedWarmRecord(const fs::path& warm_file, std::optional<WarmStamp
     };
 }
 
+WarmRecord SkippedWarmRecord(const fs::path& warm_file, const WarmStamp& stamp,
+                             std::unordered_set<u64> built) {
+    return [warm_file, stamp, built = std::move(built)]() -> std::string {
+        if (!WriteWarmProgress(warm_file, stamp, built)) {
+            LOG_ERROR(Render_Vulkan, "Shader precache: couldn't write its progress {}",
+                      Common::FS::PathToUTF8String(WarmProgressPath(warm_file)));
+            return {};
+        }
+        return "progress";
+    };
+}
+
 std::unordered_set<u64> ReadWarmProgress(const fs::path& warm_file, const WarmStamp& current) {
     std::ifstream in(WarmProgressPath(warm_file));
     WarmStamp stamp;

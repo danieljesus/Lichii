@@ -289,7 +289,10 @@ private:
     /// throttle, or writes it now where reading the cache during a build crashes. For the end of
     /// a precache: its builds never reach the timed flush, which counts only pipelines built
     /// during play. A whole save writes the precache's pending record (pending_warm_record).
-    void QueueVulkanPipelineCacheSave();
+    void QueueVulkanPipelineCacheSave(std::string_view which);
+    /// Whether a partial save arms the floor retry for the precache's record: one is held, and no
+    /// prebuild runs to overtake the retry again
+    bool RecordWaitsForRetry() const;
 
     /// One build of the shader precache: a compute pipeline built and destroyed
     struct PrecacheJob {
@@ -329,6 +332,8 @@ private:
     std::optional<ScheduledPrebuild<GraphicsPipelineCacheKey, GraphicsPipeline>> scheduled_prebuild;
     /// When the boot load that started the background prebuild began, until the prebuild is done
     std::optional<std::chrono::steady_clock::time_point> prebuild_load_begin;
+    /// Whether the background prebuild runs; read by the serialization thread
+    std::atomic_bool prebuild_running{};
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};

@@ -124,6 +124,11 @@ enum class WarmRecordCommit { Now, AfterWholeSave };
 [[nodiscard]] WarmRecord FinishedWarmRecord(const std::filesystem::path& warm_file,
                                             std::optional<WarmStamp> stamp);
 
+/// The record of a precache that was skipped or stopped: writes `built`, the keys it built, as the
+/// progress of `stamp`; returns "progress", or nothing when it cannot be written (logged).
+[[nodiscard]] WarmRecord SkippedWarmRecord(const std::filesystem::path& warm_file,
+                                           const WarmStamp& stamp, std::unordered_set<u64> built);
+
 /// "Precompile All Shaders" of one game (same folder, extension .requested): the game's precache
 /// runs before it starts whatever precache_shaders says, and the boot builds every pipeline the
 /// title's cache recorded (as build_all_cached_shaders does).
