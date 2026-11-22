@@ -105,12 +105,13 @@ struct PipelineCacheFlushState {
     size_t pipelines = 0;
 };
 
-/// A flush is due once `pipelines_needed` pipelines were built, `interval` after the last save
-/// that worked (the interval grows with the cache), and PipelineCacheFlushRetryFloor after the
-/// last attempt ended. After a failed attempt (a build overtook every read, a full disk) the floor
-/// alone spaces the next one: the pipelines built since may stay fewer than the count (the burst
-/// that overtook the reads ended), and everything since the last good save would then reach the
-/// file only on a clean close. The floor runs from the end of the attempt, so a failing save that
+/// A flush is due once `pipelines_needed` pipelines were built, `interval` after the last flush
+/// that counts (PipelineCacheFlushInterval; see AfterPipelineCacheSave), and
+/// PipelineCacheFlushRetryFloor after the last attempt ended. After an attempt that got nothing
+/// usable from the driver (a build overtook every read) the pipeline count is not waited for, and
+/// the floor spaces the next try: the pipelines built since may stay fewer than the count (the
+/// burst that overtook the reads ended), and everything since the last good save would then reach
+/// the file only on a clean close. The floor runs from the end of the attempt, so a save that
 /// itself takes longer than the floor is not queued again with no pause.
 inline constexpr std::chrono::seconds PipelineCacheFlushRetryFloor{30};
 [[nodiscard]] inline bool PipelineCacheFlushDue(const PipelineCacheFlushState& state,
@@ -126,6 +127,14 @@ inline constexpr std::chrono::seconds PipelineCacheFlushRetryFloor{30};
     }
     return state.last_attempt == TimePoint{} ||
            now - state.last_attempt >= PipelineCacheFlushRetryFloor;
+}
+
+/// The timed flush's interval: a second per MiB of the cache last read, and no less than the
+/// retry floor, as nx2 had it.
+[[nodiscard]] inline std::chrono::seconds PipelineCacheFlushInterval(size_t cache_bytes) {
+    return std::chrono::seconds{std::max<std::chrono::seconds::rep>(
+        PipelineCacheFlushRetryFloor.count(),
+        static_cast<std::chrono::seconds::rep>(cache_bytes / (1024 * 1024)))};
 }
 
 /// How a save of the driver pipeline cache ended.

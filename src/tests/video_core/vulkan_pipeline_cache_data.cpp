@@ -293,3 +293,24 @@ TEST_CASE("A driver pipeline cache flush that read nothing usable is due at the 
     CHECK(Vulkan::PipelineCacheFlushDue(state, ended + Vulkan::PipelineCacheFlushRetryFloor,
                                         std::chrono::seconds{300}, 128));
 }
+
+TEST_CASE("A driver pipeline cache flush that failed to write waits the interval its size gives",
+          "[video_core][vulkan_pipeline_cache]") {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    // A second per MiB of the cache last read, no less than the floor, as on nx2.
+    CHECK(Vulkan::PipelineCacheFlushInterval(0) == Vulkan::PipelineCacheFlushRetryFloor);
+    CHECK(Vulkan::PipelineCacheFlushInterval(size_t{10} << 20) == 30s);
+    // A 600 MB cache read whole and not written (a full disk): its size is still what the
+    // interval is computed from, so the next flush waits 600 s, not 30.
+    const size_t read_bytes = size_t{600} << 20;
+    const auto interval = Vulkan::PipelineCacheFlushInterval(read_bytes);
+    CHECK(interval == 600s);
+    const Clock::time_point queued = Clock::now();
+    auto state = Vulkan::AfterPipelineCacheSave({}, Vulkan::PipelineCacheSaveOutcome::Failed,
+                                                queued, queued + 20s);
+    state.pipelines = 128;
+    CHECK_FALSE(Vulkan::PipelineCacheFlushDue(state, queued + 60s, interval, 128));
+    CHECK_FALSE(Vulkan::PipelineCacheFlushDue(state, queued + 599s, interval, 128));
+    CHECK(Vulkan::PipelineCacheFlushDue(state, queued + 600s, interval, 128));
+}
