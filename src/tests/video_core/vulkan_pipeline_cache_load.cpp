@@ -106,7 +106,7 @@ TEST_CASE("Every way a driver pipeline cache load ends does what nx2 did, or say
              Row{VulkanCacheLoad::Damaged, false, false, true},
              Row{VulkanCacheLoad::OtherVersion, false, false, true},
              Row{VulkanCacheLoad::Rejected, false, false, true},
-             Row{VulkanCacheLoad::NoData, false, true, true},
+             Row{VulkanCacheLoad::NoData, false, true, false},
              Row{VulkanCacheLoad::DriverKeptNothing, false, true, true},
          }) {
         INFO(static_cast<int>(row.load));

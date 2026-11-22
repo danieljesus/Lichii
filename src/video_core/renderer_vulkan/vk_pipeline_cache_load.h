@@ -53,7 +53,9 @@ enum class VulkanCacheLoad {
     OtherVersion,
     /// The driver refused the data with an error (vkCreatePipelineCache failed).
     Rejected,
-    /// Driver data shorter than a version one header: a save that read nothing left it.
+    /// Driver data shorter than a version one header: what clearing the cache writes on purpose
+    /// (ClearPipelineCache, so an older version's cache is not carried over again), or what a
+    /// save that read nothing left.
     NoData,
     /// The driver was given more than an empty cache of its own and holds none of it, and the
     /// header does not say the data is its own: made by another driver version (MoltenVK's
@@ -115,6 +117,10 @@ struct VulkanCacheLoadActions {
     case VulkanCacheLoad::Rejected:
         return {.restored = false, .drop_precache_marker = false, .remove_file = true};
     case VulkanCacheLoad::NoData:
+        // The file stays until a save replaces it: removed, no file of this version would be
+        // there until the boot save, and a boot that died before it would let the cleared older
+        // version's cache be carried over again.
+        return {.restored = false, .drop_precache_marker = true, .remove_file = false};
     case VulkanCacheLoad::DriverKeptNothing:
         return {.restored = false, .drop_precache_marker = true, .remove_file = true};
     }

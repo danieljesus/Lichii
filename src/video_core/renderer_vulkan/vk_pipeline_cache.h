@@ -264,6 +264,7 @@ private:
     /// the rest of what ActionsFor says.
     vk::PipelineCache LoadVulkanPipelineCache(const std::filesystem::path& filename,
                                               u32 expected_cache_version);
+    vk::PipelineCache CreateDriverPipelineCache(size_t data_size, const void* data) const;
     /// Gives the file's driver data to the driver, into `restored`, and says what came of it.
     VulkanCacheLoad LoadDriverCacheData(const std::vector<char>& cache_data,
                                         vk::PipelineCache& restored);

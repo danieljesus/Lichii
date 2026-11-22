@@ -3864,17 +3864,23 @@ bool PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
     return true;
 }
 
+vk::PipelineCache PipelineCache::CreateDriverPipelineCache(size_t data_size,
+                                                           const void* data) const {
+    return device.GetLogical().CreatePipelineCache({
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .initialDataSize = data_size,
+        .pInitialData = data,
+    });
+}
+
 vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::path& filename,
                                                          u32 expected_cache_version) {
-    const auto create_pipeline_cache = [this](size_t data_size, const void* data) {
-        VkPipelineCacheCreateInfo pipeline_cache_ci = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .initialDataSize = data_size,
-            .pInitialData = data};
-        return device.GetLogical().CreatePipelineCache(pipeline_cache_ci);
-    };
+    // Reset first, as nx2 reset its flag: a throw that escapes must not leave the previous
+    // title's values.
+    vulkan_pipeline_cache_load = VulkanCacheLoad::NoFile;
+    vulkan_pipeline_cache_restored = false;
     const std::string path = Common::FS::PathToUTF8String(filename);
     // Every path ends in one VulkanCacheLoad, which ActionsFor turns into what the caller does:
     // whether the cache counts as restored, whether the precache's marker goes, whether the file
@@ -3912,7 +3918,6 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
                     const size_t cache_size = static_cast<size_t>(end) - header_size;
                     std::vector<char> cache_data(cache_size);
                     file.read(cache_data.data(), cache_size);
-                    file.close();
                     load = LoadDriverCacheData(cache_data, restored);
                 }
             }
@@ -3927,8 +3932,7 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         LOG_INFO(Render_Vulkan, "Loaded Vulkan driver pipeline cache: {}", path);
         break;
     case VulkanCacheLoad::NoData:
-        LOG_WARNING(Render_Vulkan, "Vulkan driver pipeline cache holds no driver data, deleting it: {}",
-                    path);
+        LOG_WARNING(Render_Vulkan, "Vulkan driver pipeline cache holds no driver data: {}", path);
         break;
     case VulkanCacheLoad::DriverKeptNothing:
         LOG_WARNING(Render_Vulkan,
@@ -3945,20 +3949,11 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
     vulkan_pipeline_cache_load = load;
     vulkan_pipeline_cache_restored = ActionsFor(load).restored;
     return vulkan_pipeline_cache_restored && restored ? std::move(restored)
-                                                      : create_pipeline_cache(0, nullptr);
+                                                      : CreateDriverPipelineCache(0, nullptr);
 }
 
 VulkanCacheLoad PipelineCache::LoadDriverCacheData(const std::vector<char>& cache_data,
                                                    vk::PipelineCache& restored) {
-    const auto create_pipeline_cache = [this](size_t data_size, const void* data) {
-        return device.GetLogical().CreatePipelineCache({
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .initialDataSize = data_size,
-            .pInitialData = data,
-        });
-    };
     const PipelineCacheDataOrigin origin = PipelineCacheDataMadeBy(
         cache_data, device.GetVendorID(), device.GetDeviceID(), device.GetPipelineCacheUUID());
     const VulkanCacheLoad first =
@@ -3967,7 +3962,7 @@ VulkanCacheLoad PipelineCache::LoadDriverCacheData(const std::vector<char>& cach
         return first;
     }
     try {
-        restored = create_pipeline_cache(cache_data.size(), cache_data.data());
+        restored = CreateDriverPipelineCache(cache_data.size(), cache_data.data());
     } catch (const vk::Exception& e) {
         // The blob came from another driver or driver version (e.g. switching between MoltenVK
         // and KosmicKrisp on macOS): the driver rejects it. Start empty instead of aborting, and
@@ -3994,7 +3989,7 @@ VulkanCacheLoad PipelineCache::LoadDriverCacheData(const std::vector<char>& cach
     };
     std::optional<size_t> empty_size;
     try {
-        empty_size = held_bytes(create_pipeline_cache(0, nullptr));
+        empty_size = held_bytes(CreateDriverPipelineCache(0, nullptr));
     } catch (const vk::Exception&) {
         // Nothing to compare with: the data is taken as kept.
     }
