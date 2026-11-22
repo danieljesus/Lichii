@@ -94,11 +94,12 @@ PipelineCacheData ReadPipelineCacheData(Read&& read, Progress&& progress) {
 /// What the timed flush of the driver pipeline cache is decided on. A default time point is
 /// "never".
 struct PipelineCacheFlushState {
-    /// When the last save that worked was queued
+    /// When the last flush that counts was queued: one that was saved, or failed for another
+    /// reason than a read with nothing usable (AfterPipelineCacheSave)
     std::chrono::steady_clock::time_point last_saved;
     /// When the last attempt, timed flush or the save after the boot builds, ended
     std::chrono::steady_clock::time_point last_attempt;
-    /// Whether that attempt failed
+    /// Whether that attempt got nothing usable from the driver
     bool last_failed = false;
     /// Pipelines built since the last flush was queued
     size_t pipelines = 0;
@@ -125,6 +126,35 @@ inline constexpr std::chrono::seconds PipelineCacheFlushRetryFloor{30};
     }
     return state.last_attempt == TimePoint{} ||
            now - state.last_attempt >= PipelineCacheFlushRetryFloor;
+}
+
+/// How a save of the driver pipeline cache ended.
+enum class PipelineCacheSaveOutcome {
+    /// All of the cache was written.
+    Whole,
+    /// Part of it was written: pipelines were built into it while it was read.
+    Partial,
+    /// The driver gave nothing usable, so the file was kept: a build overtook every read
+    /// (MoltenVK), or it reported less than a header.
+    NothingUsable,
+    /// Reading it failed with an error, or the file could not be opened, written or replaced.
+    Failed,
+};
+
+/// The flush state after an attempt queued at `queued` ended at `ended`. Only a read that got
+/// nothing usable is tried again soon, at the retry floor: that is the failure a build overtaking
+/// the read makes, and it passes. Any other attempt counts as a flush, as on nx2, whether it was
+/// written or not: one that failed to write (a full disk, a directory it cannot write) would fail
+/// again, and reading a large cache whole every floor would stall frames for nothing.
+[[nodiscard]] inline PipelineCacheFlushState AfterPipelineCacheSave(
+    PipelineCacheFlushState state, PipelineCacheSaveOutcome outcome,
+    std::chrono::steady_clock::time_point queued, std::chrono::steady_clock::time_point ended) {
+    state.last_attempt = ended;
+    state.last_failed = outcome == PipelineCacheSaveOutcome::NothingUsable;
+    if (!state.last_failed) {
+        state.last_saved = queued;
+    }
+    return state;
 }
 
 } // namespace Vulkan

@@ -254,3 +254,42 @@ TEST_CASE("A failed driver pipeline cache flush is tried again after the retry f
     CHECK(PipelineCacheFlushDue(boot_failed, start + PipelineCacheFlushRetryFloor, interval,
                                 Needed));
 }
+
+TEST_CASE("A driver pipeline cache flush that failed to write waits out the interval, as on nx2",
+          "[video_core][vulkan_pipeline_cache]") {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    using Vulkan::PipelineCacheSaveOutcome;
+    const Clock::time_point queued = Clock::now();
+    const auto ended = queued + 5s;
+    const std::chrono::seconds interval{300};
+    constexpr size_t Needed = 128;
+    // A full disk, a directory it cannot write: it would fail again, and a large cache read
+    // whole every floor stalls frames.
+    for (const auto outcome : {PipelineCacheSaveOutcome::Failed, PipelineCacheSaveOutcome::Whole,
+                               PipelineCacheSaveOutcome::Partial}) {
+        auto state = Vulkan::AfterPipelineCacheSave({}, outcome, queued, ended);
+        CHECK_FALSE(state.last_failed);
+        state.pipelines = Needed;
+        CHECK_FALSE(Vulkan::PipelineCacheFlushDue(state, ended + 60s, interval, Needed));
+        CHECK(Vulkan::PipelineCacheFlushDue(state, queued + interval, interval, Needed));
+    }
+}
+
+TEST_CASE("A driver pipeline cache flush that read nothing usable is due at the floor",
+          "[video_core][vulkan_pipeline_cache]") {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point saved = Clock::now();
+    const auto queued = saved + 400s;
+    const auto ended = queued + 5s;
+    auto state = Vulkan::AfterPipelineCacheSave({.last_saved = saved, .last_attempt = saved},
+                                                Vulkan::PipelineCacheSaveOutcome::NothingUsable,
+                                                queued, ended);
+    CHECK(state.last_failed);
+    CHECK(state.last_saved == saved);
+    state.pipelines = 1;
+    CHECK_FALSE(Vulkan::PipelineCacheFlushDue(state, ended + 10s, std::chrono::seconds{300}, 128));
+    CHECK(Vulkan::PipelineCacheFlushDue(state, ended + Vulkan::PipelineCacheFlushRetryFloor,
+                                        std::chrono::seconds{300}, 128));
+}
