@@ -194,4 +194,23 @@ enum class PipelineCacheSaveOutcome {
     return not_for_device > total - not_for_device;
 }
 
+/// Threadgroup memory a native mesh program takes on MoltenVK, where one Metal threadgroup holds
+/// both its workgroup arrays and a copy of each of its outputs: the attribute region (groups of
+/// 32 vertices, then of 32 primitives, one 32-word line per attribute), the map (a word per map
+/// byte), the primitive count, the primitive indices (a uint, uint2 or 16-byte uint3 each), the
+/// vec4 outputs of every vertex and primitive, and SPIRV-Cross's mesh sizes.
+[[nodiscard]] constexpr u64 MoltenVKMeshThreadgroupBytes(u32 max_vertices, u32 max_primitives,
+                                                         u32 primitive_vertices, u32 vertex_lines,
+                                                         u32 primitive_lines, u32 vertex_outputs,
+                                                         u32 primitive_outputs) noexcept {
+    const auto groups = [](u32 count) { return u64{(count + 31) / 32}; };
+    const u64 attribute_words =
+        groups(max_vertices) * vertex_lines * 32 + groups(max_primitives) * primitive_lines * 32;
+    const u64 map_words = 4 + u64{primitive_vertices} * max_primitives;
+    const u64 index_bytes = primitive_vertices == 1 ? 4 : primitive_vertices == 2 ? 8 : 16;
+    return ((std::max)(attribute_words, u64{1}) + map_words + 1) * 4 +
+           u64{max_primitives} * index_bytes + u64{vertex_outputs} * max_vertices * 16 +
+           u64{primitive_outputs} * max_primitives * 16 + 8;
+}
+
 } // namespace Vulkan

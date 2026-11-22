@@ -405,3 +405,15 @@ TEST_CASE("A precompiled store is mostly not for the device when most records ar
     CHECK_FALSE(Vulkan::MostRecordsNotForDevice(50, 100));
     CHECK(Vulkan::MostRecordsNotForDevice(51, 100));
 }
+
+TEST_CASE("A mesh program's threadgroup memory on MoltenVK is what Metal reports for it",
+          "[video_core][vulkan_pipeline_cache]") {
+    // Ocarina of Time's mesh programs Metal rejected (35100, 34076 and 42012 bytes): 128 or 160
+    // triangle vertices with 25, 23 or 24 attribute lines and 9 or 8 generic outputs besides the
+    // position.
+    CHECK(Vulkan::MoltenVKMeshThreadgroupBytes(128, 64, 3, 25, 0, 10, 0) == 35100);
+    CHECK(Vulkan::MoltenVKMeshThreadgroupBytes(128, 64, 3, 23, 0, 10, 0) == 34076);
+    CHECK(Vulkan::MoltenVKMeshThreadgroupBytes(160, 128, 3, 24, 0, 9, 0) == 42012);
+    // One that builds: 64 vertices, 126 triangles, 7168 bytes of attributes, 8 generic outputs.
+    CHECK(Vulkan::MoltenVKMeshThreadgroupBytes(64, 126, 3, 28, 0, 9, 0) == 19940);
+}

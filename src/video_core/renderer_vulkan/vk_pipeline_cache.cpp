@@ -4496,6 +4496,29 @@ bool PipelineCache::TranslateGraphicsStages(ShaderPools& pools, const GraphicsPi
             // one stage.
             Shader::Optimization::LimitSampledTextureArrays(programs[index], host_info);
         }
+        // MoltenVK keeps a mesh program's workgroup arrays and a copy of its outputs in one
+        // Metal threadgroup, at most maxComputeSharedMemorySize (32 KiB on Apple GPUs): a program
+        // over it fails to build, and is drawn through the mesh emulation instead.
+        if (programs[index].stage == Shader::Stage::Mesh && device.IsMoltenVK() &&
+            device.IsExtMeshShaderSupported() && !mesh_unsupported) {
+            const auto& mesh{programs[index].mesh};
+            u32 vertex_outputs{1};
+            for (size_t generic = 0; generic < 32; ++generic) {
+                vertex_outputs += programs[index].info.stores.Generic(generic) ? 1 : 0;
+            }
+            const u32 primitive_lines{static_cast<u32>(mesh.primitive_lines.size())};
+            const u64 bytes{MoltenVKMeshThreadgroupBytes(
+                mesh.max_vertices, mesh.max_primitives, mesh.PrimitiveVertices(),
+                static_cast<u32>(mesh.vertex_lines.size()), primitive_lines, vertex_outputs,
+                (primitive_lines + 3) / 4)};
+            if (bytes > device.GetMaxComputeSharedMemorySize()) {
+                LOG_INFO(Render_Vulkan,
+                         "Mesh program {:016x} needs {} bytes of threadgroup memory on MoltenVK, "
+                         "over {}: its pipeline is emulated",
+                         key.unique_hashes[index], bytes, device.GetMaxComputeSharedMemorySize());
+                mesh_unsupported = true;
+            }
+        }
 
         // Canonical native keys keep the attribute types the header's input map lists. A program
         // that loads another one would read it as disabled: this pipeline is dropped and the
