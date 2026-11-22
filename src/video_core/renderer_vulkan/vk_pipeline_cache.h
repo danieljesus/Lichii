@@ -39,6 +39,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache_load.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
@@ -258,10 +259,14 @@ private:
     bool SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
 
-    /// Sets vulkan_pipeline_cache_restored when the driver kept the file's data (see
-    /// DecideVulkanCacheLoad).
+    /// Sets vulkan_pipeline_cache_load to what loading the file came to, and
+    /// vulkan_pipeline_cache_restored when that counts as restored (ActionsFor); the caller does
+    /// the rest of what ActionsFor says.
     vk::PipelineCache LoadVulkanPipelineCache(const std::filesystem::path& filename,
                                               u32 expected_cache_version);
+    /// Gives the file's driver data to the driver, into `restored`, and says what came of it.
+    VulkanCacheLoad LoadDriverCacheData(const std::vector<char>& cache_data,
+                                        vk::PipelineCache& restored);
 
     void QueueVulkanPipelineCacheFlush();
 
@@ -301,8 +306,8 @@ private:
     bool use_vulkan_pipeline_cache{};
     /// Whether this boot's Vulkan pipeline cache started from the saved file, not empty
     bool vulkan_pipeline_cache_restored{};
-    /// Set with it when the precache's "done" marker goes too (VulkanCacheLoadActions)
-    bool vulkan_pipeline_cache_drop_marker{};
+    /// What loading the file came to (see VulkanCacheLoad)
+    VulkanCacheLoad vulkan_pipeline_cache_load{};
     /// The pipelines' builds, the prebuild and the precache. Declared before the pipelines, whose
     /// builds it runs.
     std::optional<VideoCommon::ShaderJobScheduler> shader_jobs;

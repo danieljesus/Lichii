@@ -90,17 +90,43 @@ constexpr auto Other = PipelineCacheDataOrigin::OtherDriver;
 
 } // Anonymous namespace
 
+TEST_CASE("Every way a driver pipeline cache load ends does what nx2 did, or says why not",
+          "[video_core][vulkan_pipeline_cache]") {
+    struct Row {
+        VulkanCacheLoad load;
+        bool restored;
+        bool drop_precache_marker;
+        bool remove_file;
+    };
+    // The marker goes only where the driver was given the data and kept none of it, or the file
+    // held none: a driver that rejects its own cache would reject it again after a rerun.
+    for (const Row row : {
+             Row{VulkanCacheLoad::Restored, true, false, false},
+             Row{VulkanCacheLoad::NoFile, false, false, false},
+             Row{VulkanCacheLoad::Damaged, false, false, true},
+             Row{VulkanCacheLoad::OtherVersion, false, false, true},
+             Row{VulkanCacheLoad::Rejected, false, false, true},
+             Row{VulkanCacheLoad::NoData, false, true, true},
+             Row{VulkanCacheLoad::DriverKeptNothing, false, true, true},
+         }) {
+        INFO(static_cast<int>(row.load));
+        const auto actions = Vulkan::ActionsFor(row.load);
+        CHECK(actions.restored == row.restored);
+        CHECK(actions.drop_precache_marker == row.drop_precache_marker);
+        CHECK(actions.remove_file == row.remove_file);
+    }
+}
+
 TEST_CASE("A driver pipeline cache the driver kept is restored",
           "[video_core][vulkan_pipeline_cache]") {
     // The driver reports more than an empty cache of its own (MoltenVK: 36 bytes).
-    const auto load = Vulkan::DecideVulkanCacheLoad(127845708, 127845708, 36, Mine);
-    CHECK(load == VulkanCacheLoad::Restored);
-    const auto actions = Vulkan::ActionsFor(load);
-    CHECK(actions.restored);
-    CHECK_FALSE(actions.drop_precache_marker);
-    CHECK_FALSE(actions.remove_file);
-    // The header never turns a kept cache into a dropped one.
     CHECK(Vulkan::DecideVulkanCacheLoad(127845708, 127845708, 36, Other) ==
+          VulkanCacheLoad::Restored);
+    // The header never turns a kept cache into a dropped one, and this driver's data is restored
+    // without asking: the first pass the load makes, before any probe.
+    CHECK(Vulkan::DecideVulkanCacheLoad(127845708, std::nullopt, std::nullopt, Mine) ==
+          VulkanCacheLoad::Restored);
+    CHECK(Vulkan::DecideVulkanCacheLoad(Header, std::nullopt, std::nullopt, Other) ==
           VulkanCacheLoad::Restored);
 }
 
@@ -113,31 +139,23 @@ TEST_CASE("A driver pipeline cache whose size queries failed is restored",
           VulkanCacheLoad::Restored);
 }
 
-TEST_CASE("A driver pipeline cache made by another driver version is not restored, and goes",
+TEST_CASE("A driver pipeline cache made by another driver version is not restored",
           "[video_core][vulkan_pipeline_cache]") {
     // MoltenVK given 128 MB made by another build of it holds an empty cache's 36 bytes.
-    const auto load = Vulkan::DecideVulkanCacheLoad(127845708, 36, 36, Other);
-    CHECK(load == VulkanCacheLoad::DriverKeptNothing);
-    const auto actions = Vulkan::ActionsFor(load);
-    CHECK_FALSE(actions.restored);
-    CHECK(actions.drop_precache_marker);
-    CHECK(actions.remove_file);
+    CHECK(Vulkan::DecideVulkanCacheLoad(127845708, 36, 36, Other) ==
+          VulkanCacheLoad::DriverKeptNothing);
     // Held below an empty cache's size, or a header of an unknown version the driver dropped.
     CHECK(Vulkan::DecideVulkanCacheLoad(4096, 32, 36, Other) == VulkanCacheLoad::DriverKeptNothing);
     CHECK(Vulkan::DecideVulkanCacheLoad(4096, 36, 36, PipelineCacheDataOrigin::Unknown) ==
           VulkanCacheLoad::DriverKeptNothing);
 }
 
-TEST_CASE("A driver pipeline cache this driver's header says is its own is kept though held empty",
+TEST_CASE("A driver pipeline cache this driver's header says is its own is restored",
           "[video_core][vulkan_pipeline_cache]") {
     // A driver that loads initial data lazily, or reports a size that does not follow its
-    // contents: one signal does not delete a good cache.
-    const auto load = Vulkan::DecideVulkanCacheLoad(127845708, 36, 36, Mine);
-    CHECK(load == VulkanCacheLoad::RestoredHeldNothing);
-    const auto actions = Vulkan::ActionsFor(load);
-    CHECK(actions.restored);
-    CHECK_FALSE(actions.drop_precache_marker);
-    CHECK_FALSE(actions.remove_file);
+    // contents: one signal does not delete a good cache, held at or below an empty cache's size.
+    CHECK(Vulkan::DecideVulkanCacheLoad(127845708, 36, 36, Mine) == VulkanCacheLoad::Restored);
+    CHECK(Vulkan::DecideVulkanCacheLoad(127845708, 32, 36, Mine) == VulkanCacheLoad::Restored);
 }
 
 TEST_CASE("A driver pipeline cache file holding an empty cache is restored",
@@ -148,17 +166,16 @@ TEST_CASE("A driver pipeline cache file holding an empty cache is restored",
     CHECK(Vulkan::DecideVulkanCacheLoad(36, 36, 36, Other) == VulkanCacheLoad::Restored);
 }
 
-TEST_CASE("A driver pipeline cache file with no driver data is not restored, and goes",
+TEST_CASE("A driver pipeline cache file with no driver data is not restored",
           "[video_core][vulkan_pipeline_cache]") {
     // Lichii's header alone, as a save that read nothing left it, or less than Vulkan's header:
-    // decided without giving it to the driver.
+    // decided without giving it to the driver, whatever the bytes say.
     for (const size_t size : {size_t{0}, Header - 1}) {
-        const auto load = Vulkan::DecideVulkanCacheLoad(size, std::nullopt, std::nullopt, Mine);
-        CHECK(load == VulkanCacheLoad::NoData);
-        const auto actions = Vulkan::ActionsFor(load);
-        CHECK_FALSE(actions.restored);
-        CHECK(actions.drop_precache_marker);
-        CHECK(actions.remove_file);
+        for (const auto origin : {Mine, Other, PipelineCacheDataOrigin::NoData,
+                                  PipelineCacheDataOrigin::Unknown}) {
+            CHECK(Vulkan::DecideVulkanCacheLoad(size, std::nullopt, std::nullopt, origin) ==
+                  VulkanCacheLoad::NoData);
+        }
     }
     CHECK(Vulkan::DecideVulkanCacheLoad(Header, 64, 36, Mine) == VulkanCacheLoad::Restored);
 }
