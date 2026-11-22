@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -100,6 +101,50 @@ std::unordered_set<u64> ReadWarmProgress(const std::filesystem::path& warm_file,
 /// Records `built` for `stamp`. Returns false when it cannot be written.
 bool WriteWarmProgress(const std::filesystem::path& warm_file, const WarmStamp& stamp,
                        const std::unordered_set<u64>& built);
+
+/// When what a precache recorded is written: its marker, when it finished, or the builds of one
+/// that was skipped. Both vouch for builds held by a pipeline cache. Where that is the Vulkan
+/// pipeline cache Lichii saves (`lichii_saves_cache`) and the precache built something (`built`),
+/// only once a whole save of it worked (PendingWarmRecord): written before it, a failed or partial
+/// save, a stop just after the last build, or an app that ended before its next save left a
+/// marker saying "done" for a cache without those builds, and the precache built nothing at the
+/// next boot. Now where the driver keeps its own cache, or when nothing was built (what is
+/// recorded is in the cache already).
+enum class WarmRecordCommit { Now, AfterWholeSave };
+[[nodiscard]] constexpr WarmRecordCommit WhenToCommitWarmRecord(bool lichii_saves_cache,
+                                                                bool built) {
+    return lichii_saves_cache && built ? WarmRecordCommit::AfterWholeSave : WarmRecordCommit::Now;
+}
+
+/// The record of a precache that finished: writes the marker of `stamp`, when there is one, and
+/// then removes the progress, whose builds it now vouches for. A marker that cannot be written is
+/// logged, and the progress kept.
+[[nodiscard]] std::function<void()> FinishedWarmRecord(const std::filesystem::path& warm_file,
+                                                       std::optional<WarmStamp> stamp);
+
+/// What a precache recorded, held until a whole save of the pipeline cache that holds its builds:
+/// whichever save that is (the one queued after the precache, a timed flush, a game change, the
+/// shutdown), as the prebuild that starts right after the precache can overtake the first. A new
+/// title's load drops it. Safe to use from the loading and serialization threads.
+class PendingWarmRecord {
+public:
+    /// Holds `record` (`what` names it in the log), replacing one held before.
+    void Hold(std::function<void()> record, std::string what);
+
+    /// After a save of the cache: a whole one writes what is held and returns its name; a partial
+    /// or failed one keeps it, as does one with nothing held.
+    std::optional<std::string> AfterSave(bool whole);
+
+    /// Drops what is held.
+    void Drop();
+
+    [[nodiscard]] bool Held() const;
+
+private:
+    mutable std::mutex mutex;
+    std::function<void()> record;
+    std::string what;
+};
 
 /// "Precompile All Shaders" of one game (same folder, extension .requested): the game's precache
 /// runs before it starts whatever precache_shaders says, and the boot builds every pipeline the

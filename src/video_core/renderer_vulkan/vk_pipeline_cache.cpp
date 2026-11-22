@@ -978,7 +978,7 @@ PipelineCache::~PipelineCache() {
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
-                                     CACHE_VERSION);
+                                     CACHE_VERSION, "shutdown");
     }
     Common::NoteShutdownProgress();
     LogRuntimePipelineTotals();
@@ -1216,12 +1216,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         serialization_thread.WaitForRequests();
         if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
             SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
-                                         CACHE_VERSION);
+                                         CACHE_VERSION, "game change");
         }
         shader_cache_v2 = nullptr;
         cache_v2.reset();
         pipeline_binaries.reset();
     }
+    // What the previous title's precache held was written by the save above if it could be.
+    pending_warm_record.Drop();
     // This title's flushes are timed from its own saves, not from the previous title's (a failed
     // boot save would leave those).
     pipelines_since_flush = 0;
@@ -1973,8 +1975,8 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     if (use_vulkan_pipeline_cache) {
         // Counts as a flush, stamped once it ended as nx2 did, unless the driver gave nothing
         // usable: that one is retried by the next flush after the retry floor.
-        const auto saved = SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename,
-                                                        vulkan_pipeline_cache, CACHE_VERSION);
+        const auto saved = SerializeVulkanPipelineCache(
+            vulkan_pipeline_cache_filename, vulkan_pipeline_cache, CACHE_VERSION, "boot");
         const auto end = std::chrono::steady_clock::now();
         if (saved.read) {
             last_cache_size.store(saved.bytes, std::memory_order_relaxed);
@@ -2219,13 +2221,18 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
         batch.Wait();
     }
     const size_t total_built = static_cast<size_t>(std::count(built.begin(), built.end(), u8{1}));
+    // What this precache records (the marker of a finished one, the builds of a skipped one) is
+    // written once a whole save holds the builds, where that save is what holds them: held as
+    // the cache's pending record, which any later whole save writes (the one queued below, a
+    // timed flush, a game change, the shutdown), as the prebuild that starts right after this
+    // can overtake the first. So also when loading was stopped after the last build, and no
+    // save is queued here.
+    std::function<void()> commit_record;
+    const char* record_name = "progress";
     if (compute_pending && !skipped) {
-        if (const auto stamp_done = stamp(file_entries)) {
-            ShaderWarm::WriteWarmMarker(warm_file, *stamp_done);
-        }
-        std::filesystem::remove(ShaderWarm::WarmProgressPath(warm_file), ec);
+        commit_record = ShaderWarm::FinishedWarmRecord(warm_file, stamp(file_entries));
+        record_name = "marker";
     }
-    std::function<void()> commit_progress;
     if (compute_pending && skipped && current && persisted && total_built != 0 &&
         !stop_loading.stop_requested()) {
         // A closed load saves no Vulkan pipeline cache below.
@@ -2234,18 +2241,25 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                 built_before.insert(job_keys[index]);
             }
         }
-        commit_progress = [warm_file, at = *current, keys = std::move(built_before)] {
+        commit_record = [warm_file, at = *current, keys = std::move(built_before)] {
             ShaderWarm::WriteWarmProgress(warm_file, at, keys);
         };
-        if (!vulkan_cache) {
-            commit_progress();
-            commit_progress = {};
+    }
+    if (commit_record) {
+        if (ShaderWarm::WhenToCommitWarmRecord(vulkan_cache, total_built != 0) ==
+            ShaderWarm::WarmRecordCommit::Now) {
+            commit_record();
+        } else {
+            pending_warm_record.Hold(std::move(commit_record), record_name);
+            LOG_INFO(Render_Vulkan,
+                     "Shader precache: its {} waits for a whole save of the driver pipeline cache",
+                     record_name);
         }
     }
     if (!stop_loading.stop_requested() && total_built != 0) {
         // Without this, the builds reach the file only at the next boot, game change or clean
         // close, and are lost if the app ends otherwise.
-        QueueVulkanPipelineCacheSave(std::move(commit_progress));
+        QueueVulkanPipelineCacheSave();
     }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
@@ -2304,8 +2318,8 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
     pipelines_since_flush = 0;
     last_flush_failed.store(false, std::memory_order_relaxed);
     serialization_thread.QueueWork([this, now] {
-        const auto saved = SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename,
-                                                        vulkan_pipeline_cache, CACHE_VERSION);
+        const auto saved = SerializeVulkanPipelineCache(
+            vulkan_pipeline_cache_filename, vulkan_pipeline_cache, CACHE_VERSION, "timed");
         if (saved.read) {
             last_cache_size.store(saved.bytes, std::memory_order_relaxed);
         }
@@ -2315,18 +2329,19 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
     });
 }
 
-void PipelineCache::QueueVulkanPipelineCacheSave(std::function<void()> after_save) {
+void PipelineCache::QueueVulkanPipelineCacheSave() {
     if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
         return;
     }
-    const auto save = [this, after_save = std::move(after_save)] {
-        const auto saved = SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename,
-                                                        vulkan_pipeline_cache, CACHE_VERSION);
+    const auto save = [this] {
+        const auto saved = SerializeVulkanPipelineCache(
+            vulkan_pipeline_cache_filename, vulkan_pipeline_cache, CACHE_VERSION, "post-precache");
         if (saved.read) {
             last_cache_size.store(saved.bytes, std::memory_order_relaxed);
         }
         // Overtaken by the prebuild that starts behind it: the next timed flush is due at the
-        // retry floor. Otherwise the flush timing is left as nx2 left it here.
+        // retry floor, and writes the precache's pending record if it is whole. Otherwise the
+        // flush timing is left as nx2 left it here.
         if (saved.outcome == PipelineCacheSaveOutcome::NothingUsable) {
             const auto end = std::chrono::steady_clock::now();
             StoreFlushState(AfterPipelineCacheSave(LoadFlushState(), saved.outcome, end, end));
@@ -2337,15 +2352,13 @@ void PipelineCache::QueueVulkanPipelineCacheSave(std::function<void()> after_sav
         // Written: an earlier flush that got nothing has no retry left to make.
         last_flush_failed.store(false, std::memory_order_relaxed);
         const bool whole = saved.outcome == PipelineCacheSaveOutcome::Whole;
-        // What the precache recorded vouches for its builds: only a whole save holds them all.
-        if (after_save && whole) {
-            after_save();
-        }
         LOG_INFO(Render_Vulkan, "Driver pipeline cache saved after the shader precache, {} bytes{}",
                  saved.bytes, whole ? "" : " (part of it)");
     };
-    // Here the precache's builds have ended and the prebuild has not started (see
-    // PrebuildStartsWithBootBuilds), so no build runs while this thread reads the cache.
+    // Where reading the cache during a build crashes, the prebuild has not started here (see
+    // PrebuildStartsWithBootBuilds) and the save is made now. Elsewhere it is queued, and the
+    // prebuild starting behind it may overtake its read: the precache's record then waits for a
+    // later whole save.
     if (!device.CanReadPipelineCacheDuringBuilds()) {
         save();
         return;
@@ -3839,7 +3852,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 
 PipelineCache::SavedVulkanCache PipelineCache::SerializeVulkanPipelineCache(
     const std::filesystem::path& filename, const vk::PipelineCache& pipeline_cache,
-    u32 cache_version) {
+    u32 cache_version, std::string_view which) {
     // Read before the file is opened: a cache with nothing usable leaves the file as it was. The
     // flushes read it while pipelines build into it, and each result used to be ignored. On a
     // conforming driver an overtaken read is a smaller valid cache, which was saved, losing only
@@ -3927,6 +3940,11 @@ PipelineCache::SavedVulkanCache PipelineCache::SerializeVulkanPipelineCache(
 
     LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {} ({} bytes of driver data)",
              Common::FS::PathToUTF8String(filename), cache_size);
+    // The precache's record, held until a save holds all its builds.
+    if (const auto written = pending_warm_record.AfterSave(!data.Partial())) {
+        LOG_INFO(Render_Vulkan, "Shader precache: its {} written after the {} save", *written,
+                 which);
+    }
     return {.outcome = data.Partial() ? PipelineCacheSaveOutcome::Partial
                                       : PipelineCacheSaveOutcome::Whole,
             .bytes = cache_size,

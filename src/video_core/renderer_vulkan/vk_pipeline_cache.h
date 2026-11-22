@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <vector>
@@ -45,6 +46,7 @@
 #include "video_core/shader_cache.h"
 #include "video_core/shader_cache_v2/cache.h"
 #include "video_core/shader_jobs.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/shader_stage_translation.h"
 
 namespace Core {
@@ -268,9 +270,11 @@ private:
         }
     };
     /// Written() when the file was written and replaced the previous one.
-    SavedVulkanCache SerializeVulkanPipelineCache(
-        const std::filesystem::path& filename, const vk::PipelineCache& pipeline_cache,
-        u32 cache_version);
+    /// `which` names the save in the log (boot, timed, post-precache, game change, shutdown).
+    /// A whole one writes the precache's pending record.
+    SavedVulkanCache SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+                                                  const vk::PipelineCache& pipeline_cache,
+                                                  u32 cache_version, std::string_view which);
 
     /// Sets vulkan_pipeline_cache_restored when the file's contents were read back.
     vk::PipelineCache LoadVulkanPipelineCache(const std::filesystem::path& filename,
@@ -284,8 +288,8 @@ private:
     /// Queues one write of the driver pipeline cache file on the serialization thread, with no
     /// throttle, or writes it now where reading the cache during a build crashes. For the end of
     /// a precache: its builds never reach the timed flush, which counts only pipelines built
-    /// during play. `after_save` runs once the file was written, never when the write failed.
-    void QueueVulkanPipelineCacheSave(std::function<void()> after_save = {});
+    /// during play. A whole save writes the precache's pending record (pending_warm_record).
+    void QueueVulkanPipelineCacheSave();
 
     /// One build of the shader precache: a compute pipeline built and destroyed
     struct PrecacheJob {
@@ -397,6 +401,8 @@ private:
     std::atomic_bool last_flush_failed{};
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
+    /// What the last precache recorded, until a whole save holds its builds
+    VideoCommon::ShaderWarm::PendingWarmRecord pending_warm_record;
 
     /// Requested first when the cache is destroyed, to stop a rewrite of the disk cache: Android
     /// and lichii_cmd load with a stop token that never stops
