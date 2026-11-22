@@ -84,10 +84,19 @@ enum class VulkanCacheLoad {
 /// What the load does about it.
 struct VulkanCacheLoadActions {
     /// Whether the cache counts as restored (vulkan_pipeline_cache_restored). One that is not
-    /// drops the precache's progress and its "done" marker: the builds they vouch for are not in
-    /// it, nothing else holds them on drivers without a cache of their own (MoltenVK among them),
-    /// and the marker's stamp (driver version, device) does not change with the pipelineCacheUUID.
+    /// drops the precache's progress, whose builds it no longer holds, as on every path where the
+    /// cache was not restored (no file, a damaged one, another Lichii cache version, one the
+    /// driver rejected).
     bool restored;
+    /// Whether the precache's "done" marker goes too, so the precache runs again and refills the
+    /// cache. Only here, where the driver was given the data and kept none of it, or the file held
+    /// no data: the marker's stamp (driver version, device) does not change with the
+    /// pipelineCacheUUID, so after a MoltenVK update it still matched and the precache built
+    /// nothing into the emptied cache. Not where the driver rejected the file with an error: a
+    /// driver that refuses its own cache refuses it again (MoltenVK fails a whole cache holding
+    /// MSL it cannot compile, which the precache builds), so a rerun there would poison the cache
+    /// at every boot instead of converging on one without those builds.
+    bool drop_precache_marker;
     /// The file goes, as the damaged and rejected ones do, so it is not read again at every boot
     /// until a save replaces it.
     bool remove_file;
@@ -97,12 +106,12 @@ struct VulkanCacheLoadActions {
     switch (load) {
     case VulkanCacheLoad::Restored:
     case VulkanCacheLoad::RestoredHeldNothing:
-        return {.restored = true, .remove_file = false};
+        return {.restored = true, .drop_precache_marker = false, .remove_file = false};
     case VulkanCacheLoad::NoData:
     case VulkanCacheLoad::DriverKeptNothing:
-        return {.restored = false, .remove_file = true};
+        return {.restored = false, .drop_precache_marker = true, .remove_file = true};
     }
-    return {.restored = true, .remove_file = false};
+    return {.restored = true, .drop_precache_marker = false, .remove_file = false};
 }
 
 } // namespace Vulkan

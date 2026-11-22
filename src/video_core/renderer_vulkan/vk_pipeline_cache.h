@@ -301,6 +301,8 @@ private:
     bool use_vulkan_pipeline_cache{};
     /// Whether this boot's Vulkan pipeline cache started from the saved file, not empty
     bool vulkan_pipeline_cache_restored{};
+    /// Set with it when the precache's "done" marker goes too (VulkanCacheLoadActions)
+    bool vulkan_pipeline_cache_drop_marker{};
     /// The pipelines' builds, the prebuild and the precache. Declared before the pipelines, whose
     /// builds it runs.
     std::optional<VideoCommon::ShaderJobScheduler> shader_jobs;

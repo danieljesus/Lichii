@@ -1312,23 +1312,25 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
-        if (!vulkan_pipeline_cache_restored) {
-            // The precache progress names builds the lost cache held, and its marker says they
-            // were all built. Dropped before the empty cache is saved, which would make them
-            // readable again at the next boot. The marker's stamp has the driver version and
-            // device, not the pipelineCacheUUID: after a MoltenVK update it still matched, and
-            // the precache built nothing into the emptied cache.
-            // A marker left in place would keep that, so a failure to remove it is said.
-            const auto warm_file = ShaderWarm::ComputeWarmPath(title_id);
-            for (const auto& mark :
-                 {ShaderWarm::WarmProgressPath(warm_file), ShaderWarm::WarmMarkerPath(warm_file)}) {
-                std::error_code ec;
-                std::filesystem::remove(mark, ec);
-                if (ec) {
-                    LOG_ERROR(Common_Filesystem, "Couldn't remove {}: {}",
-                              Common::FS::PathToUTF8String(mark), ec.message());
-                }
+        // The precache progress names builds the lost cache held: dropped before the empty
+        // cache is saved, which would make it readable again at the next boot. Its marker, which
+        // says they were all built, goes only where the driver was given the data and kept none
+        // of it (see VulkanCacheLoadActions); a marker left in place would keep the precache
+        // from refilling the cache, so a failure to remove either is said.
+        const auto warm_file = ShaderWarm::ComputeWarmPath(title_id);
+        const auto remove_mark = [](const std::filesystem::path& mark) {
+            std::error_code ec;
+            std::filesystem::remove(mark, ec);
+            if (ec) {
+                LOG_ERROR(Common_Filesystem, "Couldn't remove {}: {}",
+                          Common::FS::PathToUTF8String(mark), ec.message());
             }
+        };
+        if (!vulkan_pipeline_cache_restored) {
+            remove_mark(ShaderWarm::WarmProgressPath(warm_file));
+        }
+        if (vulkan_pipeline_cache_drop_marker) {
+            remove_mark(ShaderWarm::WarmMarkerPath(warm_file));
         }
     }
     if (boot_lock.Held() && !Common::FS::NewFile(boot_marker)) {
@@ -3869,6 +3871,7 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         return device.GetLogical().CreatePipelineCache(pipeline_cache_ci);
     };
     vulkan_pipeline_cache_restored = false;
+    vulkan_pipeline_cache_drop_marker = false;
     try {
         std::ifstream file(filename, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
@@ -3987,6 +3990,7 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
                       path);
         }
         vulkan_pipeline_cache_restored = actions.restored;
+        vulkan_pipeline_cache_drop_marker = actions.drop_precache_marker;
         return restored ? std::move(restored) : create_pipeline_cache(0, nullptr);
 
     } catch (const std::ios_base::failure& e) {

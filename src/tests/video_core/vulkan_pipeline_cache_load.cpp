@@ -97,6 +97,7 @@ TEST_CASE("A driver pipeline cache the driver kept is restored",
     CHECK(load == VulkanCacheLoad::Restored);
     const auto actions = Vulkan::ActionsFor(load);
     CHECK(actions.restored);
+    CHECK_FALSE(actions.drop_precache_marker);
     CHECK_FALSE(actions.remove_file);
     // The header never turns a kept cache into a dropped one.
     CHECK(Vulkan::DecideVulkanCacheLoad(127845708, 127845708, 36, Other) ==
@@ -119,6 +120,7 @@ TEST_CASE("A driver pipeline cache made by another driver version is not restore
     CHECK(load == VulkanCacheLoad::DriverKeptNothing);
     const auto actions = Vulkan::ActionsFor(load);
     CHECK_FALSE(actions.restored);
+    CHECK(actions.drop_precache_marker);
     CHECK(actions.remove_file);
     // Held below an empty cache's size, or a header of an unknown version the driver dropped.
     CHECK(Vulkan::DecideVulkanCacheLoad(4096, 32, 36, Other) == VulkanCacheLoad::DriverKeptNothing);
@@ -134,6 +136,7 @@ TEST_CASE("A driver pipeline cache this driver's header says is its own is kept 
     CHECK(load == VulkanCacheLoad::RestoredHeldNothing);
     const auto actions = Vulkan::ActionsFor(load);
     CHECK(actions.restored);
+    CHECK_FALSE(actions.drop_precache_marker);
     CHECK_FALSE(actions.remove_file);
 }
 
@@ -154,6 +157,7 @@ TEST_CASE("A driver pipeline cache file with no driver data is not restored, and
         CHECK(load == VulkanCacheLoad::NoData);
         const auto actions = Vulkan::ActionsFor(load);
         CHECK_FALSE(actions.restored);
+        CHECK(actions.drop_precache_marker);
         CHECK(actions.remove_file);
     }
     CHECK(Vulkan::DecideVulkanCacheLoad(Header, 64, 36, Mine) == VulkanCacheLoad::Restored);
