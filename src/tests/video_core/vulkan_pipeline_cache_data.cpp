@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -67,26 +68,53 @@ TEST_CASE("A driver pipeline cache that holds still is read once",
     FakeCache cache;
     int progress = 0;
     const auto data = Read(cache, &progress);
-    CHECK(data.result == VK_SUCCESS);
+    CHECK(data.Whole());
     CHECK(Bytes(data) == cache.data);
     CHECK(cache.calls == 2);
     CHECK(progress == 1);
-    FakeCache empty{.data{}};
-    const auto none = Read(empty);
-    CHECK(none.Usable());
-    CHECK(none.size == 0);
-    CHECK(empty.calls == 1);
 }
 
-TEST_CASE("A driver pipeline cache that grows between its size and its read is asked again",
+TEST_CASE("A driver pipeline cache that reads back fewer bytes than asked is whole",
           "[video_core][vulkan_pipeline_cache]") {
-    for (const bool conforming : {false, true}) {
-        FakeCache cache{.conforming = conforming, .grow = 1};
+    int calls = 0;
+    const auto data = Vulkan::ReadPipelineCacheData(
+        [&](size_t* size, void* out) {
+            ++calls;
+            if (out == nullptr) {
+                *size = Header + 64;
+            } else {
+                *size = Header + 8;
+                std::memset(out, 7, *size);
+            }
+            return VK_SUCCESS;
+        },
+        [] {});
+    CHECK(data.Whole());
+    CHECK(data.size == Header + 8);
+    CHECK(calls == 2);
+}
+
+TEST_CASE("A driver pipeline cache smaller than a header is no data",
+          "[video_core][vulkan_pipeline_cache]") {
+    // A live cache always holds a header: a size of 0, or less than one, would replace a good
+    // file with an empty cache.
+    for (const size_t size : {size_t{0}, Header - 1}) {
+        FakeCache cache{.data = std::vector<char>(size, 1)};
         const auto data = Read(cache);
+        CHECK_FALSE(data.Usable());
         CHECK(data.result == VK_SUCCESS);
-        CHECK(Bytes(data) == cache.data);
-        CHECK(cache.calls == 4);
+        CHECK(cache.calls == 1);
     }
+}
+
+TEST_CASE("A driver pipeline cache that returns nothing when it grows is asked again",
+          "[video_core][vulkan_pipeline_cache]") {
+    // MoltenVK: no bytes until the size is asked for again.
+    FakeCache cache{.grow = 1};
+    const auto data = Read(cache);
+    CHECK(data.Whole());
+    CHECK(Bytes(data) == cache.data);
+    CHECK(cache.calls == 4);
 }
 
 TEST_CASE("A driver pipeline cache that returns nothing each time it grows is not saved",
@@ -102,18 +130,26 @@ TEST_CASE("A driver pipeline cache that returns nothing each time it grows is no
     CHECK(progress == PipelineCacheReadAttempts);
 }
 
-TEST_CASE("A driver pipeline cache that returns part of itself each time it grows saves the last "
-          "part",
+TEST_CASE("A driver pipeline cache that returns part of itself when it grows saves that part",
           "[video_core][vulkan_pipeline_cache]") {
-    // A conforming driver: each part is a valid, smaller cache, as the save always took.
+    // A conforming driver: the part is a valid, smaller cache, taken at once as nx2 took it,
+    // rather than serializing the whole cache again for a result as partial.
     FakeCache cache{.conforming = true, .grow = 100};
     const auto data = Read(cache);
-    REQUIRE(data.Usable());
-    CHECK(data.result == VK_INCOMPLETE);
-    const size_t last_size = Header + 16 + 8 * (PipelineCacheReadAttempts - 1);
-    CHECK(data.size == last_size);
+    REQUIRE(data.Partial());
+    CHECK(data.size == Header + 16);
     CHECK(std::equal(data.bytes.get(), data.bytes.get() + data.size, cache.data.begin()));
-    CHECK(cache.calls == 2 * PipelineCacheReadAttempts);
+    CHECK(cache.calls == 2);
+}
+
+TEST_CASE("A driver pipeline cache part of a header alone is asked again",
+          "[video_core][vulkan_pipeline_cache]") {
+    // A header and nothing after it holds no pipeline; it must not replace a full file.
+    FakeCache cache{.data = std::vector<char>(Header, 1), .conforming = true, .grow = 100};
+    const auto data = Read(cache);
+    REQUIRE(data.Partial());
+    CHECK(data.size == Header + 8);
+    CHECK(cache.calls == 4);
 }
 
 TEST_CASE("A driver pipeline cache whose read fails is not saved",
@@ -133,4 +169,23 @@ TEST_CASE("A driver pipeline cache whose read fails is not saved",
         [](size_t*, void*) { return VK_ERROR_OUT_OF_HOST_MEMORY; }, [] {});
     CHECK_FALSE(failing_size.Usable());
     CHECK(failing_size.result == VK_ERROR_OUT_OF_HOST_MEMORY);
+}
+
+TEST_CASE("A failed driver pipeline cache flush waits for the retry floor, not the interval",
+          "[video_core][vulkan_pipeline_cache]") {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point start = Clock::now();
+    const std::chrono::seconds interval{300}; // a 300 MB cache
+    // Never saved nor tried: due.
+    CHECK(Vulkan::PipelineCacheFlushDue(start, {}, {}, interval));
+    // Saved a minute ago: not due until the interval has passed.
+    CHECK_FALSE(Vulkan::PipelineCacheFlushDue(start + 60s, start, start, interval));
+    CHECK(Vulkan::PipelineCacheFlushDue(start + 300s, start, start, interval));
+    // Tried and failed: another 128 pipelines inside the floor do not queue it again...
+    const auto failed = start + 400s;
+    CHECK_FALSE(Vulkan::PipelineCacheFlushDue(failed + 10s, start, failed, interval));
+    // ...the floor does, long before a whole interval from the failure.
+    CHECK(Vulkan::PipelineCacheFlushDue(failed + Vulkan::PipelineCacheFlushRetryFloor, start,
+                                        failed, interval));
 }

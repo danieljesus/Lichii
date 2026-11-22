@@ -254,11 +254,17 @@ private:
     /// Cancels the v2 prebuild and waits for its running stages
     void StopBackgroundJobs();
 
-    /// Returns the bytes of driver data written when the file was written and replaced the
-    /// previous one.
-    std::optional<size_t> SerializeVulkanPipelineCache(const std::filesystem::path& filename,
-                                                       const vk::PipelineCache& pipeline_cache,
-                                                       u32 cache_version);
+    struct SavedVulkanCache {
+        /// Bytes of driver data written
+        size_t bytes;
+        /// False when the driver gave part of the cache: pipelines were built into it while it
+        /// was read
+        bool whole;
+    };
+    /// Empty unless the file was written and replaced the previous one.
+    std::optional<SavedVulkanCache> SerializeVulkanPipelineCache(
+        const std::filesystem::path& filename, const vk::PipelineCache& pipeline_cache,
+        u32 cache_version);
 
     /// Sets vulkan_pipeline_cache_restored when the file's contents were read back.
     vk::PipelineCache LoadVulkanPipelineCache(const std::filesystem::path& filename,
@@ -374,8 +380,10 @@ private:
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
     size_t pipelines_since_flush{};
-    /// When a save last succeeded; written by the serialization thread
+    /// When a save last worked, and when one was last tried (timed flush or the save after the
+    /// boot builds); written by the serialization thread and the loading thread
     std::atomic<std::chrono::steady_clock::time_point> last_flush{};
+    std::atomic<std::chrono::steady_clock::time_point> last_flush_attempt{};
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
 
