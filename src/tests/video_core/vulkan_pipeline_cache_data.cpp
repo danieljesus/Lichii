@@ -382,3 +382,14 @@ TEST_CASE("A part saved while a precache's record waits is retried at the floor"
                                                ended, true)
                     .last_failed);
 }
+
+TEST_CASE("The prebuild's end saves a held record only where the cache reads during builds",
+          "[video_core][vulkan_pipeline_cache]") {
+    // Where reading during builds crashes, the save would read on the frame thread while runtime
+    // builds run: the record waits for the game change or shutdown save there.
+    CHECK(Vulkan::SavesRecordAfterPrebuild(true, true));
+    CHECK_FALSE(Vulkan::SavesRecordAfterPrebuild(true, false));
+    // Nothing held, nothing to save for.
+    CHECK_FALSE(Vulkan::SavesRecordAfterPrebuild(false, true));
+    CHECK_FALSE(Vulkan::SavesRecordAfterPrebuild(false, false));
+}

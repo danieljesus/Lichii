@@ -175,4 +175,14 @@ enum class PipelineCacheSaveOutcome {
     return state;
 }
 
+/// Whether the end of the background prebuild queues a save of the driver pipeline cache for
+/// the precache's record, which a save overtaken by the prebuild left held. Only where the driver
+/// can read its cache during builds: elsewhere the save would read it at once, on the frame
+/// thread, while runtime builds may run on the workers (the read that crashes there). The record
+/// then waits for the game change or shutdown save, as it did before the prebuild end saved it.
+[[nodiscard]] constexpr bool SavesRecordAfterPrebuild(bool record_held,
+                                                      bool can_read_during_builds) noexcept {
+    return record_held && can_read_during_builds;
+}
+
 } // namespace Vulkan

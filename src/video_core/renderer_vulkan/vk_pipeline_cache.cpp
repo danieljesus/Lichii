@@ -2269,7 +2269,7 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
     if (!stop_loading.stop_requested() && total_built != 0) {
         // Without this, the builds reach the file only at the next boot, game change or clean
         // close, and are lost if the app ends otherwise.
-        QueueVulkanPipelineCacheSave("post-precache");
+        QueueVulkanPipelineCacheSave(CacheSaveTrigger::PostPrecache);
     }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
@@ -2346,7 +2346,9 @@ bool PipelineCache::RecordWaitsForRetry() const {
     return pending_warm_record.Held() && !prebuild_running.load(std::memory_order_relaxed);
 }
 
-void PipelineCache::QueueVulkanPipelineCacheSave(std::string_view which) {
+void PipelineCache::QueueVulkanPipelineCacheSave(CacheSaveTrigger trigger) {
+    const char* const which =
+        trigger == CacheSaveTrigger::PostPrecache ? "post-precache" : "post-prebuild";
     if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
         return;
     }
@@ -2379,11 +2381,12 @@ void PipelineCache::QueueVulkanPipelineCacheSave(std::string_view which) {
         LOG_INFO(Render_Vulkan, "Driver pipeline cache saved ({}), {} bytes{}", which, saved.bytes,
                  whole ? "" : " (part of it)");
     };
-    // Where reading the cache during a build crashes, the prebuild has not started here (see
-    // PrebuildStartsWithBootBuilds) and the save is made now. Elsewhere it is queued, and the
-    // prebuild starting behind it may overtake its read: the precache's record then waits for a
-    // later whole save.
+    // Where reading the cache during a build crashes, only the end of a precache comes here: the
+    // prebuild has not started (PrebuildStartsWithBootBuilds) and no build is in flight, so the
+    // save is made now. Elsewhere it is queued, and the prebuild starting behind it may overtake
+    // its read: the precache's record then waits for a later whole save.
     if (!device.CanReadPipelineCacheDuringBuilds()) {
+        ASSERT(trigger == CacheSaveTrigger::PostPrecache);
         save();
         return;
     }
@@ -2630,9 +2633,12 @@ void PipelineCache::TickFrame() {
             prebuild_running.store(false, std::memory_order_relaxed);
             // Nothing but runtime builds can overtake a save now: one writes what the precache
             // still holds, rather than waiting for a runtime build to queue a flush, or for the
-            // shutdown.
-            if (pending_warm_record.Held()) {
-                QueueVulkanPipelineCacheSave("post-prebuild");
+            // shutdown. Not where reading the cache during a build crashes: runtime builds may
+            // run now, and the save would read it at once on this thread
+            // (SavesRecordAfterPrebuild).
+            if (SavesRecordAfterPrebuild(pending_warm_record.Held(),
+                                         device.CanReadPipelineCacheDuringBuilds())) {
+                QueueVulkanPipelineCacheSave(CacheSaveTrigger::PostPrebuild);
             }
         }
     }

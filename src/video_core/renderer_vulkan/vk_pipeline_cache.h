@@ -285,11 +285,20 @@ private:
     PipelineCacheFlushState LoadFlushState() const;
     void StoreFlushState(const PipelineCacheFlushState& state);
 
+    /// What queued a save outside the timed flush, named in its log line
+    enum class CacheSaveTrigger {
+        PostPrecache, ///< The end of a precache: its builds never reach the timed flush
+        PostPrebuild, ///< The end of the background prebuild, with the precache's record held
+    };
+
     /// Queues one write of the driver pipeline cache file on the serialization thread, with no
-    /// throttle, or writes it now where reading the cache during a build crashes. For the end of
-    /// a precache: its builds never reach the timed flush, which counts only pipelines built
-    /// during play. A whole save writes the precache's pending record (pending_warm_record).
-    void QueueVulkanPipelineCacheSave(std::string_view which);
+    /// throttle, or writes it now, on the caller's thread, where reading the cache during a build
+    /// crashes (!CanReadPipelineCacheDuringBuilds). That synchronous write requires that no
+    /// pipeline build is in flight: at the end of a precache the prebuild has not started there
+    /// (PrebuildStartsWithBootBuilds), and the post-prebuild save is not made there
+    /// (SavesRecordAfterPrebuild). A whole save writes the precache's pending record
+    /// (pending_warm_record).
+    void QueueVulkanPipelineCacheSave(CacheSaveTrigger trigger);
     /// Whether a partial save arms the floor retry for the precache's record: one is held, and no
     /// prebuild runs to overtake the retry again
     bool RecordWaitsForRetry() const;
