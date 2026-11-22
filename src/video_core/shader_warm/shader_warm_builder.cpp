@@ -15,6 +15,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include <fmt/format.h>
 
@@ -405,12 +406,46 @@ fs::path WarmProgressPath(const fs::path& warm_file) {
 std::function<void()> FinishedWarmRecord(const fs::path& warm_file,
                                          std::optional<WarmStamp> stamp) {
     return [warm_file, stamp] {
-        if (stamp) {
-            WriteWarmMarker(warm_file, *stamp);
+        if (stamp && !WriteWarmMarker(warm_file, *stamp)) {
+            LOG_ERROR(Render_Vulkan, "Shader precache: couldn't write its marker {}",
+                      Common::FS::PathToUTF8String(WarmMarkerPath(warm_file)));
+            return;
         }
         std::error_code ignored;
         fs::remove(WarmProgressPath(warm_file), ignored);
     };
+}
+
+void PendingWarmRecord::Hold(std::function<void()> record_, std::string what_) {
+    std::scoped_lock lock{mutex};
+    record = std::move(record_);
+    what = std::move(what_);
+}
+
+std::optional<std::string> PendingWarmRecord::AfterSave(bool whole) {
+    std::function<void()> taken;
+    std::string name;
+    {
+        std::scoped_lock lock{mutex};
+        if (!whole || !record) {
+            return std::nullopt;
+        }
+        taken = std::exchange(record, {});
+        name = std::exchange(what, {});
+    }
+    taken();
+    return name;
+}
+
+void PendingWarmRecord::Drop() {
+    std::scoped_lock lock{mutex};
+    record = {};
+    what.clear();
+}
+
+bool PendingWarmRecord::Held() const {
+    std::scoped_lock lock{mutex};
+    return static_cast<bool>(record);
 }
 
 std::unordered_set<u64> ReadWarmProgress(const fs::path& warm_file, const WarmStamp& current) {

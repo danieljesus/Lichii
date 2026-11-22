@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -257,8 +258,20 @@ TEST_CASE("ShaderPrecache: progress carries over only to the same file and drive
     REQUIRE(ShaderWarm::ReadWarmProgress(warm, *rebuilt).empty());
 }
 
-TEST_CASE("ShaderPrecache: a finished precache is marked done only once a save holds its builds",
+TEST_CASE("ShaderPrecache: a precache's record waits for a whole save where Lichii holds its builds",
           "[video_core]") {
+    using ShaderWarm::WarmRecordCommit;
+    // Where Lichii saves the Vulkan pipeline cache and something was built, a stop after the last
+    // build included: like any other, it waits.
+    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(true, true) == WarmRecordCommit::AfterWholeSave);
+    // The driver's own cache holds the builds, or nothing was built (what is recorded is in the
+    // cache already): now.
+    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(false, true) == WarmRecordCommit::Now);
+    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(true, false) == WarmRecordCommit::Now);
+    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(false, false) == WarmRecordCommit::Now);
+}
+
+TEST_CASE("ShaderPrecache: a pending record is written by the first whole save", "[video_core]") {
     TempDir dir;
     const auto warm = dir.path / "warm-compute.bin";
     WriteBytes(warm, "precache file contents");
@@ -267,29 +280,54 @@ TEST_CASE("ShaderPrecache: a finished precache is marked done only once a save h
     const std::unordered_set<u64> built{0x1, 0x2};
     REQUIRE(ShaderWarm::WriteWarmProgress(warm, *stamp, built));
 
-    // Where Lichii saves the Vulkan pipeline cache, the record waits for the save after the
-    // precache: one that fails never runs it, and the marker is not written.
-    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(true, true) ==
-            ShaderWarm::WarmRecordCommit::AfterSave);
-    const auto record = ShaderWarm::FinishedWarmRecord(warm, stamp);
+    ShaderWarm::PendingWarmRecord pending;
+    pending.Hold(ShaderWarm::FinishedWarmRecord(warm, stamp), "marker");
+    REQUIRE(pending.Held());
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+    // The save queued after the precache, overtaken by the prebuild: partial or nothing. Kept.
+    REQUIRE_FALSE(pending.AfterSave(false).has_value());
+    REQUIRE(pending.Held());
     REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
     REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp) == built);
-
-    // The save worked: the precache is done, and its progress goes.
-    record();
+    // A later whole save (a timed flush, a game change, the shutdown) writes it, once.
+    REQUIRE(pending.AfterSave(true) == std::optional<std::string>{"marker"});
+    REQUIRE_FALSE(pending.Held());
     const auto marker = ShaderWarm::ReadWarmMarker(warm);
     REQUIRE(marker.has_value());
     REQUIRE(marker->Matches(*stamp));
     REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp).empty());
+    REQUIRE_FALSE(pending.AfterSave(true).has_value());
+}
 
-    // The driver's own cache holds the builds, or nothing was built and no save follows: now.
-    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(false, true) == ShaderWarm::WarmRecordCommit::Now);
-    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(true, false) == ShaderWarm::WarmRecordCommit::Now);
-    REQUIRE(ShaderWarm::WhenToCommitWarmRecord(false, false) == ShaderWarm::WarmRecordCommit::Now);
+TEST_CASE("ShaderPrecache: a pending record is dropped by a new load", "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    WriteBytes(warm, "precache file contents");
+    const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 4795, 10401, 0x1B02020A, 54, 7);
+    REQUIRE(stamp.has_value());
+    ShaderWarm::PendingWarmRecord pending;
+    pending.Hold(ShaderWarm::FinishedWarmRecord(warm, stamp), "marker");
+    pending.Drop();
+    REQUIRE_FALSE(pending.Held());
+    REQUIRE_FALSE(pending.AfterSave(true).has_value());
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+}
 
-    // A precache whose stamp could not be taken only drops its progress.
-    REQUIRE(std::filesystem::remove(ShaderWarm::WarmMarkerPath(warm)));
+TEST_CASE("ShaderPrecache: a marker that cannot be written keeps the progress", "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    WriteBytes(warm, "precache file contents");
+    const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 4795, 10401, 0x1B02020A, 54, 7);
+    REQUIRE(stamp.has_value());
+    const std::unordered_set<u64> built{0x1, 0x2};
     REQUIRE(ShaderWarm::WriteWarmProgress(warm, *stamp, built));
+    // A directory where the marker goes: it cannot be written.
+    REQUIRE(std::filesystem::create_directory(ShaderWarm::WarmMarkerPath(warm)));
+    ShaderWarm::FinishedWarmRecord(warm, stamp)();
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+    REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp) == built);
+    // A precache whose stamp could not be taken only drops its progress.
+    std::filesystem::remove(ShaderWarm::WarmMarkerPath(warm));
     ShaderWarm::FinishedWarmRecord(warm, std::nullopt)();
     REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
     REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp).empty());
