@@ -2338,6 +2338,11 @@ void Device::RemoveUnsuitableExtensions() {
         features.pipeline_binary.pipelineBinaries && extensions.maintenance5 &&
         !properties.pipeline_binary.pipelineBinaryPrefersInternalCache &&
         (!DriverCachesPipelines() || amd_binaries);
+    // TEST ONLY: without the binaries, pipelines build into the VkPipelineCache, so a driver such
+    // as RADV with Mesa's disk cache off fills the Vulkan cache file.
+    if (EnvFlagSet("EDEN_NX2_TEST_NO_PIPELINE_BINARIES")) {
+        extensions.pipeline_binary = false;
+    }
     RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_binary, features.pipeline_binary,
                                        VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 
