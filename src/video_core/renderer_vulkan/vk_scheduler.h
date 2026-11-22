@@ -49,6 +49,10 @@ class UploadBatch;
 
 struct QueryCacheParams;
 
+/// EDEN_NX2_GPU_PROFILE: a buffer copy recorded in the main command buffer while a render pass
+/// was open, which ends the pass (BufferCacheRuntime::CopyBuffer)
+void NoteProfileCopyInPass(const char* reason, u64 bytes, std::source_location location);
+
 /// The scheduler abstracts command buffer and fence management with an interface that's able to do
 /// OpenGL-like operations on Vulkan command buffers.
 class Scheduler {
@@ -154,6 +158,13 @@ public:
     bool RenderPassHasStores() const {
         return render_pass_has_stores;
     }
+
+    /// EDEN_NX2_GPU_PROFILE: an emulated mesh draw is about to end the pass for its dispatch, so
+    /// runs of emulated mesh draws on one framebuffer can be counted.
+    void NoteMeshEmulatedDraw();
+
+    /// A new guest frame: EDEN_NX2_TEST_EXTRA_REOPENS has its budget again.
+    void NoteFrameForTestReopens();
 
     /// A dispatch was recorded: the next render pass must see what it wrote.
     void NoteComputeWrites() {

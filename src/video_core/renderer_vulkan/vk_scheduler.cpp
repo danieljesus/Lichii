@@ -78,6 +78,33 @@ u64 g_pass_requests{};
 u32 g_begin_color_clear_mask{};
 bool g_begin_depth_clear{};
 
+// Runs of emulated mesh draws on one framebuffer with nothing between them but their own
+// dispatches: how long they are (1, 2, 3-4, 5-8, 9+) and what ends them.
+struct MeshRunStats {
+    std::array<u64, 5> runs{};
+    u64 draws{};
+    std::map<std::string, u64> enders;
+};
+MeshRunStats g_mesh_runs;
+u32 g_mesh_run{};
+VkFramebuffer g_mesh_run_framebuffer{};
+bool g_mesh_request_pending{};
+bool g_mesh_end_pending{};
+
+void CloseMeshRun(const std::string& reason) {
+    if (g_mesh_run == 0) {
+        return;
+    }
+    const size_t bucket = g_mesh_run == 1   ? 0
+                          : g_mesh_run == 2 ? 1
+                          : g_mesh_run <= 4 ? 2
+                          : g_mesh_run <= 8 ? 3
+                                            : 4;
+    ++g_mesh_runs.runs[bucket];
+    ++g_mesh_runs.enders[reason];
+    g_mesh_run = 0;
+}
+
 void NotePassBegin(const Framebuffer* framebuffer) {
     std::scoped_lock lock{g_profile_end_mutex};
     g_pass_requests = 0;
@@ -123,6 +150,9 @@ void NotePassEnd(VkFramebuffer framebuffer) {
     std::string site = g_pending_end_site.empty() ? std::string{"(no site: flush, submit or other)"}
                                                   : std::exchange(g_pending_end_site, {});
     ++g_reopen_sites[site].ends;
+    if (!std::exchange(g_mesh_end_pending, false)) {
+        CloseMeshRun(site);
+    }
     if (g_pass_is_reopen) {
         if (g_pass_requests == 0) {
             ++g_reopen_traffic.zero_requests;
@@ -134,10 +164,42 @@ void NotePassEnd(VkFramebuffer framebuffer) {
     g_last_ended_site = std::move(site);
 }
 
-void NotePassRequest() {
+void NotePassRequest(VkFramebuffer framebuffer) {
     std::scoped_lock lock{g_profile_end_mutex};
     ++g_pass_requests;
+    g_mesh_end_pending = false;
+    if (!std::exchange(g_mesh_request_pending, false)) {
+        CloseMeshRun("another draw or clear");
+        return;
+    }
+    ++g_mesh_runs.draws;
+    if (g_mesh_run != 0 && framebuffer == g_mesh_run_framebuffer) {
+        ++g_mesh_run;
+        return;
+    }
+    CloseMeshRun("a mesh draw on another framebuffer");
+    g_mesh_run = 1;
+    g_mesh_run_framebuffer = framebuffer;
 }
+
+// Buffer copies that ended an open pass, by caller and reason
+struct CopyInPass {
+    u64 count{};
+    u64 bytes{};
+};
+std::map<std::string, CopyInPass> g_copies_in_pass;
+
+// EDEN_NX2_TEST_EXTRA_REOPENS=<n>: up to n times per guest frame, a draw that continues an open
+// pass of at least 1920x1080 with colour and depth ends it and begins it again, to measure what
+// one reopen costs.
+u32 TestExtraReopens() {
+    static const u32 count = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEST_EXTRA_REOPENS");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+    return count;
+}
+std::atomic<u32> g_test_reopens_left{};
 
 void CountRenderPassEnd(const char* file, u32 line) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
@@ -202,6 +264,40 @@ void ReportSubmitCounts() {
         LOG_INFO(Render_Vulkan, "Render pass reopen {:.0f}/s of {:.0f}/s ends at {}",
                  static_cast<double>(sites[i].first.reopened) / seconds,
                  static_cast<double>(sites[i].first.ends) / seconds, sites[i].second);
+    }
+    MeshRunStats runs;
+    std::vector<std::pair<CopyInPass, std::string>> copies;
+    {
+        std::scoped_lock lock{g_profile_end_mutex};
+        runs = std::exchange(g_mesh_runs, {});
+        for (const auto& [site, counts] : g_copies_in_pass) {
+            copies.emplace_back(counts, site);
+        }
+        g_copies_in_pass.clear();
+    }
+    if (runs.draws != 0) {
+        std::string enders;
+        for (const auto& [reason, count] : runs.enders) {
+            enders += fmt::format(", {:.0f}/s by {}", static_cast<double>(count) / seconds, reason);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Emulated mesh draws {:.0f}/s in runs of 1: {:.0f}/s, 2: {:.0f}/s, 3-4: {:.0f}/s, "
+                 "5-8: {:.0f}/s, 9+: {:.0f}/s; runs ended{}",
+                 static_cast<double>(runs.draws) / seconds,
+                 static_cast<double>(runs.runs[0]) / seconds,
+                 static_cast<double>(runs.runs[1]) / seconds,
+                 static_cast<double>(runs.runs[2]) / seconds,
+                 static_cast<double>(runs.runs[3]) / seconds,
+                 static_cast<double>(runs.runs[4]) / seconds, enders);
+    }
+    std::sort(copies.begin(), copies.end(),
+              [](const auto& a, const auto& b) { return a.first.count > b.first.count; });
+    for (size_t i = 0; i < copies.size() && i < 8; ++i) {
+        LOG_INFO(Render_Vulkan, "Buffer copy in an open pass {:.0f}/s, {:.1f} KiB each, at {}",
+                 static_cast<double>(copies[i].first.count) / seconds,
+                 static_cast<double>(copies[i].first.bytes) / 1024.0 /
+                     static_cast<double>(copies[i].first.count),
+                 copies[i].second);
     }
     const auto per_s = [seconds](double value) { return value / seconds; };
     LOG_INFO(Render_Vulkan,
@@ -639,7 +735,7 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     if (deferred_clear.framebuffer == framebuffer) {
         RealizeDeferredClear();
         if (VideoCommon::Nx2Profile::Enabled()) {
-            NotePassRequest();
+            NotePassRequest(framebuffer->Handle());
         }
         return;
     }
@@ -657,7 +753,21 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
         render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
         if (VideoCommon::Nx2Profile::Enabled()) {
-            NotePassRequest();
+            NotePassRequest(framebuffer_handle);
+        }
+        if (TestExtraReopens() != 0 && render_area.width >= 1920 && render_area.height >= 1080) {
+            const RenderPassKey& key = framebuffer->RenderPassKeyBase();
+            const bool has_color = std::ranges::any_of(key.color_formats, [](auto format) {
+                return format != VideoCore::Surface::PixelFormat::Invalid;
+            });
+            const bool has_depth = key.depth_format != VideoCore::Surface::PixelFormat::Invalid;
+            u32 left = g_test_reopens_left.load(std::memory_order_relaxed);
+            if (has_color && has_depth && left != 0 &&
+                g_test_reopens_left.compare_exchange_strong(left, left - 1)) {
+                CountRenderPassEnd("TEST_EXTRA_REOPENS", 0);
+                EndRenderPass();
+                BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
+            }
         }
         return;
     }
@@ -668,8 +778,32 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     EndRenderPass();
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
     if (VideoCommon::Nx2Profile::Enabled()) {
-        NotePassRequest();
+        NotePassRequest(framebuffer_handle);
     }
+}
+
+void Scheduler::NoteMeshEmulatedDraw() {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    std::scoped_lock lock{g_profile_end_mutex};
+    g_mesh_request_pending = true;
+    g_mesh_end_pending = state.renderpass != VK_NULL_HANDLE;
+}
+
+void Scheduler::NoteFrameForTestReopens() {
+    g_test_reopens_left.store(TestExtraReopens(), std::memory_order_relaxed);
+}
+
+void NoteProfileCopyInPass(const char* reason, u64 bytes, std::source_location location) {
+    std::string_view name{location.file_name()};
+    if (const auto slash = name.find_last_of('/'); slash != std::string_view::npos) {
+        name.remove_prefix(slash + 1);
+    }
+    std::scoped_lock lock{g_profile_end_mutex};
+    CopyInPass& entry = g_copies_in_pass[fmt::format("{}:{} ({})", name, location.line(), reason)];
+    ++entry.count;
+    entry.bytes += bytes;
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {

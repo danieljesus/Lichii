@@ -1564,6 +1564,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (mesh_emulation) {
         // The mesh program runs as a compute dispatch outside the render pass and writes the
         // triangles the draw then reads; both use the descriptor set committed here.
+        scheduler.NoteMeshEmulatedDraw();
         scheduler.RequestOutsideRenderPassOperationContext();
         if (!IsBuilt()) {
             scheduler.Record([this](vk::CommandBuffer) {

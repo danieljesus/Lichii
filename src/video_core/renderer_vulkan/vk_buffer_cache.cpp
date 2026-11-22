@@ -662,7 +662,7 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
 
 void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                                    bool can_reorder_upload) {
+                                    bool can_reorder_upload, std::source_location location) {
     if (dst_buffer == VK_NULL_HANDLE || src_buffer == VK_NULL_HANDLE) {
         return;
     }
@@ -690,6 +690,16 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         return;
     }
 
+    if (VideoCommon::Nx2Profile::Enabled() && scheduler.IsRenderPassActive()) {
+        u64 bytes = 0;
+        for (const VkBufferCopy& copy : vk_copies) {
+            bytes += copy.size;
+        }
+        NoteProfileCopyInPass(src_buffer != staging_pool.StreamBuf()
+                                  ? "source is not the stream buffer"
+                                  : "stream source, not reordered",
+                              bytes, location);
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
     if (barrier && src_buffer == staging_pool.StreamBuf() && !vk_copies.empty()) {
         // Only in-order stream uploads share barriers. Dedicated staging buffers retain their

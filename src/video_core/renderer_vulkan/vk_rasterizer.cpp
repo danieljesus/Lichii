@@ -3928,6 +3928,7 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    scheduler.NoteFrameForTestReopens();
     buffer_cache_runtime.Nx2Slots().LandDone(
         std::bind_front(&RasterizerVulkan::Nx2LandOwedWord, this));
     if (VideoCore::Nx2Debug::HasRequests()) {
