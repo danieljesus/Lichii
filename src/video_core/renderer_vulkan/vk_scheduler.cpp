@@ -47,6 +47,98 @@ std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
 
+// EDEN_NX2_GPU_PROFILE: whether a render pass begins on the framebuffer the previous one ended on
+// (a reopen), by the site that ended the previous one, and what the reopened passes load and
+// store. On a tiled GPU (Apple's, through MoltenVK) a reopen loads and stores its attachments
+// again. All under g_profile_end_mutex.
+struct PassReopenSite {
+    u64 ends{};
+    u64 reopened{};
+};
+struct PassReopenTraffic {
+    u64 passes{};
+    u64 zero_requests{}; ///< Reopened passes ended with no draw or clear requested in them
+    u64 one_request{};
+    u64 color_loads{};
+    u64 color_stores{};
+    u64 depth_loads{};
+    u64 depth_stores{};
+    double color_load_px{};
+    double color_store_px{};
+    double depth_load_px{};
+    double depth_store_px{};
+};
+std::map<std::string, PassReopenSite> g_reopen_sites;
+PassReopenTraffic g_reopen_traffic;
+std::string g_pending_end_site;
+std::string g_last_ended_site;
+VkFramebuffer g_last_ended_framebuffer{};
+bool g_pass_is_reopen{};
+u64 g_pass_requests{};
+u32 g_begin_color_clear_mask{};
+bool g_begin_depth_clear{};
+
+void NotePassBegin(const Framebuffer* framebuffer) {
+    std::scoped_lock lock{g_profile_end_mutex};
+    g_pass_requests = 0;
+    g_pass_is_reopen =
+        g_last_ended_framebuffer != VkFramebuffer{} && framebuffer->Handle() == g_last_ended_framebuffer;
+    if (!g_pass_is_reopen) {
+        return;
+    }
+    ++g_reopen_sites[g_last_ended_site].reopened;
+    PassReopenTraffic& t = g_reopen_traffic;
+    ++t.passes;
+    const RenderPassKey& key = framebuffer->RenderPassKeyBase();
+    const VkExtent2D area = framebuffer->RenderArea();
+    const double pixels = static_cast<double>(area.width) * area.height;
+    const u32 color_clear = key.color_clear_mask | g_begin_color_clear_mask;
+    for (u32 slot = 0; slot < key.color_formats.size(); ++slot) {
+        if (key.color_formats[slot] == VideoCore::Surface::PixelFormat::Invalid) {
+            continue;
+        }
+        if ((color_clear & (1u << slot)) == 0) {
+            ++t.color_loads;
+            t.color_load_px += pixels;
+        }
+        if ((key.color_discard_mask & (1u << slot)) == 0) {
+            ++t.color_stores;
+            t.color_store_px += pixels;
+        }
+    }
+    if (key.depth_format != VideoCore::Surface::PixelFormat::Invalid) {
+        if (!key.depth_stencil_clear && !g_begin_depth_clear) {
+            ++t.depth_loads;
+            t.depth_load_px += pixels;
+        }
+        if (!key.depth_stencil_discard) {
+            ++t.depth_stores;
+            t.depth_store_px += pixels;
+        }
+    }
+}
+
+void NotePassEnd(VkFramebuffer framebuffer) {
+    std::scoped_lock lock{g_profile_end_mutex};
+    std::string site = g_pending_end_site.empty() ? std::string{"(no site: flush, submit or other)"}
+                                                  : std::exchange(g_pending_end_site, {});
+    ++g_reopen_sites[site].ends;
+    if (g_pass_is_reopen) {
+        if (g_pass_requests == 0) {
+            ++g_reopen_traffic.zero_requests;
+        } else if (g_pass_requests == 1) {
+            ++g_reopen_traffic.one_request;
+        }
+    }
+    g_last_ended_framebuffer = framebuffer;
+    g_last_ended_site = std::move(site);
+}
+
+void NotePassRequest() {
+    std::scoped_lock lock{g_profile_end_mutex};
+    ++g_pass_requests;
+}
+
 void CountRenderPassEnd(const char* file, u32 line) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
         return;
@@ -56,7 +148,9 @@ void CountRenderPassEnd(const char* file, u32 line) {
         name.remove_prefix(slash + 1);
     }
     std::scoped_lock lock{g_profile_end_mutex};
-    ++g_profile_ends[fmt::format("{}:{}", name, line)];
+    std::string site = fmt::format("{}:{}", name, line);
+    ++g_profile_ends[site];
+    g_pending_end_site = std::move(site);
 }
 
 void ReportSubmitCounts() {
@@ -92,6 +186,32 @@ void ReportSubmitCounts() {
         LOG_INFO(Render_Vulkan, "Render pass ends {:.0f}/s at {}",
                  static_cast<double>(ends[i].first) / seconds, ends[i].second);
     }
+    std::vector<std::pair<PassReopenSite, std::string>> sites;
+    PassReopenTraffic t;
+    {
+        std::scoped_lock lock{g_profile_end_mutex};
+        for (const auto& [site, counts] : g_reopen_sites) {
+            sites.emplace_back(counts, site);
+        }
+        g_reopen_sites.clear();
+        t = std::exchange(g_reopen_traffic, {});
+    }
+    std::sort(sites.begin(), sites.end(),
+              [](const auto& a, const auto& b) { return a.first.ends > b.first.ends; });
+    for (size_t i = 0; i < sites.size() && i < 16; ++i) {
+        LOG_INFO(Render_Vulkan, "Render pass reopen {:.0f}/s of {:.0f}/s ends at {}",
+                 static_cast<double>(sites[i].first.reopened) / seconds,
+                 static_cast<double>(sites[i].first.ends) / seconds, sites[i].second);
+    }
+    const auto per_s = [seconds](double value) { return value / seconds; };
+    LOG_INFO(Render_Vulkan,
+             "Reopened render passes {:.0f}/s ({:.0f}/s with no draw or clear, {:.0f}/s with one): "
+             "colour loads {:.0f}/s ({:.1f} Mpx/s), colour stores {:.0f}/s ({:.1f} Mpx/s), depth "
+             "loads {:.0f}/s ({:.1f} Mpx/s), depth stores {:.0f}/s ({:.1f} Mpx/s)",
+             per_s(t.passes), per_s(t.zero_requests), per_s(t.one_request), per_s(t.color_loads),
+             per_s(t.color_load_px) / 1e6, per_s(t.color_stores), per_s(t.color_store_px) / 1e6,
+             per_s(t.depth_loads), per_s(t.depth_load_px) / 1e6, per_s(t.depth_stores),
+             per_s(t.depth_store_px) / 1e6);
 }
 }
 
@@ -389,6 +509,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
                                     const VkClearValue* clear_values, u32 clear_value_count) {
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
+        NotePassBegin(framebuffer);
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
@@ -470,7 +591,11 @@ void Scheduler::RealizeDeferredClear() {
     const VkRenderPass renderpass = dc.framebuffer->RenderPassVariant(
         dc.color_clear_mask, dc.depth_stencil, color_discard_mask, depth_stencil_discard);
     EndRenderPass();
+    g_begin_color_clear_mask = dc.color_clear_mask;
+    g_begin_depth_clear = dc.depth_stencil;
     BeginRenderPassImpl(dc.framebuffer, renderpass, clear_values.data(), count);
+    g_begin_color_clear_mask = 0;
+    g_begin_depth_clear = false;
 }
 
 bool Scheduler::DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot,
@@ -513,6 +638,9 @@ void Scheduler::FlushDeferredClear() {
 void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_location location) {
     if (deferred_clear.framebuffer == framebuffer) {
         RealizeDeferredClear();
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            NotePassRequest();
+        }
         return;
     }
     const VkRenderPass renderpass = framebuffer->RenderPass();
@@ -528,6 +656,9 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     if (state.renderpass && framebuffer_handle == state.framebuffer &&
         render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            NotePassRequest();
+        }
         return;
     }
     if (state.renderpass) {
@@ -536,6 +667,9 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        NotePassRequest();
+    }
 }
 
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
@@ -1261,6 +1395,9 @@ void Scheduler::EndRenderPass()
         RealizeDeferredClear();
         if (!state.renderpass) {
             return;
+        }
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            NotePassEnd(state.framebuffer);
         }
         ++recording_epoch;
         fragment_barrier.Reset();
