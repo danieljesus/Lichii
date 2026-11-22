@@ -259,8 +259,10 @@ private:
 
     struct SavedVulkanCache {
         PipelineCacheSaveOutcome outcome;
-        /// Bytes of driver data written, when it was
-        size_t bytes;
+        /// Bytes of driver data read, when the read was usable (`read`), written or not: the
+        /// flush interval scales with them, as nx2's size query after every save did
+        size_t bytes = 0;
+        bool read = false;
 
         [[nodiscard]] bool Written() const {
             return outcome == PipelineCacheSaveOutcome::Whole ||
@@ -392,7 +394,8 @@ private:
     vk::PipelineCache vulkan_pipeline_cache;
     size_t pipelines_since_flush{};
     /// PipelineCacheFlushState (see AfterPipelineCacheSave); written by the serialization thread
-    /// and the loading thread
+    /// and the loading thread, and last_flush_failed also cleared by the GPU thread when it queues
+    /// a flush
     std::atomic<std::chrono::steady_clock::time_point> last_flush{};
     std::atomic<std::chrono::steady_clock::time_point> last_flush_attempt{};
     std::atomic_bool last_flush_failed{};
