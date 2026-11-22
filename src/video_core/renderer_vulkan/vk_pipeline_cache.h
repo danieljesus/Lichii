@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/mesh_vertex_input.h"
+#include "video_core/renderer_vulkan/pipeline_cache_data.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -255,14 +256,17 @@ private:
     void StopBackgroundJobs();
 
     struct SavedVulkanCache {
-        /// Bytes of driver data written
+        PipelineCacheSaveOutcome outcome;
+        /// Bytes of driver data written, when it was
         size_t bytes;
-        /// False when the driver gave part of the cache: pipelines were built into it while it
-        /// was read
-        bool whole;
+
+        [[nodiscard]] bool Written() const {
+            return outcome == PipelineCacheSaveOutcome::Whole ||
+                   outcome == PipelineCacheSaveOutcome::Partial;
+        }
     };
-    /// Empty unless the file was written and replaced the previous one.
-    std::optional<SavedVulkanCache> SerializeVulkanPipelineCache(
+    /// Written() when the file was written and replaced the previous one.
+    SavedVulkanCache SerializeVulkanPipelineCache(
         const std::filesystem::path& filename, const vk::PipelineCache& pipeline_cache,
         u32 cache_version);
 
@@ -271,6 +275,9 @@ private:
                                               u32 expected_cache_version);
 
     void QueueVulkanPipelineCacheFlush();
+    /// The timed flush's state from the atomics below, without the pipeline count
+    PipelineCacheFlushState LoadFlushState() const;
+    void StoreFlushState(const PipelineCacheFlushState& state);
 
     /// Queues one write of the driver pipeline cache file on the serialization thread, with no
     /// throttle, or writes it now where reading the cache during a build crashes. For the end of
@@ -380,9 +387,8 @@ private:
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
     size_t pipelines_since_flush{};
-    /// When a save last worked, when the last one tried (timed flush or the save after the boot
-    /// builds) ended, and whether it failed (PipelineCacheFlushState); written by the
-    /// serialization thread and the loading thread
+    /// PipelineCacheFlushState (see AfterPipelineCacheSave); written by the serialization thread
+    /// and the loading thread
     std::atomic<std::chrono::steady_clock::time_point> last_flush{};
     std::atomic<std::chrono::steady_clock::time_point> last_flush_attempt{};
     std::atomic_bool last_flush_failed{};
