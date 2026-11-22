@@ -150,6 +150,7 @@ add_executable(tests
     video_core/ampere_fast_fusion.cpp
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
+    video_core/astc_bcn_batches.cpp
     video_core/async_draw_policy.cpp
     video_core/bounded_store.cpp
     video_core/pipeline_eviction_policy.cpp
@@ -206,6 +207,7 @@ add_executable(tests
     video_core/vulkan_pipeline_binaries.cpp
     video_core/vulkan_buffer_oom.cpp
     video_core/vulkan_instance_extensions.cpp
+    video_core/vulkan_pipeline_cache_data.cpp
     video_core/pipeline_layout_cache.cpp
     video_core/shader_precache.cpp
     video_core/precompiled_store.cpp
