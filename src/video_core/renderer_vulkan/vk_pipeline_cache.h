@@ -258,7 +258,8 @@ private:
     bool SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
 
-    /// Sets vulkan_pipeline_cache_restored when the file's contents were read back.
+    /// Sets vulkan_pipeline_cache_restored when the driver kept the file's data (see
+    /// DecideVulkanCacheLoad).
     vk::PipelineCache LoadVulkanPipelineCache(const std::filesystem::path& filename,
                                               u32 expected_cache_version);
 

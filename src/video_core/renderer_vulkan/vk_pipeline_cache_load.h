@@ -16,8 +16,8 @@
 namespace Vulkan {
 
 /// Who driver pipeline cache data says it was made by: Vulkan starts it with a header naming the
-/// vendor, device and pipelineCacheUUID (MoltenVK's changes with each build of it). Used to say
-/// why a driver kept nothing of a file; whether it did is asked of the driver.
+/// vendor, device and pipelineCacheUUID (MoltenVK's changes with each build of it). Whether the
+/// driver kept a file is asked of the driver; the header only confirms a drop, and says why.
 enum class PipelineCacheDataOrigin { ThisDriver, OtherDriver, NoData, Unknown };
 
 /// NoData for data shorter than a version one header (a file of Lichii's header alone among
@@ -41,34 +41,44 @@ enum class PipelineCacheDataOrigin { ThisDriver, OtherDriver, NoData, Unknown };
     return same ? PipelineCacheDataOrigin::ThisDriver : PipelineCacheDataOrigin::OtherDriver;
 }
 
-/// What loading the driver pipeline cache file came to.
+/// What loading the driver pipeline cache file's data came to.
 enum class VulkanCacheLoad {
     /// The driver holds the file's data.
     Restored,
-    /// No file, or one the load already removes (damaged, of another Lichii cache version, or
-    /// rejected by the driver).
-    None,
+    /// The driver reports holding nothing, but the header says the data is this driver's: taken
+    /// as restored, as it always was. A driver may load initial data lazily, or report a size
+    /// that does not follow its contents; deleting a good cache on one signal would cost every
+    /// boot its builds.
+    RestoredHeldNothing,
     /// Driver data shorter than a version one header: a save that read nothing left it.
     NoData,
-    /// The driver was given the data and holds none of it: made by another driver version, or
-    /// dropped for a reason of its own. vkCreatePipelineCache succeeds either way.
+    /// The driver was given more than an empty cache of its own and holds none of it, and the
+    /// header does not say the data is its own: made by another driver version (MoltenVK's
+    /// pipelineCacheUUID changes with each build of it), or of an unknown header version the
+    /// driver dropped. vkCreatePipelineCache succeeds either way.
     DriverKeptNothing,
 };
 
-/// The size the driver reports for a cache created from `data_size` bytes of the file
-/// (`held_after_create`, empty when the query failed), against an empty cache's
-/// (`empty_size`). A driver that keeps nothing reports an empty cache's size.
+/// `data_size` bytes of the file were given to the driver, which then reports holding
+/// `held_after_create`; an empty cache it creates reports `empty_size` (each empty when its
+/// query failed: the data is then taken as kept, as it always was). `origin` is what the
+/// header says. Two signals are needed to drop a file: the driver holds no more than an empty
+/// cache although it was given more (a file holding an empty cache of this driver, as a boot
+/// save writes where no pipeline went through the cache, is kept), and the header does not say
+/// the data is this driver's. The header never turns a kept cache into a dropped one.
 [[nodiscard]] inline VulkanCacheLoad DecideVulkanCacheLoad(size_t data_size,
                                                            std::optional<size_t> held_after_create,
-                                                           size_t empty_size) {
+                                                           std::optional<size_t> empty_size,
+                                                           PipelineCacheDataOrigin origin) {
     if (data_size < sizeof(VkPipelineCacheHeaderVersionOne)) {
         return VulkanCacheLoad::NoData;
     }
-    // A query that failed tells nothing: the data is taken as kept, as it always was.
-    if (held_after_create && *held_after_create <= empty_size) {
-        return VulkanCacheLoad::DriverKeptNothing;
+    if (!held_after_create || !empty_size || *held_after_create > *empty_size ||
+        data_size <= *empty_size) {
+        return VulkanCacheLoad::Restored;
     }
-    return VulkanCacheLoad::Restored;
+    return origin == PipelineCacheDataOrigin::ThisDriver ? VulkanCacheLoad::RestoredHeldNothing
+                                                         : VulkanCacheLoad::DriverKeptNothing;
 }
 
 /// What the load does about it.
@@ -86,14 +96,13 @@ struct VulkanCacheLoadActions {
 [[nodiscard]] constexpr VulkanCacheLoadActions ActionsFor(VulkanCacheLoad load) {
     switch (load) {
     case VulkanCacheLoad::Restored:
+    case VulkanCacheLoad::RestoredHeldNothing:
         return {.restored = true, .remove_file = false};
-    case VulkanCacheLoad::None:
-        return {.restored = false, .remove_file = false};
     case VulkanCacheLoad::NoData:
     case VulkanCacheLoad::DriverKeptNothing:
         return {.restored = false, .remove_file = true};
     }
-    return {.restored = false, .remove_file = false};
+    return {.restored = true, .remove_file = false};
 }
 
 } // namespace Vulkan
