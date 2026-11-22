@@ -271,66 +271,116 @@ TEST_CASE("ShaderPrecache: a precache's record waits for a whole save where Lich
     REQUIRE(ShaderWarm::WhenToCommitWarmRecord(false, false) == WarmRecordCommit::Now);
 }
 
-TEST_CASE("ShaderPrecache: a pending record is written by the first whole save", "[video_core]") {
-    TempDir dir;
-    const auto warm = dir.path / "warm-compute.bin";
-    WriteBytes(warm, "precache file contents");
-    const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 4795, 10401, 0x1B02020A, 54, 7);
-    REQUIRE(stamp.has_value());
-    const std::unordered_set<u64> built{0x1, 0x2};
-    REQUIRE(ShaderWarm::WriteWarmProgress(warm, *stamp, built));
+namespace {
 
+struct PrecacheFile {
+    TempDir dir;
+    std::filesystem::path warm = dir.path / "warm-compute.bin";
+    std::optional<ShaderWarm::WarmStamp> stamp;
+    std::unordered_set<u64> built{0x1, 0x2};
+
+    PrecacheFile() {
+        WriteBytes(warm, "precache file contents");
+        stamp = ShaderWarm::CurrentWarmStamp(warm, 4795, 10401, 0x1B02020A, 54, 7);
+        REQUIRE(stamp.has_value());
+        REQUIRE(ShaderWarm::WriteWarmProgress(warm, *stamp, built));
+    }
+};
+
+} // Anonymous namespace
+
+TEST_CASE("ShaderPrecache: a pending record is written by the first whole save", "[video_core]") {
+    PrecacheFile file;
     ShaderWarm::PendingWarmRecord pending;
-    pending.Hold(ShaderWarm::FinishedWarmRecord(warm, stamp), "marker");
+    pending.Hold(ShaderWarm::FinishedWarmRecord(file.warm, file.stamp));
     REQUIRE(pending.Held());
-    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(file.warm).has_value());
     // The save queued after the precache, overtaken by the prebuild: partial or nothing. Kept.
-    REQUIRE_FALSE(pending.AfterSave(false).has_value());
+    REQUIRE_FALSE(pending.AfterSave(false, pending.TicketBeforeRead()).has_value());
     REQUIRE(pending.Held());
-    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
-    REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp) == built);
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(file.warm).has_value());
+    REQUIRE(ShaderWarm::ReadWarmProgress(file.warm, *file.stamp) == file.built);
     // A later whole save (a timed flush, a game change, the shutdown) writes it, once.
-    REQUIRE(pending.AfterSave(true) == std::optional<std::string>{"marker"});
+    REQUIRE(pending.AfterSave(true, pending.TicketBeforeRead()) ==
+            std::optional<std::string>{"marker"});
     REQUIRE_FALSE(pending.Held());
-    const auto marker = ShaderWarm::ReadWarmMarker(warm);
+    const auto marker = ShaderWarm::ReadWarmMarker(file.warm);
     REQUIRE(marker.has_value());
-    REQUIRE(marker->Matches(*stamp));
-    REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp).empty());
-    REQUIRE_FALSE(pending.AfterSave(true).has_value());
+    REQUIRE(marker->Matches(*file.stamp));
+    REQUIRE(ShaderWarm::ReadWarmProgress(file.warm, *file.stamp).empty());
+    REQUIRE_FALSE(pending.AfterSave(true, pending.TicketBeforeRead()).has_value());
+}
+
+TEST_CASE("ShaderPrecache: a save whose read began before the record was held does not write it",
+          "[video_core]") {
+    PrecacheFile file;
+    ShaderWarm::PendingWarmRecord pending;
+    // A save that took its ticket, and began reading, before the precache's last builds...
+    const auto before = pending.TicketBeforeRead();
+    pending.Hold(ShaderWarm::FinishedWarmRecord(file.warm, file.stamp));
+    // ...and ended whole after the record was held: its file lacks those builds.
+    REQUIRE_FALSE(pending.AfterSave(true, before).has_value());
+    REQUIRE(pending.Held());
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(file.warm).has_value());
+    REQUIRE(pending.AfterSave(true, pending.TicketBeforeRead()).has_value());
+    REQUIRE(ShaderWarm::ReadWarmMarker(file.warm).has_value());
+}
+
+TEST_CASE("ShaderPrecache: a held record is replaced by the next one", "[video_core]") {
+    PrecacheFile file;
+    ShaderWarm::PendingWarmRecord pending;
+    int first = 0;
+    pending.Hold([&] {
+        ++first;
+        return std::string{"first"};
+    });
+    pending.Hold(ShaderWarm::FinishedWarmRecord(file.warm, file.stamp));
+    REQUIRE(pending.AfterSave(true, pending.TicketBeforeRead()) ==
+            std::optional<std::string>{"marker"});
+    REQUIRE(first == 0);
+}
+
+TEST_CASE("ShaderPrecache: a skipped precache's progress is held like the marker",
+          "[video_core]") {
+    PrecacheFile file;
+    REQUIRE(std::filesystem::remove(ShaderWarm::WarmProgressPath(file.warm)));
+    ShaderWarm::PendingWarmRecord pending;
+    const std::unordered_set<u64> built{0x10, 0x20, 0x30};
+    pending.Hold([&]() -> std::string {
+        return ShaderWarm::WriteWarmProgress(file.warm, *file.stamp, built) ? "progress" : "";
+    });
+    REQUIRE_FALSE(pending.AfterSave(false, pending.TicketBeforeRead()).has_value());
+    REQUIRE(ShaderWarm::ReadWarmProgress(file.warm, *file.stamp).empty());
+    REQUIRE(pending.AfterSave(true, pending.TicketBeforeRead()) ==
+            std::optional<std::string>{"progress"});
+    REQUIRE(ShaderWarm::ReadWarmProgress(file.warm, *file.stamp) == built);
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(file.warm).has_value());
 }
 
 TEST_CASE("ShaderPrecache: a pending record is dropped by a new load", "[video_core]") {
-    TempDir dir;
-    const auto warm = dir.path / "warm-compute.bin";
-    WriteBytes(warm, "precache file contents");
-    const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 4795, 10401, 0x1B02020A, 54, 7);
-    REQUIRE(stamp.has_value());
+    PrecacheFile file;
     ShaderWarm::PendingWarmRecord pending;
-    pending.Hold(ShaderWarm::FinishedWarmRecord(warm, stamp), "marker");
+    pending.Hold(ShaderWarm::FinishedWarmRecord(file.warm, file.stamp));
     pending.Drop();
     REQUIRE_FALSE(pending.Held());
-    REQUIRE_FALSE(pending.AfterSave(true).has_value());
-    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+    REQUIRE_FALSE(pending.AfterSave(true, pending.TicketBeforeRead()).has_value());
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(file.warm).has_value());
 }
 
 TEST_CASE("ShaderPrecache: a marker that cannot be written keeps the progress", "[video_core]") {
-    TempDir dir;
-    const auto warm = dir.path / "warm-compute.bin";
-    WriteBytes(warm, "precache file contents");
-    const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 4795, 10401, 0x1B02020A, 54, 7);
-    REQUIRE(stamp.has_value());
-    const std::unordered_set<u64> built{0x1, 0x2};
-    REQUIRE(ShaderWarm::WriteWarmProgress(warm, *stamp, built));
-    // A directory where the marker goes: it cannot be written.
-    REQUIRE(std::filesystem::create_directory(ShaderWarm::WarmMarkerPath(warm)));
-    ShaderWarm::FinishedWarmRecord(warm, stamp)();
-    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
-    REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp) == built);
+    PrecacheFile file;
+    // A directory where the marker goes: it cannot be written, and the record says so.
+    REQUIRE(std::filesystem::create_directory(ShaderWarm::WarmMarkerPath(file.warm)));
+    ShaderWarm::PendingWarmRecord pending;
+    pending.Hold(ShaderWarm::FinishedWarmRecord(file.warm, file.stamp));
+    REQUIRE(pending.AfterSave(true, pending.TicketBeforeRead()) == std::optional<std::string>{""});
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(file.warm).has_value());
+    REQUIRE(ShaderWarm::ReadWarmProgress(file.warm, *file.stamp) == file.built);
     // A precache whose stamp could not be taken only drops its progress.
-    std::filesystem::remove(ShaderWarm::WarmMarkerPath(warm));
-    ShaderWarm::FinishedWarmRecord(warm, std::nullopt)();
-    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
-    REQUIRE(ShaderWarm::ReadWarmProgress(warm, *stamp).empty());
+    std::filesystem::remove(ShaderWarm::WarmMarkerPath(file.warm));
+    REQUIRE(ShaderWarm::FinishedWarmRecord(file.warm, std::nullopt)() == "progress removal");
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(file.warm).has_value());
+    REQUIRE(ShaderWarm::ReadWarmProgress(file.warm, *file.stamp).empty());
 }
 
 TEST_CASE("ShaderPrecache: a BNSH file gives each stage's code and control", "[video_core]") {

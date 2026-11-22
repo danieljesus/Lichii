@@ -46,7 +46,7 @@
 #include "video_core/shader_cache.h"
 #include "video_core/shader_cache_v2/cache.h"
 #include "video_core/shader_jobs.h"
-#include "video_core/shader_warm/shader_warm_builder.h"
+#include "video_core/shader_warm/pending_warm_record.h"
 #include "video_core/shader_stage_translation.h"
 
 namespace Core {

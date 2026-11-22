@@ -980,6 +980,10 @@ PipelineCache::~PipelineCache() {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION, "shutdown");
     }
+    if (pending_warm_record.Held()) {
+        LOG_INFO(Render_Vulkan, "Shader precache: its record was not written, as no whole save of "
+                                "the driver pipeline cache held its builds; it runs again");
+    }
     Common::NoteShutdownProgress();
     LogRuntimePipelineTotals();
     // After the records the serialization thread queued: its writer drains on destruction
@@ -1981,7 +1985,8 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         if (saved.read) {
             last_cache_size.store(saved.bytes, std::memory_order_relaxed);
         }
-        StoreFlushState(AfterPipelineCacheSave(LoadFlushState(), saved.outcome, end, end));
+        StoreFlushState(AfterPipelineCacheSave(LoadFlushState(), saved.outcome, end, end,
+                                               pending_warm_record.Held()));
     }
     if (state.statistics) {
         state.statistics->Report();
@@ -2225,32 +2230,39 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
     // written once a whole save holds the builds, where that save is what holds them: held as
     // the cache's pending record, which any later whole save writes (the one queued below, a
     // timed flush, a game change, the shutdown), as the prebuild that starts right after this
-    // can overtake the first. So also when loading was stopped after the last build, and no
-    // save is queued here.
-    std::function<void()> commit_record;
-    const char* record_name = "progress";
+    // can overtake the first. So also when loading was stopped, after the last build or
+    // during the builds, and no save is queued here: the shutdown's or the game change's save
+    // writes it.
+    ShaderWarm::WarmRecord commit_record;
+    std::string_view record_name;
     if (compute_pending && !skipped) {
-        commit_record = ShaderWarm::FinishedWarmRecord(warm_file, stamp(file_entries));
-        record_name = "marker";
+        const auto stamp_done = stamp(file_entries);
+        commit_record = ShaderWarm::FinishedWarmRecord(warm_file, stamp_done);
+        record_name = stamp_done ? "marker" : "progress removal";
     }
-    if (compute_pending && skipped && current && persisted && total_built != 0 &&
-        !stop_loading.stop_requested()) {
-        // A closed load saves no Vulkan pipeline cache below.
+    if (compute_pending && skipped && current && persisted && total_built != 0) {
         for (size_t index = 0; index < jobs.size(); ++index) {
             if (built[index]) {
                 built_before.insert(job_keys[index]);
             }
         }
-        commit_record = [warm_file, at = *current, keys = std::move(built_before)] {
-            ShaderWarm::WriteWarmProgress(warm_file, at, keys);
+        commit_record = [warm_file, at = *current,
+                         keys = std::move(built_before)]() -> std::string {
+            if (!ShaderWarm::WriteWarmProgress(warm_file, at, keys)) {
+                LOG_ERROR(Render_Vulkan, "Shader precache: couldn't write its progress {}",
+                          Common::FS::PathToUTF8String(ShaderWarm::WarmProgressPath(warm_file)));
+                return {};
+            }
+            return "progress";
         };
+        record_name = "progress";
     }
     if (commit_record) {
         if (ShaderWarm::WhenToCommitWarmRecord(vulkan_cache, total_built != 0) ==
             ShaderWarm::WarmRecordCommit::Now) {
-            commit_record();
+            (void)commit_record();
         } else {
-            pending_warm_record.Hold(std::move(commit_record), record_name);
+            pending_warm_record.Hold(std::move(commit_record));
             LOG_INFO(Render_Vulkan,
                      "Shader precache: its {} waits for a whole save of the driver pipeline cache",
                      record_name);
@@ -2324,7 +2336,8 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
             last_cache_size.store(saved.bytes, std::memory_order_relaxed);
         }
         StoreFlushState(AfterPipelineCacheSave(LoadFlushState(), saved.outcome, now,
-                                               std::chrono::steady_clock::now()));
+                                               std::chrono::steady_clock::now(),
+                                               pending_warm_record.Held()));
         flush_in_flight.store(false, std::memory_order_release);
     });
 }
@@ -2339,18 +2352,25 @@ void PipelineCache::QueueVulkanPipelineCacheSave() {
         if (saved.read) {
             last_cache_size.store(saved.bytes, std::memory_order_relaxed);
         }
-        // Overtaken by the prebuild that starts behind it: the next timed flush is due at the
-        // retry floor, and writes the precache's pending record if it is whole. Otherwise the
-        // flush timing is left as nx2 left it here.
-        if (saved.outcome == PipelineCacheSaveOutcome::NothingUsable) {
+        // Overtaken by the prebuild that starts behind it (nothing usable, or a part while the
+        // precache's record still waits): the next timed flush is due at the retry floor, and
+        // writes the record if it is whole. Otherwise the flush timing is left as nx2 left it.
+        const bool retry =
+            saved.outcome == PipelineCacheSaveOutcome::NothingUsable ||
+            (saved.outcome == PipelineCacheSaveOutcome::Partial && pending_warm_record.Held());
+        if (retry) {
             const auto end = std::chrono::steady_clock::now();
-            StoreFlushState(AfterPipelineCacheSave(LoadFlushState(), saved.outcome, end, end));
+            StoreFlushState(AfterPipelineCacheSave(LoadFlushState(), saved.outcome, end, end,
+                                               pending_warm_record.Held()));
         }
         if (!saved.Written()) {
             return;
         }
-        // Written: an earlier flush that got nothing has no retry left to make.
-        last_flush_failed.store(false, std::memory_order_relaxed);
+        // Written: an earlier flush that got nothing has no retry left to make, unless this one
+        // left the record waiting.
+        if (!retry) {
+            last_flush_failed.store(false, std::memory_order_relaxed);
+        }
         const bool whole = saved.outcome == PipelineCacheSaveOutcome::Whole;
         LOG_INFO(Render_Vulkan, "Driver pipeline cache saved after the shader precache, {} bytes{}",
                  saved.bytes, whole ? "" : " (part of it)");
@@ -2363,8 +2383,8 @@ void PipelineCache::QueueVulkanPipelineCacheSave() {
         save();
         return;
     }
-    // Not skipped when a timed flush is in flight: that one may have read the cache before the
-    // stage's last builds. The serialization thread runs the two one after the other.
+    // The serialization thread runs saves one after another; one whose read began before the
+    // precache's record was held does not write it (PendingWarmRecord's ticket).
     serialization_thread.QueueWork(save);
 }
 
@@ -3858,6 +3878,9 @@ PipelineCache::SavedVulkanCache PipelineCache::SerializeVulkanPipelineCache(
     // conforming driver an overtaken read is a smaller valid cache, which was saved, losing only
     // the newest pipelines; on MoltenVK it is no bytes, and the file was replaced by an empty
     // cache.
+    // Taken before the read: the precache's record is written only by a save whose read began
+    // once it was held, after the precache's last builds.
+    const auto record_ticket = pending_warm_record.TicketBeforeRead();
     PipelineCacheData data;
     if (pipeline_cache) {
         data = ReadPipelineCacheData(
@@ -3941,7 +3964,8 @@ PipelineCache::SavedVulkanCache PipelineCache::SerializeVulkanPipelineCache(
     LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {} ({} bytes of driver data)",
              Common::FS::PathToUTF8String(filename), cache_size);
     // The precache's record, held until a save holds all its builds.
-    if (const auto written = pending_warm_record.AfterSave(!data.Partial())) {
+    if (const auto written = pending_warm_record.AfterSave(data.Whole(), record_ticket);
+        written && !written->empty()) {
         LOG_INFO(Render_Vulkan, "Shader precache: its {} written after the {} save", *written,
                  which);
     }

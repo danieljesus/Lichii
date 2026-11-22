@@ -341,3 +341,31 @@ TEST_CASE("A driver pipeline cache flush that failed to write waits the interval
     CHECK_FALSE(Vulkan::PipelineCacheFlushDue(state, queued + 599s, interval, 128));
     CHECK(Vulkan::PipelineCacheFlushDue(state, queued + 600s, interval, 128));
 }
+
+TEST_CASE("A part saved while a precache's record waits is retried at the floor",
+          "[video_core][vulkan_pipeline_cache]") {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    using Vulkan::PipelineCacheSaveOutcome;
+    const Clock::time_point saved = Clock::now();
+    const auto queued = saved + 400s;
+    const auto ended = queued + 5s;
+    const Vulkan::PipelineCacheFlushState before{.last_saved = saved, .last_attempt = saved};
+    // The prebuild overtook the save after the precache: its record still waits.
+    auto waiting = Vulkan::AfterPipelineCacheSave(before, PipelineCacheSaveOutcome::Partial,
+                                                  queued, ended, true);
+    CHECK(waiting.last_failed);
+    CHECK(waiting.last_saved == saved);
+    waiting.pipelines = 1;
+    CHECK(Vulkan::PipelineCacheFlushDue(waiting, ended + Vulkan::PipelineCacheFlushRetryFloor,
+                                        std::chrono::seconds{300}, 128));
+    // Nothing waits: a part counts as a flush, as on nx2.
+    const auto plain = Vulkan::AfterPipelineCacheSave(before, PipelineCacheSaveOutcome::Partial,
+                                                      queued, ended, false);
+    CHECK_FALSE(plain.last_failed);
+    CHECK(plain.last_saved == queued);
+    // A write that failed is not retried soon, record or not.
+    CHECK_FALSE(Vulkan::AfterPipelineCacheSave(before, PipelineCacheSaveOutcome::Failed, queued,
+                                               ended, true)
+                    .last_failed);
+}

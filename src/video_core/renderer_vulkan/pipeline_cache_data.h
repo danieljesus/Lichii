@@ -161,9 +161,14 @@ enum class PipelineCacheSaveOutcome {
 /// again, and reading a large cache whole every floor would stall frames for nothing.
 [[nodiscard]] inline PipelineCacheFlushState AfterPipelineCacheSave(
     PipelineCacheFlushState state, PipelineCacheSaveOutcome outcome,
-    std::chrono::steady_clock::time_point queued, std::chrono::steady_clock::time_point ended) {
+    std::chrono::steady_clock::time_point queued, std::chrono::steady_clock::time_point ended,
+    bool record_waiting = false) {
     state.last_attempt = ended;
-    state.last_failed = outcome == PipelineCacheSaveOutcome::NothingUsable;
+    // A part saved while a precache's record waits for a whole save is retried the same way: the
+    // prebuild that overtook it passes, and the record would otherwise wait for 128 runtime
+    // pipelines and the interval, all session for a well-cached game.
+    state.last_failed = outcome == PipelineCacheSaveOutcome::NothingUsable ||
+                        (outcome == PipelineCacheSaveOutcome::Partial && record_waiting);
     if (!state.last_failed) {
         state.last_saved = queued;
     }

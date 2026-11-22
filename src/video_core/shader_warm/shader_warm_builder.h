@@ -14,6 +14,7 @@
 
 #include "common/common_types.h"
 #include "common/settings_enums.h"
+#include "video_core/shader_warm/pending_warm_record.h"
 
 namespace Core {
 class System;
@@ -116,35 +117,12 @@ enum class WarmRecordCommit { Now, AfterWholeSave };
     return lichii_saves_cache && built ? WarmRecordCommit::AfterWholeSave : WarmRecordCommit::Now;
 }
 
-/// The record of a precache that finished: writes the marker of `stamp`, when there is one, and
-/// then removes the progress, whose builds it now vouches for. A marker that cannot be written is
-/// logged, and the progress kept.
-[[nodiscard]] std::function<void()> FinishedWarmRecord(const std::filesystem::path& warm_file,
-                                                       std::optional<WarmStamp> stamp);
-
-/// What a precache recorded, held until a whole save of the pipeline cache that holds its builds:
-/// whichever save that is (the one queued after the precache, a timed flush, a game change, the
-/// shutdown), as the prebuild that starts right after the precache can overtake the first. A new
-/// title's load drops it. Safe to use from the loading and serialization threads.
-class PendingWarmRecord {
-public:
-    /// Holds `record` (`what` names it in the log), replacing one held before.
-    void Hold(std::function<void()> record, std::string what);
-
-    /// After a save of the cache: a whole one writes what is held and returns its name; a partial
-    /// or failed one keeps it, as does one with nothing held.
-    std::optional<std::string> AfterSave(bool whole);
-
-    /// Drops what is held.
-    void Drop();
-
-    [[nodiscard]] bool Held() const;
-
-private:
-    mutable std::mutex mutex;
-    std::function<void()> record;
-    std::string what;
-};
+/// The record of a precache that finished (see PendingWarmRecord): writes the marker of `stamp`,
+/// when there is one, and then removes the progress, whose builds it now vouches for; returns
+/// "marker", or "progress removal" without a stamp. A marker that cannot be written is logged,
+/// the progress kept, and nothing returned.
+[[nodiscard]] WarmRecord FinishedWarmRecord(const std::filesystem::path& warm_file,
+                                            std::optional<WarmStamp> stamp);
 
 /// "Precompile All Shaders" of one game (same folder, extension .requested): the game's precache
 /// runs before it starts whatever precache_shaders says, and the boot builds every pipeline the
