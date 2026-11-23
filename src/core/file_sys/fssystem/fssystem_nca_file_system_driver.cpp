@@ -44,6 +44,12 @@ s64 GetBodySize(const std::shared_ptr<NcaReader>& reader) {
     return reader != nullptr ? static_cast<s64>(reader->GetSharedBodyStorage()->GetSize()) : 0;
 }
 
+// A table read into memory whole lies in the NCA's own file, so it cannot be larger than the bytes
+// that file holds, whatever size the file's container claims and whatever layers lie between.
+s64 GetBodyHeldSize(const std::shared_ptr<NcaReader>& reader) {
+    return reader != nullptr ? static_cast<s64>(reader->GetSharedBodyStorage()->GetHeldSize()) : 0;
+}
+
 class SharedNcaBodyStorage : public IReadOnlyStorage {
     LICHII_NON_COPYABLE(SharedNcaBodyStorage);
     LICHII_NON_MOVEABLE(SharedNcaBodyStorage);
@@ -558,6 +564,7 @@ Result NcaFileSystemDriver::CreateSparseStorageMetaStorage(VirtualFile* out,
                                     AlignmentStorageRequirement::None));
 
     // Create buffered storage.
+    R_UNLESS(meta_size <= GetBodyHeldSize(m_reader), ResultNcaBaseStorageOutOfRangeB);
     std::vector<u8> meta_data(meta_size);
     decrypted_storage->Read(meta_data.data(), meta_size, 0);
 
@@ -894,6 +901,7 @@ Result NcaFileSystemDriver::CreateAesCtrExStorageMetaStorage(
     R_UNLESS(meta_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
 
     // Create buffered storage.
+    R_UNLESS(meta_size <= GetBodyHeldSize(m_reader), ResultNcaBaseStorageOutOfRangeB);
     std::vector<u8> meta_data(meta_size);
     meta_storage->Read(meta_data.data(), meta_size, 0);
 
@@ -1018,6 +1026,8 @@ Result NcaFileSystemDriver::CreateIndirectStorageMetaStorage(VirtualFile* out,
     R_UNLESS(meta_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
 
     // Create buffered storage.
+    R_UNLESS(patch_info.indirect_size <= GetBodyHeldSize(m_reader),
+             ResultNcaBaseStorageOutOfRangeE);
     std::vector<u8> meta_data(patch_info.indirect_size);
     meta_storage->Read(meta_data.data(), patch_info.indirect_size, 0);
 
