@@ -40,6 +40,7 @@
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs_vector.h"
+#include "core/file_sys/xts_archive.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/loader/loader.h"
 #include "core/loader/nsp.h"
@@ -134,6 +135,37 @@ TEST_CASE("PFS0 rejects a table larger than the file without allocating it",
     Put(bytes, 8, u32{0xFFFFFFFF});
     PartitionFilesystem pfs{MakeFile(std::move(bytes))};
     REQUIRE(pfs.GetStatus() == Loader::ResultStatus::ErrorIncorrectPFSFileSize);
+}
+
+TEST_CASE("PFS0 keeps an entry that runs past the end of its file at the bytes it holds",
+          "[core][file_sys]") {
+    auto bytes =
+        MakePfs0WithFiles({{"a", std::vector<u8>(0x100, 1)}, {"b", std::vector<u8>(0x100, 2)}});
+    bytes.pop_back();
+    const PartitionFilesystem truncated{MakeFile(bytes)};
+    REQUIRE(truncated.GetStatus() == Loader::ResultStatus::Success);
+    REQUIRE(truncated.GetFile("a")->GetSize() == 0x100);
+    REQUIRE(truncated.GetFile("b")->GetSize() == 0xFF);
+    REQUIRE(truncated.GetFile("b")->ReadAllBytes() == std::vector<u8>(0xFF, 2));
+
+    // An entry that starts past the end keeps nothing.
+    Put(bytes, 0x10 + 0x18, u64{0x1000});
+    const PartitionFilesystem past{MakeFile(std::move(bytes))};
+    REQUIRE(past.GetStatus() == Loader::ResultStatus::Success);
+    REQUIRE(past.GetFile("b")->GetSize() == 0);
+}
+
+TEST_CASE("NAX rejects a file size that does not fit in its file, however large",
+          "[core][file_sys]") {
+    std::vector<u8> bytes(0x4000 + 0x200);
+    Put(bytes, 0x20, Common::MakeMagic('N', 'A', 'X', '0'));
+    Put(bytes, 0x20 + 8 + 0x20, u64{0x400});
+    REQUIRE(NAX{MakeFile(bytes), {}}.GetStatus() ==
+            Loader::ResultStatus::ErrorIncorrectNAXFileSize);
+    // A size whose sum with the header padding wraps around.
+    Put(bytes, 0x20 + 8 + 0x20, ~u64{0} - 0x3FFF);
+    REQUIRE(NAX{MakeFile(std::move(bytes)), {}}.GetStatus() ==
+            Loader::ResultStatus::ErrorIncorrectNAXFileSize);
 }
 
 TEST_CASE("PFS0 with more than 65535 entries reads every entry", "[core][file_sys]") {
