@@ -50,6 +50,11 @@ public:
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
         return std::nullopt;
     }
+    /// The live register value, and the driver constant folding the backends derive from it.
+    void SetTextureBound(u32 value, bool proprietary_driver) {
+        texture_bound = value;
+        is_proprietary_driver = proprietary_driver;
+    }
 
 private:
     std::map<std::pair<u32, u32>, u32> words;
@@ -182,4 +187,150 @@ TEST_CASE("Markers of the retired layout are dropped", "[video_core]") {
                          {{1, Color2D}, {2, Color2D}, {3, Color2D}, {6, Color3D}}};
     REQUIRE(!file.AnswersHoldFor(live, &why));
     REQUIRE(std::string_view{why} == "constant buffer value");
+}
+
+namespace {
+/// A kept translation with one texture descriptor on `bank` (a handle table's if `handle_program`).
+Shader::Info OneTexture(u32 bank, u32 handle_program = ~0U) {
+    Shader::Info info{};
+    Shader::TextureDescriptor desc{};
+    desc.type = Color2D;
+    desc.cbuf_index = bank;
+    desc.cbuf_offset = 0x10;
+    desc.count = 1;
+    desc.handle_program = handle_program;
+    info.texture_descriptors.push_back(desc);
+    return info;
+}
+
+/// Recorded with the fixture's texture bound buffer, 2 (the record's driver folding is then on).
+VideoCommon::FileEnvironment RecordedWithBound2() {
+    WordEnvironment recorded{{{{1, 0x20}, 5}}, {}};
+    (void)recorded.ReadCbufValue(1, 0x20);
+    return Record(recorded);
+}
+} // namespace
+
+TEST_CASE("A translation with no descriptor on the recorded bound buffer holds under another value",
+          "[video_core]") {
+    // A bound texture instruction's descriptor takes the bound buffer as its bank (texture_pass
+    // MakeInst), so a translation with none on the recorded bank had none.
+    auto file = RecordedWithBound2();
+    const char* why = "";
+    const Shader::Info no_handles{};
+    const Shader::Info other_bank = OneTexture(3);
+
+    SECTION("No handle descriptor, the same driver constant folding") {
+        WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+        live.SetTextureBound(0, true);
+        REQUIRE(file.AnswersHoldFor(live, &why, ~0U, &no_handles));
+    }
+    SECTION("A bindless descriptor on another bank, the same driver constant folding") {
+        WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+        live.SetTextureBound(0, true);
+        REQUIRE(file.AnswersHoldFor(live, &why, ~0U, &other_bank));
+    }
+    SECTION("Another value that turns the driver constant folding off") {
+        WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+        live.SetTextureBound(0, false);
+        REQUIRE(!file.AnswersHoldFor(live, &why, ~0U, &no_handles));
+        REQUIRE(std::string_view{why} == "texture bound buffer folding");
+    }
+}
+
+TEST_CASE("A translation with a descriptor on the recorded bound buffer keeps its value",
+          "[video_core]") {
+    // It may be a bound instruction's, which read its handle from that bank.
+    auto file = RecordedWithBound2();
+    WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+    live.SetTextureBound(0, true);
+    const char* why = "";
+    const auto rejected = [&](const Shader::Info& on_bank) {
+        return !file.AnswersHoldFor(live, &why, ~0U, &on_bank) &&
+               std::string_view{why} == "texture bound buffer";
+    };
+    REQUIRE(rejected(OneTexture(2)));
+    Shader::Info image{};
+    Shader::ImageDescriptor image_desc{};
+    image_desc.type = Color2D;
+    image_desc.cbuf_index = 2;
+    image_desc.count = 1;
+    image_desc.handle_program = ~0U;
+    image.image_descriptors.push_back(image_desc);
+    REQUIRE(rejected(image));
+    Shader::Info texture_buffer{};
+    Shader::TextureBufferDescriptor texture_buffer_desc{};
+    texture_buffer_desc.cbuf_index = 2;
+    texture_buffer_desc.count = 1;
+    texture_buffer_desc.handle_program = ~0U;
+    texture_buffer.texture_buffer_descriptors.push_back(texture_buffer_desc);
+    REQUIRE(rejected(texture_buffer));
+    Shader::Info image_buffer{};
+    Shader::ImageBufferDescriptor image_buffer_desc{};
+    image_buffer_desc.cbuf_index = 2;
+    image_buffer_desc.count = 1;
+    image_buffer_desc.handle_program = ~0U;
+    image_buffer.image_buffer_descriptors.push_back(image_buffer_desc);
+    REQUIRE(rejected(image_buffer));
+}
+
+TEST_CASE("A handle table descriptor does not read the bound buffer", "[video_core]") {
+    // MakeInst gives a handle computed by a handle program bank 0 and offset 0 as placeholders:
+    // the handle comes from a storage buffer, so the record holds even when the recorded value is 0.
+    // (Recorded with 0, a guest record's driver folding is off; the live value keeps it off.)
+    WordEnvironment recorded{{{{1, 0x20}, 5}}, {}};
+    recorded.SetTextureBound(0, false);
+    (void)recorded.ReadCbufValue(1, 0x20);
+    auto file = Record(recorded);
+    const Shader::Info table = OneTexture(0, 0);
+    WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+    live.SetTextureBound(3, false);
+    const char* why = "";
+    REQUIRE(file.AnswersHoldFor(live, &why, ~0U, &table));
+}
+
+TEST_CASE("Without a kept translation the texture bound buffer is compared", "[video_core]") {
+    auto file = RecordedWithBound2();
+    WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+    live.SetTextureBound(0, true);
+    const char* why = "";
+    REQUIRE(!file.AnswersHoldFor(live, &why));
+    REQUIRE(std::string_view{why} == "texture bound buffer");
+}
+
+TEST_CASE("Each environment takes the kept translation of its pipeline slot", "[video_core]") {
+    // Infos by slot, vertex B to fragment; environments in slot order with empty slots skipped.
+    const std::array<Shader::Info, 5> kept{};
+    const std::array<const Shader::Info*, 5> slots{&kept[0], &kept[1], &kept[2], &kept[3],
+                                                   &kept[4]};
+    SECTION("Vertex B and fragment, with gaps between") {
+        const std::array<u64, 6> hashes{0, 11, 0, 0, 0, 55};
+        const auto infos = VideoCommon::KeptInfosByEnvironment(hashes, slots);
+        REQUIRE(infos[0] == &kept[0]);
+        REQUIRE(infos[1] == &kept[4]);
+        REQUIRE(infos[2] == nullptr);
+    }
+    SECTION("Task and mesh programs in the vertex B and tessellation control slots") {
+        const std::array<u64, 6> hashes{0, 77, 88, 0, 0, 55};
+        const auto infos = VideoCommon::KeptInfosByEnvironment(hashes, slots);
+        REQUIRE(infos[0] == &kept[0]);
+        REQUIRE(infos[1] == &kept[1]);
+        REQUIRE(infos[2] == &kept[4]);
+    }
+    SECTION("A vertex A program has none, and shifts the others") {
+        const std::array<u64, 6> hashes{10, 11, 0, 0, 44, 55};
+        const auto infos = VideoCommon::KeptInfosByEnvironment(hashes, slots);
+        REQUIRE(infos[0] == nullptr);
+        REQUIRE(infos[1] == &kept[0]);
+        REQUIRE(infos[2] == &kept[3]);
+        REQUIRE(infos[3] == &kept[4]);
+    }
+    SECTION("A slot without a kept translation") {
+        std::array<const Shader::Info*, 5> partial = slots;
+        partial[4] = nullptr;
+        const std::array<u64, 6> hashes{0, 11, 0, 0, 0, 55};
+        const auto infos = VideoCommon::KeptInfosByEnvironment(hashes, partial);
+        REQUIRE(infos[0] == &kept[0]);
+        REQUIRE(infos[1] == nullptr);
+    }
 }
