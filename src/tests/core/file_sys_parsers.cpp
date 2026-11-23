@@ -39,6 +39,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/submission_package.h"
+#include "core/file_sys/vfs/vfs_offset.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/loader/loader.h"
@@ -295,14 +296,20 @@ struct PlaintextNca {
         fs.encryption_type = NcaFsHeader::EncryptionType::None;
     }
 
-    Result Open() const {
+    // claimed_size, when larger than the bytes, is the size a container such as an NSP gives the
+    // NCA: the file is opened as a range of that size over the bytes it really holds.
+    Result Open(size_t claimed_size = 0) const {
         std::vector<u8> bytes(std::max<size_t>(0x4C00, 0xC00 + section.size()));
         std::memcpy(bytes.data(), &header, sizeof(header));
         std::memcpy(bytes.data() + sizeof(header), &fs, sizeof(fs));
         std::copy(section.begin(), section.end(), bytes.begin() + 0xC00);
 
+        VirtualFile file = MakeFile(std::move(bytes));
+        if (claimed_size > file->GetSize()) {
+            file = std::make_shared<OffsetVfsFile>(std::move(file), claimed_size, 0);
+        }
         auto reader = std::make_shared<NcaReader>();
-        R_TRY(reader->Initialize(MakeFile(std::move(bytes)), GetCryptoConfiguration(),
+        R_TRY(reader->Initialize(std::move(file), GetCryptoConfiguration(),
                                  GetNcaCompressionConfiguration()));
         NcaFileSystemDriver driver{reader};
         VirtualFile storage;
@@ -724,6 +731,29 @@ PlaintextNca MakeIndirectNca(s64 end) {
 
 TEST_CASE("NCA with a valid indirect table opens", "[core][file_sys]") {
     REQUIRE(MakeIndirectNca(0x8000).Open() == ResultSuccess);
+}
+
+TEST_CASE("NCA with a valid indirect table opens in a container that claims more than it holds",
+          "[core][file_sys]") {
+    REQUIRE(MakeIndirectNca(0x8000).Open(size_t{1} << 41) == ResultSuccess);
+}
+
+TEST_CASE("NCA rejects an indirect table its container claims but does not hold, without "
+          "allocating it",
+          "[core][file_sys]") {
+    auto nca = MakeIndirectNca(0x8000);
+    nca.header.fs_info[0].end_sector = 0xFFFFFF06;
+    nca.fs.patch_info.indirect_size = s64{1} << 40;
+    REQUIRE(nca.Open(size_t{1} << 41) == ResultNcaBaseStorageOutOfRangeE);
+}
+
+TEST_CASE("NCA rejects an indirect table its container claims but does not hold behind AES-XTS",
+          "[core][file_sys]") {
+    auto nca = MakeIndirectNca(0x8000);
+    nca.fs.encryption_type = NcaFsHeader::EncryptionType::AesXts;
+    nca.header.fs_info[0].end_sector = 0xFFFFFF06;
+    nca.fs.patch_info.indirect_size = s64{1} << 40;
+    REQUIRE(nca.Open(size_t{1} << 41) == ResultNcaBaseStorageOutOfRangeE);
 }
 
 TEST_CASE("NCA rejects a hash region larger than the file behind an indirect layer",

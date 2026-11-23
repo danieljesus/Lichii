@@ -3,7 +3,9 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <bit>
+#include <vector>
 
 #include "core/file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_storage.h"
@@ -42,6 +44,26 @@ constexpr bool IsRangeWithin(s64 offset, s64 size, s64 end) {
 // are read into memory whole are also checked against the bytes the NCAs actually store.
 s64 GetBodySize(const std::shared_ptr<NcaReader>& reader) {
     return reader != nullptr ? static_cast<s64>(reader->GetSharedBodyStorage()->GetSize()) : 0;
+}
+
+// The body storage's size is not always the file's: an NCA inside an NSP or XCI is a range of
+// the container whose size the container's header gives. A table read into memory whole is
+// therefore read a piece at a time, so the buffer only grows as far as the storage returns
+// bytes, and a table the file does not hold in full is rejected.
+bool ReadWholeTable(const VirtualFile& storage, s64 size, std::vector<u8>& out) {
+    constexpr s64 PieceSize = s64{1} << 20;
+    out.clear();
+    for (s64 done = 0; done < size;) {
+        const s64 piece = std::min(PieceSize, size - done);
+        out.resize(static_cast<size_t>(done + piece));
+        if (storage->Read(out.data() + done, static_cast<size_t>(piece),
+                          static_cast<size_t>(done)) != static_cast<size_t>(piece)) {
+            out.clear();
+            return false;
+        }
+        done += piece;
+    }
+    return true;
 }
 
 class SharedNcaBodyStorage : public IReadOnlyStorage {
@@ -1018,8 +1040,9 @@ Result NcaFileSystemDriver::CreateIndirectStorageMetaStorage(VirtualFile* out,
     R_UNLESS(meta_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
 
     // Create buffered storage.
-    std::vector<u8> meta_data(patch_info.indirect_size);
-    meta_storage->Read(meta_data.data(), patch_info.indirect_size, 0);
+    std::vector<u8> meta_data;
+    R_UNLESS(ReadWholeTable(meta_storage, patch_info.indirect_size, meta_data),
+             ResultNcaBaseStorageOutOfRangeE);
 
     auto buffered_storage = std::make_shared<VectorVfsFile>(std::move(meta_data));
     R_UNLESS(buffered_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
