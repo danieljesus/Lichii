@@ -3442,9 +3442,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
             format_traits |= FileEnvironment::FormatTraitSnorm;
         }
     }
+    const auto env_infos = VideoCommon::KeptInfosByEnvironment(graphics_key.unique_hashes, info_ptrs);
+    ASSERT(live.size() <= env_infos.size());
     for (size_t i = 0; i < live.size(); ++i) {
         const char* why = "";
-        if (!(*recorded)[i].AnswersHoldFor(*live[i], &why, format_traits)) {
+        if (!(*recorded)[i].AnswersHoldFor(*live[i], &why, format_traits, env_infos[i])) {
             CountPrecompiledReason(why);
             return nullptr;
         }
@@ -3614,7 +3616,7 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
             format_traits |= FileEnvironment::FormatTraitSnorm;
         }
         const char* why = "";
-        if (!recorded.AnswersHoldFor(env, &why, format_traits)) {
+        if (!recorded.AnswersHoldFor(env, &why, format_traits, &info)) {
             if (!first_reason) {
                 first_reason = why;
             }
