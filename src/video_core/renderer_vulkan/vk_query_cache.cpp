@@ -100,6 +100,13 @@ public:
     }
 
     void Sync(size_t start, size_t size, u64 written_tick) {
+        // TEST ONLY: with EDEN_NX2_TEST_NO_TILER_SAMPLES no query ran; report them all visible.
+        static const bool test_skip{std::getenv("EDEN_NX2_TEST_NO_TILER_SAMPLES") != nullptr &&
+                                    IsTilerQueryDriver(device.GetDriverID())};
+        if (test_skip) {
+            std::fill(host_results.begin() + start, host_results.begin() + start + size, u64{1000});
+            return;
+        }
         const auto& dev = device.GetLogical();
         const auto read = [&] {
             return dev.GetQueryResults(*query_pool, static_cast<u32>(start),
@@ -215,6 +222,14 @@ public:
 
         ReserveHostQuery();
 
+        // TEST ONLY: EDEN_NX2_TEST_NO_TILER_SAMPLES records no samples query on tiler drivers,
+        // whose results PresyncWrites drops anyway.
+        static const bool test_skip{std::getenv("EDEN_NX2_TEST_NO_TILER_SAMPLES") != nullptr &&
+                                    IsTilerQueryDriver(device.GetDriverID())};
+        if (test_skip) {
+            has_started = true;
+            return;
+        }
         scheduler.Record([query_pool = current_query_pool,
                                  query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
             const bool use_precise = Settings::IsGPULevelHigh();
@@ -228,6 +243,12 @@ public:
 
     void PauseCounter() override {
         if (!has_started) {
+            return;
+        }
+        static const bool test_skip{std::getenv("EDEN_NX2_TEST_NO_TILER_SAMPLES") != nullptr &&
+                                    IsTilerQueryDriver(device.GetDriverID())};
+        if (test_skip) {
+            has_started = false;
             return;
         }
         scheduler.Record([query_pool = current_query_pool,
