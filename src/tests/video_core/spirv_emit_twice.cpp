@@ -3,6 +3,9 @@
 // pipeline's reference module and then the pipeline's module from the same program.
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -156,6 +159,14 @@ Emitted EmitTwice(Build&& build, bool texture = false) {
     const auto before{Snapshot(block)};
     emitted.first = Backend::SPIRV::EmitSPIRV(profile, program);
     const auto after_first{Snapshot(block)};
+    if (const char* dir = std::getenv("LICHII_SPIRV_EMIT_DUMP")) {
+        static int index = 0;
+        const std::string path{std::string{dir} + "/" + std::to_string(index++) + ".spv"};
+        if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(emitted.first.data(), 4, emitted.first.size(), f);
+            std::fclose(f);
+        }
+    }
     emitted.second = Backend::SPIRV::EmitSPIRV(profile, program);
     emitted.ir_kept = after_first == before && Snapshot(block) == before;
     return emitted;
