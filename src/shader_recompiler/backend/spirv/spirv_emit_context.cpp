@@ -474,11 +474,13 @@ void VectorTypes::Define(Sirit::Module& sirit_ctx, Id base_type, std::string_vie
 }
 
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_,
-                         IR::Program& program, Bindings& bindings, bool vulkan_memory_model_)
+                         IR::Program& program, Bindings& bindings, bool vulkan_memory_model_,
+                         u32 shared_memory_size_)
     : Sirit::Module(profile_.supported_spirv), profile{profile_}, runtime_info{runtime_info_},
       requires_coherent_global_memory{program.info.requires_coherent_global_memory},
       requires_coherent_image_memory{program.info.requires_coherent_image_memory},
-      vulkan_memory_model{vulkan_memory_model_}, stage{program.stage},
+      vulkan_memory_model{vulkan_memory_model_}, shared_memory_size{shared_memory_size_},
+      stage{program.stage},
       texture_rescaling_index{bindings.texture_scaling_index},
       image_rescaling_index{bindings.image_scaling_index} {
     const bool is_unified{profile.unified_descriptor_binding};
@@ -654,11 +656,11 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
         profile.support_explicit_workgroup_layout &&
         (!program.info.uses_int8 || profile.support_workgroup_layout_8bit_access) &&
         (!program.info.uses_int16 || profile.support_workgroup_layout_16bit_access);
-    if (program.shared_memory_size == 0) {
+    if (shared_memory_size == 0) {
         return;
     }
     const auto make{[&](Id element_type, u32 element_size) {
-        const u32 num_elements{Common::DivCeil(program.shared_memory_size, element_size)};
+        const u32 num_elements{Common::DivCeil(shared_memory_size, element_size)};
         const Id array_type{TypeArray(element_type, Const(num_elements))};
         Decorate(array_type, spv::Decoration::ArrayStride, element_size);
 
@@ -693,7 +695,7 @@ void EmitContext::DefineSharedMemory(const IR::Program& program) {
         std::tie(shared_memory_u32x4, shared_u32x4, std::ignore) = make(U32[4], 16);
         return;
     }
-    const u32 num_elements{Common::DivCeil(program.shared_memory_size, 4U)};
+    const u32 num_elements{Common::DivCeil(shared_memory_size, 4U)};
     const Id type{TypeArray(U32[1], Const(num_elements))};
     shared_memory_u32_type = TypePointer(spv::StorageClass::Workgroup, type);
 

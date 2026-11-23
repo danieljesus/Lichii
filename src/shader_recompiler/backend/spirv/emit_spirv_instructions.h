@@ -658,8 +658,15 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
 void PatchCooperativeHmma(std::vector<u32>& code, const CooperativeHmmaTypes& types);
 /// Whether a program's K=16 HMMA runs on 16x8x16 cooperative matrices.
 bool UsesCooperativeHmma(const Profile& profile, const IR::Program& program);
-/// Appends the shared memory of the 16x16x16 HMMA path to a program that runs it, and returns the
-/// word where it starts.
-std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program);
+/// Shared memory the 16x16x16 HMMA path appends after a program's own.
+struct CooperativeHmmaScratch {
+    u32 word;               ///< The word where the scratch starts
+    u32 shared_memory_size; ///< The program's shared memory with the scratch, in bytes
+};
+
+/// The scratch of the 16x16x16 HMMA path for a program that runs it. The program is left as it is,
+/// so that emitting it again reserves the same scratch.
+std::optional<CooperativeHmmaScratch> ReserveCooperativeHmmaScratch(const Profile& profile,
+                                                                    const IR::Program& program);
 
 } // namespace Shader::Backend::SPIRV

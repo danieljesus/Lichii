@@ -68,6 +68,13 @@ struct Emitted {
     std::vector<u32> first;
     std::vector<u32> second;
     bool ir_kept; ///< Each emission left every instruction's opcode and use count as it found them
+    u32 shared_memory_size_before;
+    u32 shared_memory_size_after; ///< After both emissions
+};
+
+struct Setup {
+    bool texture{}; ///< One 2D texture descriptor
+    bool hmma{};    ///< A workgroup of a guest warp, shared memory, and the 16x16x16 HMMA path
 };
 
 std::vector<std::pair<IR::Opcode, int>> Snapshot(IR::Block& block) {
@@ -81,7 +88,7 @@ std::vector<std::pair<IR::Opcode, int>> Snapshot(IR::Block& block) {
 // One compute block: a and b read from a constant buffer, `build` makes a value from them, and
 // the value is written to global memory. The program is emitted twice.
 template <typename Build>
-Emitted EmitTwice(Build&& build, bool texture = false) {
+Emitted EmitTwice(Build&& build, const Setup& setup = {}) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::IREmitter ir{block};
@@ -93,7 +100,8 @@ Emitted EmitTwice(Build&& build, bool texture = false) {
 
     IR::Program program;
     program.stage = Stage::Compute;
-    program.workgroup_size = {1, 1, 1};
+    program.workgroup_size = setup.hmma ? std::array<u32, 3>{32, 1, 1} : std::array<u32, 3>{1, 1, 1};
+    program.shared_memory_size = setup.hmma ? 0x104 : 0;
     program.blocks = {&block};
     program.post_order_blocks = {&block};
     program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
@@ -105,7 +113,7 @@ Emitted EmitTwice(Build&& build, bool texture = false) {
     Optimization::CollectShaderInfoPass(env, program);
     program.info.native_global_bounds = true;
     program.info.constant_buffer_descriptors = {{0, 1}};
-    if (texture) {
+    if (setup.texture) {
         program.info.texture_descriptors = {{.type = TextureType::Color2D, .count = 1}};
     }
 
@@ -115,12 +123,15 @@ Emitted EmitTwice(Build&& build, bool texture = false) {
     profile.support_descriptor_aliasing = true;
     profile.unified_descriptor_binding = true;
     profile.min_ssbo_alignment = 16;
+    profile.support_cooperative_hmma_16x16x16 = setup.hmma;
     Emitted emitted;
+    emitted.shared_memory_size_before = program.shared_memory_size;
     const auto before{Snapshot(block)};
     emitted.first = Backend::SPIRV::EmitSPIRV(profile, program);
     const auto after_first{Snapshot(block)};
     emitted.second = Backend::SPIRV::EmitSPIRV(profile, program);
     emitted.ir_kept = after_first == before && Snapshot(block) == before;
+    emitted.shared_memory_size_after = program.shared_memory_size;
     return emitted;
 }
 
@@ -201,7 +212,7 @@ TEST_CASE("Emitting twice keeps a fetch's residency", "[spirv_emission]") {
             const IR::U32 x{ir.BitCast<IR::U32>(IR::F32{ir.CompositeExtract(color, 0)})};
             return IR::U32{ir.Select(resident, x, ir.Imm32(0))};
         },
-        true)};
+        {.texture = true})};
     CHECK(Count(emitted.first, OpImageSparseFetch) == 1);
     CHECK(Count(emitted.first, OpImageSparseTexelsResident) == 1);
     CHECK(emitted.ir_kept);
@@ -215,6 +226,22 @@ TEST_CASE("Emitting twice keeps a shuffle's in-bounds flag", "[spirv_emission]")
         return IR::U32{ir.Select(in_bounds, shuffled, ir.Imm32(0))};
     })};
     CHECK(Count(emitted.first, OpSLessThanEqual) >= 1);
+    CHECK(emitted.ir_kept);
+    REQUIRE(emitted.first == emitted.second);
+}
+
+TEST_CASE("Emitting twice reserves the HMMA scratch once", "[spirv_emission]") {
+    // A 16x16x16 matrix multiply-add on the cooperative matrix path, which appends its scratch to
+    // the program's shared memory.
+    const Emitted emitted{EmitTwice(
+        [](IR::IREmitter& ir, const IR::U32& a, const IR::U32& b) {
+            const IR::Value pair{ir.CompositeConstruct(a, b)};
+            const IR::Value result{
+                ir.TensorMulAdd(ir.CompositeConstruct(a, b, a, b), pair, pair, 16)};
+            return IR::U32{ir.CompositeExtract(result, 0)};
+        },
+        {.hmma = true})};
+    CHECK(emitted.shared_memory_size_after == emitted.shared_memory_size_before);
     CHECK(emitted.ir_kept);
     REQUIRE(emitted.first == emitted.second);
 }

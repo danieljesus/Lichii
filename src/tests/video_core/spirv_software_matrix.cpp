@@ -126,6 +126,19 @@ std::vector<std::vector<u32>> Instructions(const std::vector<u32>& code, u32 opc
     return result;
 }
 
+// Whether the module declares an array of `length` elements (OpTypeArray with an OpConstant length).
+bool DeclaresArrayOf(const std::vector<u32>& code, u32 length) {
+    std::vector<u32> lengths;
+    for (const auto& constant : Instructions(code, 43)) { // OpConstant: type, result, value
+        if (constant.size() == 3 && constant[2] == length) {
+            lengths.push_back(constant[1]);
+        }
+    }
+    return std::ranges::any_of(Instructions(code, 28), [&](const auto& array) { // OpTypeArray
+        return array.size() == 3 && std::ranges::find(lengths, array[2]) != lengths.end();
+    });
+}
+
 bool HasCapability(const std::vector<u32>& code, u32 capability) {
     const auto capabilities = Instructions(code, 17);
     return std::ranges::any_of(capabilities, [=](const auto& words) {
@@ -778,7 +791,10 @@ TEST_CASE("16x16x16 cooperative HMMA runs both depths through shared memory",
         REQUIRE(Instructions(code, 202).empty()); // OpBitFieldUExtract
         REQUIRE(Instructions(code, 57).empty());  // OpFunctionCall
         REQUIRE(Instructions(code, 345).empty()); // OpGroupNonUniformShuffle
-        REQUIRE(fixture.program.shared_memory_size == 2 * 384 * 4);
+        // Two subgroups' scratch is declared in the module's shared memory; the program keeps its
+        // own size, so that emitting it again reserves the same scratch.
+        REQUIRE(DeclaresArrayOf(code, 2 * 384));
+        REQUIRE(fixture.program.shared_memory_size == 0);
     }
 }
 

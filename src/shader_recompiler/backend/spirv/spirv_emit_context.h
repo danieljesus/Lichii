@@ -175,7 +175,8 @@ struct CooperativeHmmaTypes {
 class EmitContext final : public Sirit::Module {
 public:
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info,
-                         IR::Program& program, Bindings& binding, bool vulkan_memory_model);
+                         IR::Program& program, Bindings& binding, bool vulkan_memory_model,
+                         u32 shared_memory_size);
     ~EmitContext();
 
     [[nodiscard]] Id Def(const IR::Value& value);
@@ -251,6 +252,8 @@ public:
     const bool requires_coherent_image_memory;
     /// Set when HMMA lowers to cooperative matrices, which need the Vulkan memory model.
     const bool vulkan_memory_model;
+    /// Bytes of shared memory declared: the program's, and the HMMA scratch after it if any.
+    const u32 shared_memory_size;
     Stage stage{};
 
     Id void_id{};

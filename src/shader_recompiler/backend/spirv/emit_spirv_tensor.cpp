@@ -194,7 +194,8 @@ bool UsesCooperativeHmma(const Profile& profile, const IR::Program& program) {
     return false;
 }
 
-std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program) {
+std::optional<CooperativeHmmaScratch> ReserveCooperativeHmmaScratch(const Profile& profile,
+                                                                    const IR::Program& program) {
     if (!profile.support_cooperative_hmma_16x16x16 || !SupportsCooperativeHmma(program)) {
         return std::nullopt;
     }
@@ -217,8 +218,7 @@ std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Pro
         total > profile.max_compute_shared_memory_size) {
         return std::nullopt;
     }
-    program.shared_memory_size = total;
-    return scratch_offset / 4U;
+    return CooperativeHmmaScratch{.word = scratch_offset / 4U, .shared_memory_size = total};
 }
 
 namespace {
