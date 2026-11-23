@@ -580,8 +580,9 @@ Result NcaFileSystemDriver::CreateSparseStorageMetaStorage(VirtualFile* out,
                                     AlignmentStorageRequirement::None));
 
     // Create buffered storage.
-    std::vector<u8> meta_data(meta_size);
-    decrypted_storage->Read(meta_data.data(), meta_size, 0);
+    std::vector<u8> meta_data;
+    R_UNLESS(ReadWholeTable(decrypted_storage, meta_size, meta_data),
+             ResultNcaBaseStorageOutOfRangeB);
 
     auto buffered_storage = std::make_shared<VectorVfsFile>(std::move(meta_data));
     R_UNLESS(buffered_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
@@ -916,8 +917,8 @@ Result NcaFileSystemDriver::CreateAesCtrExStorageMetaStorage(
     R_UNLESS(meta_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
 
     // Create buffered storage.
-    std::vector<u8> meta_data(meta_size);
-    meta_storage->Read(meta_data.data(), meta_size, 0);
+    std::vector<u8> meta_data;
+    R_UNLESS(ReadWholeTable(meta_storage, meta_size, meta_data), ResultNcaBaseStorageOutOfRangeB);
 
     auto buffered_storage = std::make_shared<VectorVfsFile>(std::move(meta_data));
     R_UNLESS(buffered_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
