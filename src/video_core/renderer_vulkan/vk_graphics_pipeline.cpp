@@ -1926,8 +1926,14 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // (Scheduler::OpenHoistSlot). A program that writes buffers or images stays in its
         // place: an earlier draw of the pass could read them.
         const bool hoists{HoistsMeshDispatches() && !writes_storage};
+        static u64 test_dispatches{}, test_hoisted{}; // TEST ONLY
+        if (++test_dispatches % 2000 == 0) {
+            LOG_INFO(Render_Vulkan, "Mesh emulation dispatches: {} ({} hoisted before their pass)",
+                     test_dispatches, test_hoisted);
+        }
         if (hoists && IsBuilt() && !mesh_reads_target &&
             scheduler.CanHoist(texture_cache.GetFramebuffer())) {
+            ++test_hoisted;
             scheduler.Hoist(std::move(dispatch));
         } else {
             scheduler.RequestOutsideRenderPassOperationContext();
