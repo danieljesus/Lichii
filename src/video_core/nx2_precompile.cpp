@@ -38,8 +38,8 @@
 
 #include "common/cityhash.h"
 #include "common/logging.h"
-#include "common/scope_exit.h"
 #include "common/fs/path_util.h"
+#include "common/scope_exit.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
