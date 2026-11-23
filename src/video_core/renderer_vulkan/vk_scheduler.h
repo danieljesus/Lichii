@@ -182,6 +182,10 @@ public:
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    bool IsBetweenRenderPasses() const {
+        return state.renderpass == VK_NULL_HANDLE && deferred_clear.framebuffer == nullptr;
+    }
+
     /// Changes whenever a render pass begins or ends.
     u64 RenderPassSerial() const {
         return render_pass_serial;
