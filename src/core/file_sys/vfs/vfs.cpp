@@ -158,6 +158,10 @@ bool VfsFilesystem::DeleteDirectory(std::string_view path_) {
 
 VfsFile::~VfsFile() = default;
 
+std::size_t VfsFile::GetHeldSize() const {
+    return GetSize();
+}
+
 std::string VfsFile::GetExtension() const {
     return std::string(Common::FS::GetExtensionFromFilename(GetName()));
 }
