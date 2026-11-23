@@ -1758,6 +1758,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     } else {
         RecordBinding(binding, descriptor_data, std::move(mesh_set));
     }
+    scheduler.ProbeDrawRecorded();
     return true;
 }
 
