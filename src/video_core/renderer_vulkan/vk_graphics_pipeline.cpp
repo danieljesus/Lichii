@@ -1700,8 +1700,38 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             const char* const value{std::getenv("EDEN_NX2_MESH_HOIST")};
             return value == nullptr || value[0] != '0';
         }()};
-        const bool hoisted{hoist_enabled && IsBuilt() && !mesh_reads_target &&
-                           scheduler.TryHoist(dispatch)};
+        const bool hoist_candidate{hoist_enabled && IsBuilt() && !mesh_reads_target};
+        // A dispatch whose program writes buffers or images could feed a draw already in the pass.
+        const bool kept_for_storage{hoist_candidate && writes_storage};
+        if (kept_for_storage) {
+            static std::vector<const GraphicsPipeline*> logged;
+            if (std::ranges::find(logged, this) == logged.end()) {
+                logged.push_back(this);
+                std::string what;
+                for (size_t stage = 0; stage < stage_infos.size(); ++stage) {
+                    const Shader::Info& info{stage_infos[stage]};
+                    const auto written = [](const auto& descriptors) {
+                        return std::ranges::count_if(descriptors,
+                                                     [](const auto& desc) { return desc.is_written; });
+                    };
+                    const auto ssbo{written(info.storage_buffers_descriptors)};
+                    const auto image{written(info.image_descriptors)};
+                    const auto image_buffer{written(info.image_buffer_descriptors)};
+                    if (info.stores_global_memory || ssbo || image || image_buffer) {
+                        what += fmt::format(" stage {}: global stores {}, storage buffers written {} "
+                                            "of {}, images written {}, image buffers written {};",
+                                            stage, info.stores_global_memory, ssbo,
+                                            info.storage_buffers_descriptors.size(), image,
+                                            image_buffer);
+                    }
+                }
+                LOG_INFO(Render_Vulkan,
+                         "Mesh emulation dispatch kept in place, its pipeline writes storage "
+                         "(task {}, hash {:016x}):{}",
+                         mesh_emulation->has_task, key.Hash(), what);
+            }
+        }
+        const bool hoisted{hoist_candidate && !writes_storage && scheduler.TryHoist(dispatch)};
         if (!hoisted) {
             scheduler.RequestOutsideRenderPassOperationContext();
             if (!IsBuilt()) {
@@ -1718,12 +1748,15 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 scheduler.OpenHoistSlot();
             }
         }
-        static u64 dispatches{}, hoisted_dispatches{};
+        static u64 dispatches{}, hoisted_dispatches{}, storage_dispatches{};
         ++dispatches;
         hoisted_dispatches += hoisted ? 1 : 0;
+        storage_dispatches += kept_for_storage ? 1 : 0;
         if (dispatches % 2000 == 0) {
-            LOG_INFO(Render_Vulkan, "Mesh emulation dispatches: {} ({} hoisted before their pass)",
-                     dispatches, hoisted_dispatches);
+            LOG_INFO(Render_Vulkan,
+                     "Mesh emulation dispatches: {} ({} hoisted before their pass, {} kept in "
+                     "place for writing storage)",
+                     dispatches, hoisted_dispatches, storage_dispatches);
         }
     }
     const u64 render_pass = deferred != nullptr ? scheduler.RenderPassSerial() : 0;
