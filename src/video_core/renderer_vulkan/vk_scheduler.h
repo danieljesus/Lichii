@@ -68,7 +68,7 @@ public:
     /// submission is older than a window (EDEN_NX2_FENCE_FLUSH_US, default 500 us, 0 submits at
     /// once); otherwise it goes with the next one. The back submits deferred work before it
     /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
-    bool DeferFlush();
+    bool DeferFlush(std::source_location location = std::source_location::current());
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
@@ -289,13 +289,14 @@ public:
     /// target_fps paces presents in game frames; game_frame_presents is how many presents show the
     /// current one (see FramePacer).
     void Wait(u64 tick, double target_fps = 0.0, bool may_flush = true,
-              u32 game_frame_presents = 1) {
+              u32 game_frame_presents = 1,
+              std::source_location location = std::source_location::current()) {
         const bool trace = Common::DkbFrameTrace::Enabled() && target_fps > 0.0;
         const auto trace_start = trace ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
         if (tick > 0 && (may_flush || WaitForSubmission(tick))) {
             if (tick >= master_semaphore->CurrentTick()) {
-                Flush();
+                Flush({}, {}, location);
             }
             master_semaphore->Wait(tick);
         }
@@ -359,6 +360,9 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+    /// The first DeferFlush caller since the last submission (EDEN_NX2_GPU_PROFILE's submit sites).
+    std::source_location deferred_location{};
+    bool flushing_deferred{}; ///< FlushDeferred is submitting
     u64 record_serial{};    ///< Commands recorded
     u64 submitted_serial{}; ///< record_serial at the last Flush or Finish
 
