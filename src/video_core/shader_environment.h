@@ -356,9 +356,12 @@ public:
     /// classifications and the other recorded answers must be the same. Sets `why` to the first
     /// answer that differs. `format_traits` limits the pixel format traits compared to those the
     /// program's translation used (PixelFormatTraits bits; see PipelineCache's precompiled
-    /// pipelines).
+    /// pipelines). With `info`, the program's kept translation, a handle its texture descriptors
+    /// assemble from shifted or several words of the texture bank is rebuilt from the live words
+    /// and checked by the texture it names; those words may then hold other values.
     [[nodiscard]] bool AnswersHoldFor(Shader::Environment& live, const char** why = nullptr,
-                                      u32 format_traits = ~0U);
+                                      u32 format_traits = ~0U,
+                                      const Shader::Info* info = nullptr);
 
     /// Pixel format traits translation uses: integer formats (sampled textures).
     static constexpr u32 FormatTraitInteger = 1;

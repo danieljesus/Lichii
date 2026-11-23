@@ -1418,7 +1418,7 @@ u32 PixelFormatTraits(Shader::TexturePixelFormat format) {
 } // Anonymous namespace
 
 bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why,
-                                     u32 format_traits) {
+                                     u32 format_traits, const Shader::Info* info) {
     const auto fail = [why](const char* reason) {
         if (why) {
             *why = reason;
@@ -1458,6 +1458,76 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
         return storage_pointer_types.contains(MakeCbufKey(index, offset)) ||
                (offset >= 4 && storage_pointer_types.contains(MakeCbufKey(index, offset - 4)));
     };
+    // A handle assembled from shifted or several words (texture_pass ReadTextureHandleWords) has
+    // its words read as values, but translation keeps only the texture the assembled handle names
+    // (its type and pixel format): the descriptor keeps the words' places and the shader reads
+    // them at run time. With the kept translation the handle is rebuilt from the live words and
+    // checked by the texture it names, so those words may change. Only words of the texture bank
+    // are taken: bank 1 holds the driver constants folded into the code, and any word that is not
+    // a part of such a handle keeps its value.
+    std::vector<u64> assembled_words;
+    std::vector<u32> assembled_handles;
+    if (info) {
+        const auto recorded_word = [&](u32 index, u32 offset) -> std::optional<u32> {
+            const auto it = cbuf_values.find(MakeCbufKey(index, offset));
+            return it == cbuf_values.end() ? std::nullopt : std::optional{it->second};
+        };
+        const auto check_assembled = [&](const auto& desc) -> const char* {
+            if (desc.handle_program != ~0U || desc.count != 1 ||
+                (!desc.has_secondary && desc.shift_left == 0 && desc.secondary_shift_left == 0)) {
+                return nullptr;
+            }
+            const u32 secondary_index =
+                desc.has_secondary ? desc.secondary_cbuf_index : desc.cbuf_index;
+            const u32 secondary_offset =
+                desc.has_secondary ? desc.secondary_cbuf_offset : desc.cbuf_offset;
+            if (desc.cbuf_index != texture_bound || secondary_index != texture_bound ||
+                texture_bound == 1) {
+                return nullptr;
+            }
+            const auto lhs = recorded_word(desc.cbuf_index, desc.cbuf_offset);
+            const auto rhs = recorded_word(secondary_index, secondary_offset);
+            if (!lhs || !rhs) {
+                return nullptr;
+            }
+            const u32 recorded = (*lhs << desc.shift_left) | (*rhs << desc.secondary_shift_left);
+            const auto type = texture_types.find(recorded);
+            const auto format = texture_pixel_formats.find(recorded);
+            if (type == texture_types.end() && format == texture_pixel_formats.end()) {
+                return nullptr;
+            }
+            const u32 now = (live.ReadCbufValue(desc.cbuf_index, desc.cbuf_offset)
+                             << desc.shift_left) |
+                            (live.ReadCbufValue(secondary_index, secondary_offset)
+                             << desc.secondary_shift_left);
+            if (type != texture_types.end() && live.ReadTextureType(now) != type->second) {
+                return "texture type";
+            }
+            if (format != texture_pixel_formats.end() &&
+                ((PixelFormatTraits(live.ReadTexturePixelFormat(now)) ^
+                  PixelFormatTraits(format->second)) &
+                 format_traits) != 0) {
+                return "texture pixel format";
+            }
+            assembled_words.push_back(MakeCbufKey(desc.cbuf_index, desc.cbuf_offset));
+            assembled_words.push_back(MakeCbufKey(secondary_index, secondary_offset));
+            assembled_handles.push_back(recorded);
+            return nullptr;
+        };
+        for (const auto& desc : info->texture_descriptors) {
+            if (const char* reason = check_assembled(desc)) {
+                return fail(reason);
+            }
+        }
+        for (const auto& desc : info->texture_buffer_descriptors) {
+            if (const char* reason = check_assembled(desc)) {
+                return fail(reason);
+            }
+        }
+    }
+    const auto is_assembled_word = [&](u64 key) {
+        return std::ranges::find(assembled_words, key) != assembled_words.end();
+    };
     std::vector<u32> handles_read;
     for (const auto& [key, value] : cbuf_values) {
         const u32 index = static_cast<u32>(key >> 32);
@@ -1485,12 +1555,13 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
             handles_read.push_back(value);
             continue;
         }
-        if (live_value != value && !is_pointer_word(key)) {
+        if (live_value != value && !is_pointer_word(key) && !is_assembled_word(key)) {
             return fail("constant buffer value");
         }
     }
     const auto read_from_cbuf = [&](u32 handle) {
-        return std::ranges::find(handles_read, handle) != handles_read.end();
+        return std::ranges::find(handles_read, handle) != handles_read.end() ||
+               std::ranges::find(assembled_handles, handle) != assembled_handles.end();
     };
     // Handles not read from a constant buffer (or built from several words): asked as they are.
     for (const auto& [handle, type] : texture_types) {

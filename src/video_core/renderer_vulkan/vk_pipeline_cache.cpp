@@ -3444,7 +3444,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
     }
     for (size_t i = 0; i < live.size(); ++i) {
         const char* why = "";
-        if (!(*recorded)[i].AnswersHoldFor(*live[i], &why, format_traits)) {
+        // The stage's kept translation names the handles it assembles from several words.
+        const auto stage_slot = static_cast<size_t>(live[i]->ShaderStage());
+        const Shader::Info* const info =
+            stage_slot < info_ptrs.size() ? info_ptrs[stage_slot] : nullptr;
+        if (!(*recorded)[i].AnswersHoldFor(*live[i], &why, format_traits, info)) {
             CountPrecompiledReason(why);
             return nullptr;
         }
@@ -3614,7 +3618,7 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
             format_traits |= FileEnvironment::FormatTraitSnorm;
         }
         const char* why = "";
-        if (!recorded.AnswersHoldFor(env, &why, format_traits)) {
+        if (!recorded.AnswersHoldFor(env, &why, format_traits, &info)) {
             if (!first_reason) {
                 first_reason = why;
             }
