@@ -551,6 +551,7 @@ Result NcaFileSystemDriver::CreateSparseStorageMetaStorage(VirtualFile* out,
     R_UNLESS(offset >= 0 && meta_offset >= 0 && meta_size >= 0 && meta_size <= base_size &&
                  meta_offset - offset <= base_size - meta_size,
              ResultNcaBaseStorageOutOfRangeB);
+    R_UNLESS(meta_size <= GetBodyHeldSize(m_reader), ResultNcaBaseStorageOutOfRangeB);
 
     // Create the encrypted storage.
     auto enc_storage =
@@ -564,7 +565,6 @@ Result NcaFileSystemDriver::CreateSparseStorageMetaStorage(VirtualFile* out,
                                     AlignmentStorageRequirement::None));
 
     // Create buffered storage.
-    R_UNLESS(meta_size <= GetBodyHeldSize(m_reader), ResultNcaBaseStorageOutOfRangeB);
     std::vector<u8> meta_data(meta_size);
     decrypted_storage->Read(meta_data.data(), meta_size, 0);
 
@@ -878,7 +878,7 @@ Result NcaFileSystemDriver::CreateAesCtrExStorageMetaStorage(
         Common::AlignUp(static_cast<s64>(patch_info.aes_ctr_ex_size), NcaHeader::XtsBlockSize);
     R_UNLESS(IsRangeWithin(meta_offset, meta_size, base_size), ResultNcaBaseStorageOutOfRangeB);
 
-    R_UNLESS(meta_size <= GetBodySize(m_reader), ResultNcaBaseStorageOutOfRangeB);
+    R_UNLESS(meta_size <= GetBodyHeldSize(m_reader), ResultNcaBaseStorageOutOfRangeB);
 
     // Create the encrypted storage.
     auto enc_storage =
@@ -901,7 +901,6 @@ Result NcaFileSystemDriver::CreateAesCtrExStorageMetaStorage(
     R_UNLESS(meta_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
 
     // Create buffered storage.
-    R_UNLESS(meta_size <= GetBodyHeldSize(m_reader), ResultNcaBaseStorageOutOfRangeB);
     std::vector<u8> meta_data(meta_size);
     meta_storage->Read(meta_data.data(), meta_size, 0);
 
@@ -1018,7 +1017,8 @@ Result NcaFileSystemDriver::CreateIndirectStorageMetaStorage(VirtualFile* out,
     R_UNLESS(IsRangeWithin(patch_info.indirect_offset, patch_info.indirect_size, base_size),
              ResultNcaBaseStorageOutOfRangeE);
 
-    R_UNLESS(patch_info.indirect_size <= GetBodySize(m_reader), ResultNcaBaseStorageOutOfRangeE);
+    R_UNLESS(patch_info.indirect_size <= GetBodyHeldSize(m_reader),
+             ResultNcaBaseStorageOutOfRangeE);
 
     // Create the meta storage.
     auto meta_storage = std::make_shared<OffsetVfsFile>(base_storage, patch_info.indirect_size,
@@ -1026,8 +1026,6 @@ Result NcaFileSystemDriver::CreateIndirectStorageMetaStorage(VirtualFile* out,
     R_UNLESS(meta_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
 
     // Create buffered storage.
-    R_UNLESS(patch_info.indirect_size <= GetBodyHeldSize(m_reader),
-             ResultNcaBaseStorageOutOfRangeE);
     std::vector<u8> meta_data(patch_info.indirect_size);
     meta_storage->Read(meta_data.data(), patch_info.indirect_size, 0);
 

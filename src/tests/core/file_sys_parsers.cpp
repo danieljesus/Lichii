@@ -23,12 +23,14 @@
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/crypto/key_manager.h"
+#include "core/crypto/xts_encryption_layer.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/decrypted_nca.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_storage.h"
+#include "core/file_sys/fssystem/fssystem_alignment_matching_storage.h"
 #include "core/file_sys/fssystem/fssystem_bucket_tree.h"
 #include "core/file_sys/fssystem/fssystem_compression_configuration.h"
 #include "core/file_sys/fssystem/fssystem_crypto_configuration.h"
@@ -42,7 +44,9 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/submission_package.h"
+#include "core/file_sys/vfs/vfs_concat.h"
 #include "core/file_sys/vfs/vfs_offset.h"
+#include "core/file_sys/vfs/vfs_static.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/file_sys/xts_archive.h"
 #include "core/hle/service/acc/profile_manager.h"
@@ -167,6 +171,29 @@ TEST_CASE("A range of a file holds only what its base holds from its offset", "[
     REQUIRE(OffsetVfsFile{outer, size_t{1} << 39, 0x200}.GetHeldSize() == 0xD00);
 }
 
+TEST_CASE("Held size passes through concatenations, encryption layers and storages, and made-up "
+          "bytes hold nothing",
+          "[core][file_sys]") {
+    const auto claimed =
+        std::make_shared<OffsetVfsFile>(MakeFile(std::vector<u8>(0x200)), size_t{1} << 41, 0);
+    const auto zeros = std::make_shared<StaticVfsFile>(u8{0}, 0x1000);
+    REQUIRE(zeros->GetHeldSize() == 0);
+
+    const auto concat = ConcatenatedVfsFile::MakeConcatenatedFile(
+        "concat", std::vector<VirtualFile>{MakeFile(std::vector<u8>(0x100)), zeros, claimed});
+    REQUIRE(concat->GetSize() == 0x100 + 0x1000 + (size_t{1} << 41));
+    REQUIRE(concat->GetHeldSize() == 0x100 + 0x200);
+
+    REQUIRE(Core::Crypto::XTSEncryptionLayer{claimed, {}}.GetHeldSize() == 0x200);
+
+    static constexpr std::array<u8, AesCtrStorage::KeySize> key{4};
+    std::array<u8, AesCtrStorage::IvSize> iv{};
+    const auto ctr = std::make_shared<AlignmentMatchingStorage<NcaHeader::CtrBlockSize, 1>>(
+        std::make_shared<AesCtrStorage>(claimed, key.data(), key.size(), iv.data(), iv.size()));
+    REQUIRE(ctr->GetSize() == size_t{1} << 41);
+    REQUIRE(ctr->GetHeldSize() == 0x200);
+}
+
 TEST_CASE("NAX rejects a file size that does not fit in its file, however large",
           "[core][file_sys]") {
     std::vector<u8> bytes(0x4000 + 0x200);
@@ -176,8 +203,12 @@ TEST_CASE("NAX rejects a file size that does not fit in its file, however large"
             Loader::ResultStatus::ErrorIncorrectNAXFileSize);
     // A size whose sum with the header padding wraps around.
     Put(bytes, 0x20 + 8 + 0x20, ~u64{0} - 0x3FFF);
-    REQUIRE(NAX{MakeFile(std::move(bytes)), {}}.GetStatus() ==
+    REQUIRE(NAX{MakeFile(bytes), {}}.GetStatus() ==
             Loader::ResultStatus::ErrorIncorrectNAXFileSize);
+    // A NAX reached as a range that claims more than its file holds is bounded by what it holds.
+    Put(bytes, 0x20 + 8 + 0x20, u64{0x400});
+    REQUIRE(NAX{std::make_shared<OffsetVfsFile>(MakeFile(std::move(bytes)), size_t{1} << 41, 0), {}}
+                .GetStatus() == Loader::ResultStatus::ErrorIncorrectNAXFileSize);
 }
 
 TEST_CASE("PFS0 with more than 65535 entries reads every entry", "[core][file_sys]") {
@@ -1062,6 +1093,35 @@ TEST_CASE("Decrypting an NCA refuses an AES-CTR-EX table in a sparse section lar
             nullptr);
     UNSCOPED_INFO(error);
     REQUIRE(error.find("AES-CTR-EX table out of range") != std::string::npos);
+    RequireFewReads(reads);
+}
+
+TEST_CASE("Decrypting an NCA refuses an AES-CTR-EX table of a negative size", "[core][file_sys]") {
+    auto nca = MakeAesCtrExNca();
+    nca.fs.encryption_type = NcaFsHeader::EncryptionType::AesCtrEx;
+    nca.fs.patch_info.aes_ctr_ex_size = -0x200;
+    std::string error;
+    REQUIRE(OpenDecryptedNca(MakeFile(nca.Bytes()), error) == nullptr);
+    UNSCOPED_INFO(error);
+    REQUIRE(error.find("invalid AES-CTR-EX table") != std::string::npos);
+}
+
+TEST_CASE("NCA decrypted from a range that claims too much refuses an indirect table it does not "
+          "hold",
+          "[core][file_sys]") {
+    // The decrypted NCA is a concatenation of the header and ranges of the claimed file: what it
+    // holds is what those ranges hold, so the driver opening it refuses the indirect table.
+    auto nca = MakeIndirectNca(0x8000);
+    nca.header.fs_info[0].end_sector = 0xFFFFFF06;
+    nca.fs.patch_info.indirect_size = s64{1} << 40;
+    ReadCounter reads;
+    const auto claimed = std::make_shared<OffsetVfsFile>(MakeFile(nca.Bytes()), size_t{1} << 41, 0);
+    std::string error;
+    const auto decrypted = OpenDecryptedNca(std::make_shared<CountingFile>(claimed, reads), error);
+    INFO(error);
+    REQUIRE(decrypted != nullptr);
+    REQUIRE(decrypted->GetSize() > (size_t{1} << 40));
+    REQUIRE(PlaintextNca::OpenFile(decrypted) == ResultNcaBaseStorageOutOfRangeE);
     RequireFewReads(reads);
 }
 
