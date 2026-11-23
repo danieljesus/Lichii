@@ -449,13 +449,14 @@ void CountPrecompiledReason(const char* reason) {
     ++precompiled_reasons[reason];
 }
 
-// NX2INFO6: infos keep requires_full_guest_warps, and the kept SPIR-V of a software HMMA may use
+// NX2INFO7: each kept info is followed by the constant buffer words its translation read only as
+// whole texture handles (AppendKeptHandleWords). NX2INFO6: infos keep requires_full_guest_warps, and the kept SPIR-V of a software HMMA may use
 // the staged exchange, which older files do not have.
 // NX2INFO5: texture descriptors keep is_descriptor_array and handle_is_pointer_word, and infos
 // demoted_conditional_barrier, uses_barrier_vote and binds_unmapped_pointer_word (NX2INFO3:
 // storage buffer descriptors keep their write extent). A file of another version is prepared
 // again.
-constexpr std::string_view PrecompiledInfosMagic{"NX2INFO6"};
+constexpr std::string_view PrecompiledInfosMagic{"NX2INFO7"};
 
 /// EDEN_NX2_PRECOMPILED_FAST=0: precompiled pipelines are translated on the GPU thread like the
 /// others (their kept infos and SPIR-V unused), to compare.
@@ -790,9 +791,11 @@ struct PipelineCache::PrecompiledPrep {
 
     /// Keeps a prepared pipeline's shader infos and SPIR-V in the store, once each (most
     /// pipelines share their programs' infos with others, and stages their SPIR-V). A compute
-    /// pipeline's info and SPIR-V are its stage 0.
+    /// pipeline's info and SPIR-V are its stage 0. Each info is followed by the words its
+    /// translation read only as whole texture handles (`handle_words`, by stage).
     void Keep(u32 index, const Shader::Info* compute_info, const GraphicsPipeline* graphics,
-              const std::array<std::vector<u32>, Maxwell::MaxShaderStage>& spirv) {
+              const std::array<std::vector<u32>, Maxwell::MaxShaderStage>& spirv,
+              const std::array<std::vector<u64>, Maxwell::MaxShaderStage>& handle_words) {
         using Store = VideoCommon::PrecompiledStore;
         const auto& source = records[index];
         auto record = StoreRecord(index);
@@ -812,6 +815,7 @@ struct PipelineCache::PrecompiledPrep {
             }
             std::vector<u8> bytes;
             Shader::SerializeInfo(*info, bytes);
+            VideoCommon::AppendKeptHandleWords(bytes, handle_words[stage]);
             const u64 info_hash =
                 Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             record.infos[stage] = store.AddBlob(Store::BlobKind::Info, info_hash, bytes);
@@ -3251,20 +3255,30 @@ PipelineCache::PrecompiledPrepOutcome PipelineCache::RunPrecompiledPrep(
                  const bool without_cache = device.IsMoltenVK();
                  try {
                      auto envs = prep.ReadEnvs(record.envs);
+                     // The translation that makes the kept infos and SPIR-V tells how it read
+                     // each recorded word, which a record made before handle words were marked
+                     // does not.
+                     for (auto& env : envs) {
+                         env.ObserveCbufReads();
+                     }
+                     std::array<std::vector<u64>, Maxwell::MaxShaderStage> handle_words;
                      ShaderPools pools;
                      if (record.compute) {
                          std::array<std::vector<u32>, Maxwell::MaxShaderStage> spirv;
                          auto entry{CreateComputePipeline(pools, record.compute_key, envs.front(),
                                                           nullptr, false, nullptr, &spirv[0],
                                                           without_cache)};
+                         handle_words[0] = envs.front().CbufWordsReadOnlyAsHandles();
                          if (entry.pipeline) {
                              build = [index, &prep, spirv = std::move(spirv),
+                                      handle_words = std::move(handle_words),
                                       pipeline = std::move(entry.pipeline)] {
                                  pipeline->Build();
                                  if (pipeline->BuildFailed()) {
                                      return false;
                                  }
-                                 prep.Keep(index, &pipeline->StageInfo(), nullptr, spirv);
+                                 prep.Keep(index, &pipeline->StageInfo(), nullptr, spirv,
+                                           handle_words);
                                  return true;
                              };
                          }
@@ -3279,14 +3293,22 @@ PipelineCache::PrecompiledPrepOutcome PipelineCache::RunPrecompiledPrep(
                          auto pipeline{CreateGraphicsPipeline(
                              pools, record.graphics_key, MakeSpan(env_ptrs), nullptr, false,
                              nullptr, nullptr, &spirv, without_cache)};
+                         const auto slots =
+                             VideoCommon::KeptSlotsByEnvironment(record.graphics_key.unique_hashes);
+                         for (size_t i = 0; i < envs.size() && i < slots.size(); ++i) {
+                             if (slots[i] != VideoCommon::NoKeptSlot) {
+                                 handle_words[slots[i]] = envs[i].CbufWordsReadOnlyAsHandles();
+                             }
+                         }
                          if (pipeline) {
                              build = [index, &prep, spirv = std::move(spirv),
+                                      handle_words = std::move(handle_words),
                                       pipeline = std::move(pipeline)] {
                                  pipeline->Build();
                                  if (pipeline->Failed()) {
                                      return false;
                                  }
-                                 prep.Keep(index, nullptr, pipeline.get(), spirv);
+                                 prep.Keep(index, nullptr, pipeline.get(), spirv, handle_words);
                                  return true;
                              };
                          }
@@ -3383,6 +3405,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
     auto recorded = std::make_shared<std::vector<FileEnvironment>>(record.env_count);
     std::array<Shader::Info, 5> infos{};
     std::array<const Shader::Info*, 5> info_ptrs{};
+    std::array<std::vector<u64>, 5> handle_words{};
     try {
         if (!precompiled_file.is_open()) {
             precompiled_file.open(precompiled_path, std::ios::binary);
@@ -3419,6 +3442,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
                 CountPrecompiledReason("infos unreadable or with layer emulation");
                 return nullptr;
             }
+            if (!VideoCommon::ReadKeptHandleWords(in, handle_words[stage])) {
+                CountPrecompiledReason("kept handle words unreadable");
+                return nullptr;
+            }
             info_ptrs[stage] = &infos[stage];
         }
     } catch (const std::exception&) {
@@ -3444,6 +3471,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
     }
     const auto env_infos = VideoCommon::KeptInfosByEnvironment(graphics_key.unique_hashes, info_ptrs);
     ASSERT(live.size() <= env_infos.size());
+    // The words the translation that made the kept infos read only as whole texture handles are
+    // checked as the record's marked handle words are: by the texture their live value names.
+    const auto slots = VideoCommon::KeptSlotsByEnvironment(graphics_key.unique_hashes);
+    for (size_t i = 0; i < live.size(); ++i) {
+        if (slots[i] != VideoCommon::NoKeptSlot) {
+            (*recorded)[i].MarkCbufHandleWords(handle_words[slots[i]]);
+        }
+    }
     for (size_t i = 0; i < live.size(); ++i) {
         const char* why = "";
         if (!(*recorded)[i].AnswersHoldFor(*live[i], &why, format_traits, env_infos[i])) {
@@ -3601,6 +3636,15 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
                 }
                 continue;
             }
+            std::vector<u64> handle_words;
+            if (!VideoCommon::ReadKeptHandleWords(in, handle_words)) {
+                if (!first_reason) {
+                    first_reason = "kept handle words unreadable";
+                }
+                continue;
+            }
+            // Checked as the record's marked handle words are (see the graphics pipelines).
+            recorded.MarkCbufHandleWords(handle_words);
         } catch (const std::exception&) {
             CountPrecompiledReason("files unreadable");
             CloseQuietly(precompiled_file);
@@ -3717,6 +3761,12 @@ void PipelineCache::AuditPrecompiled(std::span<Shader::Environment* const> envs,
             precompiled_infos_file.clear();
             precompiled_infos_file.seekg(static_cast<std::streamoff>(offset));
             precompiled_infos_file.read(reinterpret_cast<char*>(kept_info.data()), size);
+            // Compared without the handle words kept after the info.
+            Shader::Info kept_parsed{};
+            std::span<const u8> rest{kept_info};
+            if (Shader::DeserializeInfo(rest, kept_parsed)) {
+                kept_info.resize(kept_info.size() - rest.size());
+            }
             if (kept_info != live_info[stage]) {
                 differ(stage, "infos");
                 same = false;

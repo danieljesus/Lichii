@@ -28,6 +28,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include <ranges>
 #include "shader_recompiler/environment.h"
@@ -1593,10 +1594,41 @@ u64 FileEnvironment::ReadInstruction(u32 address) {
     return code[(address - read_lowest) / sizeof(u64)];
 }
 
+u32 FileEnvironment::ReadCbufHandleWord(u32 cbuf_index, u32 cbuf_offset) {
+    reading_handle_word = true;
+    SCOPE_EXIT {
+        reading_handle_word = false;
+    };
+    return ReadCbufValue(cbuf_index, cbuf_offset);
+}
+
+std::vector<u64> FileEnvironment::CbufWordsReadOnlyAsHandles() const {
+    std::vector<u64> keys;
+    for (const auto& [key, kinds] : cbuf_read_kinds) {
+        if (kinds == 2) {
+            keys.push_back(key);
+        }
+    }
+    std::ranges::sort(keys);
+    return keys;
+}
+
+void FileEnvironment::MarkCbufHandleWords(std::span<const u64> keys) {
+    for (const u64 key : keys) {
+        if (cbuf_values.contains(key)) {
+            cbuf_handle_words.emplace(key, u8{1});
+        }
+    }
+}
+
 /// Recorded constant buffer value at `cbuf_index`/`cbuf_offset`. Without a record, the guess when
 /// one is set, else throws.
 u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
-    const auto it{cbuf_values.find(MakeCbufKey(cbuf_index, cbuf_offset))};
+    const u64 key = MakeCbufKey(cbuf_index, cbuf_offset);
+    if (observing_reads) {
+        cbuf_read_kinds[key] |= reading_handle_word ? u8{2} : u8{1};
+    }
+    const auto it{cbuf_values.find(key)};
     if (it == cbuf_values.end()) {
         if (guess) {
             return cbuf_index == 0 ? guess->cbuf_bank0 : guess->cbuf_other;
@@ -2204,6 +2236,42 @@ KeptInfosByEnvironment(
         }
     }
     return infos;
+}
+
+std::array<size_t, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> KeptSlotsByEnvironment(
+    std::span<const u64, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> unique_hashes) {
+    std::array<size_t, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> slots;
+    slots.fill(NoKeptSlot);
+    size_t env = 0;
+    for (size_t slot = 0; slot < unique_hashes.size(); ++slot) {
+        if (unique_hashes[slot] != 0) {
+            slots[env++] = slot == 0 ? NoKeptSlot : slot - 1;
+        }
+    }
+    return slots;
+}
+
+void AppendKeptHandleWords(std::vector<u8>& bytes, std::span<const u64> keys) {
+    const u32 count = static_cast<u32>(keys.size());
+    const auto* const count_bytes = reinterpret_cast<const u8*>(&count);
+    bytes.insert(bytes.end(), count_bytes, count_bytes + sizeof(count));
+    const auto* const key_bytes = reinterpret_cast<const u8*>(keys.data());
+    bytes.insert(bytes.end(), key_bytes, key_bytes + keys.size_bytes());
+}
+
+bool ReadKeptHandleWords(std::span<const u8> rest, std::vector<u64>& keys) {
+    u32 count{};
+    if (rest.size() < sizeof(count)) {
+        return false;
+    }
+    std::memcpy(&count, rest.data(), sizeof(count));
+    rest = rest.subspan(sizeof(count));
+    if (rest.size() != u64{count} * sizeof(u64)) {
+        return false;
+    }
+    keys.resize(count);
+    std::memcpy(keys.data(), rest.data(), rest.size());
+    return true;
 }
 
 } // namespace VideoCommon

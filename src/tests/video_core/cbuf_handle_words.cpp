@@ -334,3 +334,98 @@ TEST_CASE("Each environment takes the kept translation of its pipeline slot", "[
         REQUIRE(infos[1] == nullptr);
     }
 }
+
+namespace {
+u64 Key(u32 bank, u32 offset) {
+    return (u64{bank} << 32) | offset;
+}
+
+/// Recorded by a build that read a whole handle word as a plain value: handle 7, a 2D texture.
+VideoCommon::FileEnvironment OldLayoutRecord() {
+    WordEnvironment recorded{{{{2, 0x10}, 7}}, {{7, Color2D}}};
+    (void)recorded.ReadTextureType(recorded.ReadCbufValue(2, 0x10));
+    return Record(recorded);
+}
+} // namespace
+
+TEST_CASE("The preparation's translation tells which words it read only as handles",
+          "[video_core]") {
+    WordEnvironment recorded{{{{2, 0x10}, 7}, {{2, 0x14}, 3}, {{2, 0x18}, 4}}, {}};
+    (void)recorded.ReadCbufValue(2, 0x10);
+    (void)recorded.ReadCbufValue(2, 0x14);
+    (void)recorded.ReadCbufValue(2, 0x18);
+    auto file = Record(recorded);
+    Shader::Environment& env = file;
+    (void)env.ReadCbufHandleWord(2, 0x10); // before observing: not noted
+    file.ObserveCbufReads();
+    (void)env.ReadCbufHandleWord(2, 0x10);
+    (void)env.ReadCbufValue(2, 0x14);       // a value: a folded constant, a table, a part
+    (void)env.ReadCbufHandleWord(2, 0x18);  // read both ways
+    (void)env.ReadCbufValue(2, 0x18);
+    REQUIRE(file.CbufWordsReadOnlyAsHandles() == std::vector<u64>{Key(2, 0x10)});
+}
+
+TEST_CASE("A word the preparation read only as a handle is checked by the texture it names",
+          "[video_core]") {
+    const std::vector<u64> observed{Key(2, 0x10)};
+    const char* why = "";
+    SECTION("Another handle naming a texture of the same type") {
+        auto file = OldLayoutRecord();
+        file.MarkCbufHandleWords(observed);
+        WordEnvironment live{{{{2, 0x10}, 9}}, {{7, Color2D}, {9, Color2D}}};
+        REQUIRE(file.AnswersHoldFor(live, &why));
+    }
+    SECTION("Another handle naming a texture of another type") {
+        auto file = OldLayoutRecord();
+        file.MarkCbufHandleWords(observed);
+        WordEnvironment live{{{{2, 0x10}, 9}}, {{7, Color2D}, {9, Color3D}}};
+        REQUIRE(!file.AnswersHoldFor(live, &why));
+        REQUIRE(std::string_view{why} == "texture type");
+    }
+    SECTION("Not observed (read both ways, a part, or no kept observation): exact") {
+        auto file = OldLayoutRecord();
+        file.MarkCbufHandleWords({});
+        WordEnvironment live{{{{2, 0x10}, 9}}, {{7, Color2D}, {9, Color2D}}};
+        REQUIRE(!file.AnswersHoldFor(live, &why));
+        REQUIRE(std::string_view{why} == "constant buffer value");
+    }
+    SECTION("A word the record does not hold is not marked") {
+        auto file = OldLayoutRecord();
+        file.MarkCbufHandleWords(std::vector<u64>{Key(2, 0x20)});
+        WordEnvironment live{{{{2, 0x10}, 9}}, {{7, Color2D}, {9, Color2D}}};
+        REQUIRE(!file.AnswersHoldFor(live, &why));
+        REQUIRE(std::string_view{why} == "constant buffer value");
+    }
+}
+
+TEST_CASE("Kept handle words follow the info exactly", "[video_core]") {
+    std::vector<u8> bytes{0xaa, 0xbb};
+    const std::vector<u64> keys{Key(2, 0x10), Key(3, 0x48)};
+    VideoCommon::AppendKeptHandleWords(bytes, keys);
+    std::vector<u64> read;
+    REQUIRE(VideoCommon::ReadKeptHandleWords(std::span{bytes}.subspan(2), read));
+    REQUIRE(read == keys);
+    // A kept info of the previous format ends with the info: nothing follows it.
+    REQUIRE(!VideoCommon::ReadKeptHandleWords(std::span<const u8>{}, read));
+    // Short, or followed by anything else.
+    REQUIRE(!VideoCommon::ReadKeptHandleWords(std::span{bytes}.subspan(2, bytes.size() - 3), read));
+    bytes.push_back(0);
+    REQUIRE(!VideoCommon::ReadKeptHandleWords(std::span{bytes}.subspan(2), read));
+    std::vector<u8> none;
+    VideoCommon::AppendKeptHandleWords(none, {});
+    REQUIRE(VideoCommon::ReadKeptHandleWords(none, read));
+    REQUIRE(read.empty());
+}
+
+TEST_CASE("Each environment's pipeline slot", "[video_core]") {
+    using VideoCommon::NoKeptSlot;
+    const auto slots = VideoCommon::KeptSlotsByEnvironment(std::array<u64, 6>{0, 77, 88, 0, 0, 55});
+    REQUIRE(slots[0] == 0);
+    REQUIRE(slots[1] == 1);
+    REQUIRE(slots[2] == 4);
+    REQUIRE(slots[3] == NoKeptSlot);
+    const auto with_a = VideoCommon::KeptSlotsByEnvironment(std::array<u64, 6>{10, 11, 0, 0, 0, 55});
+    REQUIRE(with_a[0] == NoKeptSlot);
+    REQUIRE(with_a[1] == 0);
+    REQUIRE(with_a[2] == 4);
+}

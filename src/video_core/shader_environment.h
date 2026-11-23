@@ -308,6 +308,24 @@ public:
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 
+    [[nodiscard]] u32 ReadCbufHandleWord(u32 cbuf_index, u32 cbuf_offset) override;
+
+    /// From now on, notes how translation reads each constant buffer word: as a whole texture
+    /// handle (ReadCbufHandleWord), as a value (ReadCbufValue: folded constants, branch tables,
+    /// the parts of an assembled handle), or both.
+    void ObserveCbufReads() noexcept {
+        observing_reads = true;
+    }
+
+    /// The words translation read only as whole texture handles since ObserveCbufReads, sorted:
+    /// what the record would mark had the build that recorded it marked handle words.
+    [[nodiscard]] std::vector<u64> CbufWordsReadOnlyAsHandles() const;
+
+    /// Marks these recorded words as read only as texture handles (a precompiled record's kept
+    /// observation), as GenericEnvironment::Serialize marks them: AnswersHoldFor then checks each
+    /// by the texture its live value names. Words the record does not hold are ignored.
+    void MarkCbufHandleWords(std::span<const u64> keys);
+
     [[nodiscard]] Shader::TextureType ReadTextureType(u32 handle) override;
 
     [[nodiscard]] Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override;
@@ -395,6 +413,10 @@ private:
     std::vector<u32> dropped_texture_handles;
     bool lacks_recorded_value{};
     bool lacks_dropped_value{};
+    bool observing_reads{};
+    bool reading_handle_word{};
+    /// Since ObserveCbufReads: 1 read as a value, 2 as a whole handle, 3 both
+    ::Common::unordered_map<u64, u8> cbuf_read_kinds;
 };
 
 /// Where a pipeline is in a cache file, from its environment count to the end of its key, and a
@@ -511,5 +533,21 @@ KeptInfosByEnvironment(
     std::span<const u64, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> unique_hashes,
     std::span<const Shader::Info* const, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage>
         slot_infos);
+
+/// The pipeline slot (vertex B = 0 to fragment = 4) of each of a graphics pipeline's
+/// environments, in their order, as KeptInfosByEnvironment walks them; NoKeptSlot for vertex A
+/// and past the last environment.
+constexpr size_t NoKeptSlot = ~size_t{0};
+std::array<size_t, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> KeptSlotsByEnvironment(
+    std::span<const u64, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> unique_hashes);
+
+/// The precompiled store keeps after each stage's info the constant buffer words its
+/// translation read only as whole texture handles (FileEnvironment::CbufWordsReadOnlyAsHandles):
+/// a count, then the words' keys.
+void AppendKeptHandleWords(std::vector<u8>& bytes, std::span<const u64> keys);
+
+/// Reads what follows a kept info (the bytes DeserializeInfo left), which must be exactly that
+/// list; false when it is missing, short or followed by anything.
+[[nodiscard]] bool ReadKeptHandleWords(std::span<const u8> rest, std::vector<u64>& keys);
 
 } // namespace VideoCommon
