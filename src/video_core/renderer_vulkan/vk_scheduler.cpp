@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/texture_cache/formatter.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -342,9 +343,18 @@ void Scheduler::OpenHoistSlot() {
         return;
     }
     auto slot = std::make_shared<std::vector<HoistedCommand>>();
-    Record([slot](vk::CommandBuffer cmdbuf) {
+    Record([this, slot](vk::CommandBuffer cmdbuf) {
+        // TEST ONLY: EDEN_NX2_TEST_PASS_ORDER times a slot's commands apart from what came
+        // before it and from the pass after it.
+        static const bool test_order{std::getenv("EDEN_NX2_TEST_PASS_ORDER") != nullptr};
+        if (test_order && !slot->empty()) {
+            TraceSegmentEnd(cmdbuf, 1, 0);
+        }
         for (const HoistedCommand& command : *slot) {
             command(cmdbuf);
+        }
+        if (test_order && !slot->empty()) {
+            TraceSegmentEnd(cmdbuf, 2, static_cast<u32>(slot->size()));
         }
     });
     // Assigned after Record: a full chunk makes Record dispatch, which drops the previous slot.
@@ -504,6 +514,14 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     });
     num_renderpass_images = framebuffer->NumImages();
     renderpass_images = framebuffer->Images();
+    {
+        const RenderPassKey& key = framebuffer->RenderPassKeyBase();
+        trace_begin_color = key.color_formats[0];
+        trace_begin_depth = key.depth_format;
+        trace_begin_colors = static_cast<u32>(std::ranges::count_if(
+            key.color_formats,
+            [](auto format) { return format != VideoCore::Surface::PixelFormat::Invalid; }));
+    }
     renderpass_image_ranges = framebuffer->ImageRanges();
     framebuffer->MarkResolveShadowsUpToDate();
 }
@@ -746,11 +764,11 @@ void Scheduler::TraceShader(u64 hash, u32 stage) {
     trace_work.shaders[trace_work.num_shaders++] = {hash, stage};
 }
 
-void Scheduler::TraceGraphicsPipeline(const std::array<u64, 6>& hashes) {
+void Scheduler::TraceGraphicsPipeline(const std::array<u64, 6>& hashes, bool emulated_mesh) {
     if (!trace_work_pool) {
         return;
     }
-    Record([this, hashes](vk::CommandBuffer) {
+    Record([this, hashes, emulated_mesh](vk::CommandBuffer) {
         if (!trace_gpu_recording) {
             return;
         }
@@ -759,6 +777,7 @@ void Scheduler::TraceGraphicsPipeline(const std::array<u64, 6>& hashes) {
             TraceShader(hashes[stage], stage);
         }
         ++trace_pass.draws;
+        trace_pass.mesh_draws += emulated_mesh ? 1 : 0;
         const auto vertex = std::ranges::find_if(hashes.begin(), hashes.end() - 1,
                                                  [](u64 hash) { return hash != 0; });
         if (vertex != hashes.end() - 1) {
@@ -796,12 +815,28 @@ void Scheduler::TracePassShaders(u64 hash, u32 stage, u64 fragment_hash) {
     trace_pass.shaders[trace_pass.num_shaders++] = {hash, fragment_hash, stage};
 }
 
-void Scheduler::TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent) {
+void Scheduler::TraceSegmentEnd(vk::CommandBuffer cmdbuf, u32 kind, u32 slot_commands) {
+    if (!trace_gpu_recording || !trace_pass_pool || trace_pass_count == TraceMaxPasses) {
+        return;
+    }
+    trace_pass.kind = kind;
+    trace_pass.slot_commands = slot_commands;
+    TracePassEnd(cmdbuf, VkExtent2D{});
+}
+
+void Scheduler::TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent,
+                             VideoCore::Surface::PixelFormat color,
+                             VideoCore::Surface::PixelFormat depth, u32 colors) {
     if (!trace_gpu_recording || !trace_pass_pool || trace_pass_count == TraceMaxPasses) {
         return;
     }
     trace_pass.submission = trace_gpu_count;
     trace_pass.extent = extent;
+    if (trace_pass.kind == 0) {
+        trace_pass.color = color;
+        trace_pass.depth = depth;
+        trace_pass.colors = colors;
+    }
     trace_pass_items[trace_pass_count] = trace_pass;
     cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_pass_pool,
                           trace_pass_count);
@@ -855,6 +890,36 @@ void Scheduler::ReportPassTimes(const std::vector<u64>& submission_begin,
         const double ms = to_ms(previous, submission_end[submission]);
         segments.push_back({ms, &trace_pass_tails[submission], true});
         total_ms += ms;
+    }
+    // TEST ONLY: EDEN_NX2_TEST_PASS_ORDER logs every segment in submission order.
+    static const bool test_order{std::getenv("EDEN_NX2_TEST_PASS_ORDER") != nullptr};
+    if (test_order) {
+        LOG_INFO(Render_Vulkan, "DKB gpu_order renderer_frame={} segments={} timed_ms={:.3f}",
+                 trace_sample_frame, segments.size(), total_ms);
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const auto& [ms, pass, tail] = segments[i];
+            std::string shaders;
+            for (u32 s = 0; s < pass->num_shaders; ++s) {
+                const auto& shader = pass->shaders[s];
+                shaders += fmt::format("{}s{}:{:016x}", shaders.empty() ? "" : ",", shader.stage,
+                                       shader.hash);
+                if (shader.fragment_hash != 0) {
+                    shaders += fmt::format("+s5:{:016x}", shader.fragment_hash);
+                }
+            }
+            const std::string what =
+                tail              ? std::string{"tail"}
+                : pass->kind == 1 ? std::string{"before-slot"}
+                : pass->kind == 2 ? fmt::format("slot commands={}", pass->slot_commands)
+                                  : fmt::format("pass {}x{} colors={} color={} depth={}",
+                                                pass->extent.width, pass->extent.height,
+                                                pass->colors, pass->color, pass->depth);
+            LOG_INFO(Render_Vulkan,
+                     "DKB gpu_seg {} {:.3f}ms submission={} {} draws={} mesh_draws={} "
+                     "dispatches={} shaders={}",
+                     i, ms, pass->submission, what, pass->draws, pass->mesh_draws,
+                     pass->dispatches, shaders);
+        }
     }
     std::ranges::sort(segments, std::greater<>{}, &Segment::ms);
     LOG_INFO(Render_Vulkan, "DKB gpu_passes renderer_frame={} passes={}{} timed_ms={:.3f}",
@@ -1336,6 +1401,8 @@ void Scheduler::EndRenderPass()
         query_cache->NotifySegment(false);
 
         Record([this, render_area = state.render_area, num_images = num_renderpass_images,
+                trace_color = trace_begin_color, trace_depth = trace_begin_depth,
+                trace_colors = trace_begin_colors,
                        images = renderpass_images,
                        ranges = renderpass_image_ranges,
                        has_transform_feedback = device.IsExtTransformFeedbackSupported()](
@@ -1375,7 +1442,7 @@ void Scheduler::EndRenderPass()
                         .subresourceRange = range,
                 };
             }
-            TracePassEnd(cmdbuf, render_area);
+            TracePassEnd(cmdbuf, render_area, trace_color, trace_depth, trace_colors);
             cmdbuf.EndRenderPass();
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,

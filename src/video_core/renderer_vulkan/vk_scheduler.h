@@ -31,6 +31,7 @@
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/frame_pacer.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCommon {
@@ -100,7 +101,7 @@ public:
     }
     /// Host GPU busy time of the last sampled frame, nullopt when none was taken in 3 s.
     [[nodiscard]] std::optional<double> GpuBusyMs() const;
-    void TraceGraphicsPipeline(const std::array<u64, 6>& hashes);
+    void TraceGraphicsPipeline(const std::array<u64, 6>& hashes, bool emulated_mesh = false);
     void TraceComputePipeline(u64 hash);
     /// Worker thread, inside a recorded command: timestamps one draw or dispatch of a sampled
     /// submission. A draw passes its vertex and fragment hashes, a dispatch its compute hash.
@@ -535,7 +536,10 @@ private:
     void TracePassShaders(u64 hash, u32 stage, u64 fragment_hash);
     /// Worker thread, just before a render pass of a sampled submission ends: timestamps it and
     /// keeps what was recorded since the previous pass ended.
-    void TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent);
+    void TracePassEnd(vk::CommandBuffer cmdbuf, VkExtent2D extent,
+                      VideoCore::Surface::PixelFormat color = VideoCore::Surface::PixelFormat::Invalid,
+                      VideoCore::Surface::PixelFormat depth = VideoCore::Surface::PixelFormat::Invalid,
+                      u32 colors = 0);
     /// Logs the sampled frame's GPU time by render pass (the 16 most expensive). Each pass is
     /// timed from the end of the one before it, so compute and copies between them count with it.
     /// MoltenVK samples timestamps only at Metal encoder boundaries, so this is the finest split
@@ -620,7 +624,19 @@ private:
         u32 num_shaders{};
         u32 untracked_uses{};
         std::array<Shaders, 4> shaders{};
+        // TEST ONLY (EDEN_NX2_TEST_PASS_ORDER)
+        u32 kind{}; ///< 0 a pass, 1 work before a hoist slot, 2 a hoist slot's commands
+        u32 slot_commands{};
+        u32 mesh_draws{};
+        VideoCore::Surface::PixelFormat color{VideoCore::Surface::PixelFormat::Invalid};
+        VideoCore::Surface::PixelFormat depth{VideoCore::Surface::PixelFormat::Invalid};
+        u32 colors{};
     };
+    /// TEST ONLY: closes the trace segment so far as a non-pass segment of `kind`.
+    void TraceSegmentEnd(vk::CommandBuffer cmdbuf, u32 kind, u32 slot_commands);
+    VideoCore::Surface::PixelFormat trace_begin_color{VideoCore::Surface::PixelFormat::Invalid};
+    VideoCore::Surface::PixelFormat trace_begin_depth{VideoCore::Surface::PixelFormat::Invalid};
+    u32 trace_begin_colors{};
     vk::QueryPool trace_pass_pool;
     std::vector<PassTrace> trace_pass_items;
     /// What each sampled submission recorded after its last render pass ended.

@@ -425,6 +425,7 @@ private:
         u32 primitive_vertices{3};
         std::array<u32, 4> position_lines{};
         bool pending{};
+        u64 key{}; ///< TEST ONLY: the mesh program's hash (EDEN_NX2_TEST_MESH_FILL)
     } mesh_probe;
     void ReadMeshEmulationProbe();
     /// Mesh emulation with a task program: the output arena every task draw of a submission

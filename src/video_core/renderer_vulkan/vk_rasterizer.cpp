@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <map>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -357,6 +358,71 @@ void RecordDispatchBarrier(vk::CommandBuffer cmdbuf) {
 /// Reads back the mesh emulation's output for the probe frame and logs how many primitives of
 /// PrimitiveVertices() indices it holds: unused slots, primitives with every vertex off screen
 /// and bad indices.
+namespace {
+// TEST ONLY (EDEN_NX2_TEST_MESH_FILL with EDEN_NX2_MESH_EMULATION_PROBE): per mesh program, the
+// groups every emulated draw ran and, from sampled draws' output, the primitives and vertices the
+// program emitted against the slots the emulated draw submits.
+struct MeshFill {
+    bool task{};
+    u32 max_vertices{};
+    u32 max_primitives{};
+    u32 primitive_vertices{};
+    u32 block_words{};
+    u32 vertex_lines{};
+    u64 draws{};
+    u64 groups{};
+    u64 probed_groups{};
+    u64 primitives{};
+    u64 vertices{};
+};
+std::map<u64, MeshFill> g_mesh_fill;
+u64 g_mesh_fill_frames{};
+
+void LogMeshFill() {
+    std::vector<std::pair<u64, const std::pair<const u64, MeshFill>*>> order;
+    u64 total_groups{};
+    for (const auto& entry : g_mesh_fill) {
+        order.emplace_back(entry.second.groups, &entry);
+        total_groups += entry.second.groups;
+    }
+    std::sort(order.rbegin(), order.rend());
+    const double frames = static_cast<double>((std::max)(g_mesh_fill_frames, u64{1}));
+    double weighted_primitives{}, weighted_vertices{}, weight{};
+    for (const auto& [groups, entry] : order) {
+        const MeshFill& f = entry->second;
+        const double primitive_fill =
+            f.probed_groups ? static_cast<double>(f.primitives) /
+                                  (static_cast<double>(f.probed_groups) * f.max_primitives)
+                            : -1.0;
+        const double vertex_fill =
+            f.probed_groups ? static_cast<double>(f.vertices) /
+                                  (static_cast<double>(f.probed_groups) * f.max_vertices)
+                            : -1.0;
+        if (f.probed_groups) {
+            weighted_primitives += primitive_fill * static_cast<double>(f.groups);
+            weighted_vertices += vertex_fill * static_cast<double>(f.groups);
+            weight += static_cast<double>(f.groups);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Mesh fill {:016x}: task {}, max_vertices {}, max_primitives {} of {} vertices, "
+                 "block {} words ({} lines a vertex); {:.1f} draws, {:.0f} groups a frame "
+                 "({:.0f} KiB written, {:.0f} vertices submitted a frame); probed {} groups: "
+                 "primitives {:.3f} of the slots, vertices {:.3f}",
+                 entry->first, f.task, f.max_vertices, f.max_primitives, f.primitive_vertices,
+                 f.block_words, f.vertex_lines, static_cast<double>(f.draws) / frames,
+                 static_cast<double>(f.groups) / frames,
+                 static_cast<double>(f.groups) * f.block_words * 4.0 / 1024.0 / frames,
+                 static_cast<double>(f.groups) * f.max_primitives * f.primitive_vertices / frames,
+                 f.probed_groups, primitive_fill, vertex_fill);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Mesh fill over {:.0f} frames: {:.0f} groups a frame; weighted by groups over the "
+             "probed programs, primitives {:.3f} of the slots, vertices {:.3f}",
+             frames, static_cast<double>(total_groups) / frames,
+             weight ? weighted_primitives / weight : -1.0, weight ? weighted_vertices / weight : -1.0);
+}
+} // namespace
+
 void RasterizerVulkan::ReadMeshEmulationProbe() {
     const MeshEmulationProbe probe{mesh_probe};
     mesh_probe.pending = false;
@@ -428,6 +494,38 @@ void RasterizerVulkan::ReadMeshEmulationProbe() {
              "Mesh emulation probe frame {}: {} groups, {} primitives of {} vertices ({} unused "
              "slots), {} with every vertex off screen, {} with a bad index; first primitives:{}",
              probe.frame, probe.groups, triangles, corners, degenerate, outside, bad_index, sample);
+    if (probe.key != 0) {
+        // TEST ONLY: vertices a group's emitted primitives use, against max_vertices.
+        u64 used_vertices{};
+        std::vector<bool> used(probe.max_vertices);
+        for (u32 group = 0; group < probe.groups; ++group) {
+            std::fill(used.begin(), used.end(), false);
+            const u64 base{u64{group} * probe.block_words};
+            const u64 index_base{base + u64{probe.max_vertices} * probe.vertex_lines};
+            for (u32 primitive = 0; primitive < probe.max_primitives; ++primitive) {
+                std::array<u32, 3> storage{};
+                for (u32 corner = 0; corner < corners; ++corner) {
+                    storage[corner] = word(index_base + u64{primitive} * corners + corner);
+                }
+                const bool unused{corners == 3 ? storage[0] == storage[1] && storage[1] == storage[2]
+                                               : storage[0] ==
+                                                     Shader::Backend::SPIRV::MESH_EMULATION_UNUSED_VERTEX};
+                if (unused) {
+                    continue;
+                }
+                for (u32 corner = 0; corner < corners; ++corner) {
+                    if (storage[corner] < probe.max_vertices && !used[storage[corner]]) {
+                        used[storage[corner]] = true;
+                        ++used_vertices;
+                    }
+                }
+            }
+        }
+        MeshFill& fill = g_mesh_fill[probe.key];
+        fill.probed_groups += probe.groups;
+        fill.primitives += triangles;
+        fill.vertices += used_vertices;
+    }
 }
 
 const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
@@ -1173,8 +1271,35 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // host-visible download buffer, as device-local ones are not mapped on every GPU).
         static const bool probe{std::getenv("EDEN_NX2_MESH_EMULATION_PROBE") != nullptr};
         const bool has_task{pipeline->MeshEmulationHasTask()};
+        // TEST ONLY: EDEN_NX2_TEST_MESH_FILL samples every 97th draw (all programs) and counts
+        // every draw's groups per mesh program.
+        static const bool test_fill{std::getenv("EDEN_NX2_TEST_MESH_FILL") != nullptr};
+        static u64 test_fill_draws{}, test_fill_last_frame{~0ULL};
+        u64 test_fill_key{};
+        if (test_fill) {
+            const auto& hashes{pipeline->ShaderHashes()};
+            test_fill_key = hashes[0] != 0 ? hashes[0] : hashes[1];
+            const MeshEmulationSetup& setup{*pipeline->MeshEmulation()};
+            MeshFill& fill = g_mesh_fill[test_fill_key];
+            fill.task = has_task;
+            fill.max_vertices = setup.max_vertices;
+            fill.max_primitives = setup.max_primitives;
+            fill.primitive_vertices = setup.primitive_vertices;
+            fill.block_words = setup.block_words;
+            fill.vertex_lines = setup.vertex_lines;
+            ++fill.draws;
+            fill.groups += groups;
+            if (render_trace_frame != test_fill_last_frame) {
+                test_fill_last_frame = render_trace_frame;
+                ++g_mesh_fill_frames;
+            }
+            if (++test_fill_draws % 20000 == 0) {
+                LogMeshFill();
+            }
+        }
         const bool probe_draw{probe && !has_task && !mesh_probe.pending && groups != 0 &&
-                              render_trace_frame % 60 == 0};
+                              (test_fill ? test_fill_draws % 97 == 0
+                                         : render_trace_frame % 60 == 0)};
         // With a task program the draw's groups are task workgroups. The mesh workgroups they ask
         // for are only known on the GPU, so their output goes to the submission's arena.
         const u64 block_bytes{pipeline->MeshEmulationBlockBytes()};
@@ -1253,6 +1378,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 .primitive_vertices = setup.primitive_vertices,
                 .position_lines = setup.position_lines,
                 .pending = true,
+                .key = test_fill_key,
             };
         } else if (probe_draw && output.mapped_span.empty()) {
             static bool warned{};
@@ -1425,7 +1551,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
                 query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, samples);
                 const Profile::Scope scope{Profile::Zone::DrawRecord};
                 const auto& hashes = pipeline->ShaderHashes();
-                scheduler.TraceGraphicsPipeline(hashes);
+                scheduler.TraceGraphicsPipeline(hashes, pipeline->IsEmulatedMesh());
                 RecordDirectDraw(scheduler, params, {hashes[1], hashes[5]});
             }};
     } else {
@@ -1441,7 +1567,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                                   maxwell3d->regs.zpass_pixel_count_enable);
         Profile::Scope scope{Profile::Zone::DrawRecord};
-        scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
+        scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes(), pipeline->IsEmulatedMesh());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
         draw_func();
     }
