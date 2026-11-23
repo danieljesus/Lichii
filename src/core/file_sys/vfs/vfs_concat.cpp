@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 #include "common/assert.h"
@@ -114,13 +115,17 @@ std::size_t ConcatenatedVfsFile::GetSize() const {
 }
 
 // The parts lie end to end, so what they hold adds up; a part that holds less than its size, or a
-// filler that holds nothing, adds only what it holds.
+// filler that holds nothing, adds only what it holds. The sum saturates and never exceeds the
+// file's size, should parts overlap.
 std::size_t ConcatenatedVfsFile::GetHeldSize() const {
     std::size_t held = 0;
     for (const auto& entry : concatenation_map) {
-        held += entry.file->GetHeldSize();
+        const std::size_t part = entry.file->GetHeldSize();
+        held = part > std::numeric_limits<std::size_t>::max() - held
+                   ? std::numeric_limits<std::size_t>::max()
+                   : held + part;
     }
-    return held;
+    return std::min(held, GetSize());
 }
 
 bool ConcatenatedVfsFile::Resize(std::size_t new_size) {

@@ -182,7 +182,7 @@ VirtualFile DenseSparseSection(const NcaReader& reader, const NcaFsHeaderReader&
     // NCA's file, and the table no further than the bytes the file holds.
     const s64 nca_size = static_cast<s64>(nca->GetSize());
     const s64 physical_offset = info.physical_offset;
-    if (physical_offset < 0 || info.bucket.offset < 0 || info.bucket.size <= 0 ||
+    if (nca_size < 0 || physical_offset < 0 || info.bucket.offset < 0 || info.bucket.size <= 0 ||
         info.bucket.size > static_cast<s64>(nca->GetHeldSize()) ||
         info.bucket.offset > nca_size - info.bucket.size ||
         info.GetPhysicalSize() > nca_size - physical_offset) {
@@ -283,8 +283,9 @@ VirtualFile DecryptSection(const NcaReader& reader, const NcaFsHeaderReader& hea
             }
             const auto meta_size = Common::AlignUp(static_cast<s64>(patch.aes_ctr_ex_size),
                                                    NcaHeader::XtsBlockSize);
-            // The table lies in the NCA's file: a sparse section's size is virtual.
-            if (meta_size > static_cast<s64>(nca->GetHeldSize())) {
+            // The table lies in the NCA's file: a sparse section's size is virtual. A size near
+            // the top of s64 aligns up to a negative one.
+            if (meta_size <= 0 || meta_size > static_cast<s64>(nca->GetHeldSize())) {
                 error = "AES-CTR-EX table out of range";
                 return nullptr;
             }

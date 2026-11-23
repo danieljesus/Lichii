@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -183,6 +184,8 @@ TEST_CASE("Held size passes through concatenations, encryption layers and storag
         "concat", std::vector<VirtualFile>{MakeFile(std::vector<u8>(0x100)), zeros, claimed});
     REQUIRE(concat->GetSize() == 0x100 + 0x1000 + (size_t{1} << 41));
     REQUIRE(concat->GetHeldSize() == 0x100 + 0x200);
+    // What parts hold is never more than the concatenation's size, whatever the parts claim.
+    REQUIRE(concat->GetHeldSize() <= concat->GetSize());
 
     REQUIRE(Core::Crypto::XTSEncryptionLayer{claimed, {}}.GetHeldSize() == 0x200);
 
@@ -1104,6 +1107,27 @@ TEST_CASE("Decrypting an NCA refuses an AES-CTR-EX table of a negative size", "[
     REQUIRE(OpenDecryptedNca(MakeFile(nca.Bytes()), error) == nullptr);
     UNSCOPED_INFO(error);
     REQUIRE(error.find("invalid AES-CTR-EX table") != std::string::npos);
+}
+
+TEST_CASE("Decrypting an NCA refuses an AES-CTR-EX table whose aligned size wraps",
+          "[core][file_sys]") {
+    auto nca = MakeAesCtrExNca();
+    nca.fs.encryption_type = NcaFsHeader::EncryptionType::AesCtrEx;
+    nca.fs.patch_info.aes_ctr_ex_size = std::numeric_limits<s64>::max();
+    std::string error;
+    REQUIRE(OpenDecryptedNca(MakeFile(nca.Bytes()), error) == nullptr);
+    UNSCOPED_INFO(error);
+    REQUIRE(error.find("AES-CTR-EX table out of range") != std::string::npos);
+}
+
+TEST_CASE("Decrypting an NCA refuses a sparse section of an NCA claimed larger than s64",
+          "[core][file_sys]") {
+    const auto nca = MakeSparseNca();
+    const auto claimed = std::make_shared<OffsetVfsFile>(MakeFile(nca.Bytes()), size_t{1} << 63, 0);
+    std::string error;
+    REQUIRE(OpenDecryptedNca(claimed, error) == nullptr);
+    UNSCOPED_INFO(error);
+    REQUIRE(error.find("sparse data is out of range") != std::string::npos);
 }
 
 TEST_CASE("NCA decrypted from a range that claims too much refuses an indirect table it does not "
