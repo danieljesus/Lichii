@@ -765,7 +765,7 @@ private:
     /// Records a clear of the whole image to zero.
     void ClearTiles();
 
-    ImagePoolKey pool_key{}; ///< Before original_image: MakeImage fills it while making that
+    ImagePoolKey pool_key{}; ///< Describes original_image: MakeImage fills it while making that
     bool pool_allowed = false;
     vk::Image original_image;
     vk::Image scaled_image;
@@ -879,13 +879,18 @@ private:
     const Device* device = nullptr;
     const SlotVector<Image>* slot_images = nullptr;
 
+    struct NullImages {
+        vk::Image one_dimensional;
+        vk::Image two_dimensional;
+    };
+    std::unique_ptr<NullImages> null_images;
     std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
     std::optional<StorageViews> storage_views;
     vk::ImageView typeless_storage_view;
     vk::ImageView depth_view;
     vk::ImageView stencil_view;
     vk::ImageView color_view;
-    vk::Image null_image;
+    std::optional<VideoCommon::SubresourceRange> compact_view_range;
     VkImage image_handle = VK_NULL_HANDLE;
     VkImageView render_target = VK_NULL_HANDLE;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
