@@ -3658,7 +3658,8 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
 }
 
 void PipelineCache::AuditPrecompiled(std::span<Shader::Environment* const> envs, bool compute,
-                                     u64 key_hash, const PrecompiledRecord* given) {
+                                     u64 key_hash, const PrecompiledRecord* given,
+                                     u64 compute_shader_hash) {
     const auto it = precompiled_records.find(key_hash);
     if (!given && (compute || it == precompiled_records.end())) {
         return;
@@ -3680,7 +3681,11 @@ void PipelineCache::AuditPrecompiled(std::span<Shader::Environment* const> envs,
                                            envs[0]->StartAddress()};
             auto program{TranslateProgram(main_pools.inst, main_pools.block, *envs[0], cfg,
                                           host_info)};
-            live_code[0] = EmitSPIRV(profile, program);
+            // As CreateComputePipeline emits it: through EmitPipelineShader, which routes global
+            // memory with route_single_candidates on the NVIDIA proprietary driver, so a plain
+            // EmitSPIRV would differ from every kept module of a program that routes.
+            Shader::Backend::SPIRV::PrepareHmma(profile, program);
+            live_code[0] = EmitComputeShader(profile, program, compute_shader_hash);
             Shader::SerializeInfo(program.info, live_info[0]);
             present[0] = true;
         } else {
@@ -5358,7 +5363,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
         entry = CreatePrecompiledComputePipeline(key, env, &matched);
         if (entry.pipeline && PrecompiledAudit()) {
             Shader::Environment* const env_ptr = &env;
-            AuditPrecompiled(std::span(&env_ptr, 1), true, key.Hash(), matched);
+            AuditPrecompiled(std::span(&env_ptr, 1), true, key.Hash(), matched, key.unique_hash);
         }
         if (entry.pipeline) {
             precompiled_created.fetch_add(1, std::memory_order_relaxed);

@@ -399,9 +399,11 @@ private:
     /// the game's state, on the GPU thread, and its SPIR-V and infos compared with the kept ones
     /// (counted in the 10 s report, the first differences logged). Slow: a check of the
     /// relational answers (FileEnvironment::AnswersHoldFor), not for play. A compute pipeline
-    /// passes the record it was made from.
+    /// passes the record it was made from and its program's hash, as its module is emitted for
+    /// that program (EmitComputeShader).
     void AuditPrecompiled(std::span<Shader::Environment* const> envs, bool compute,
-                          u64 key_hash, const PrecompiledRecord* record = nullptr);
+                          u64 key_hash, const PrecompiledRecord* record = nullptr,
+                          u64 compute_shader_hash = 0);
 
     /// The current pipeline was precompiled and its build failed (its translation did not give
     /// the infos it was drawn with): replaced by one translated from the game's state.
