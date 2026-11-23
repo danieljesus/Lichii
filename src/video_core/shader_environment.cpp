@@ -1474,6 +1474,129 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
         return storage_pointer_types.contains(MakeCbufKey(index, offset)) ||
                (offset >= 4 && storage_pointer_types.contains(MakeCbufKey(index, offset - 4)));
     };
+    // Handle words the kept translation names. Translation reads a texture handle only to ask the
+    // texture it names: its type (an image size query takes it as it is, a fetch asks whether it
+    // is a buffer, any other instruction keeps its own) and its pixel format (the integer flag and
+    // the traits format_traits covers); the descriptor keeps the words' places and the shader reads
+    // the handle at run time. So a translation made with one handle is the one made with any
+    // handle naming a texture with the same answers, and such a word is checked by the texture its
+    // live value names instead of by its value (the recorded handle's own answers are still asked of
+    // the live state below, as another descriptor may read that handle too). Covered: the parts of a handle assembled from
+    // shifted or several words, which are read as values, and whole handle words of records made
+    // before handle words were marked, which load as plain values. The reference is the record's
+    // answer for the recorded handle, or, where a record keeps none (a played record drops them),
+    // the descriptor's own type and integer flag, the ones the program was translated with.
+    // Kept exact: words outside the texture bank (bank 1 holds the driver constants folded into
+    // the code), words no descriptor names, and every word of a program whose indirect branch (BRX,
+    // JMX) may take its table from the texture bank: translation reads a table as values too, and
+    // the record does not tell such a word apart from a handle's.
+    std::vector<u64> named_words;
+    if (info && texture_bound != 1) {
+        // Scanned only once a descriptor could be relaxed. A branch table is read by an LDC whose
+        // bank is in its encoding (indirect_branch_table_track.cpp): only a program with both an
+        // indirect branch and an LDC from the texture bank may have one there.
+        std::optional<bool> table_in_texture_bank;
+        const auto may_have_table_in_texture_bank = [&] {
+            if (!table_in_texture_bank) {
+                const auto is_indirect_branch = [](u64 word) {
+                    const u64 opcode = word >> 52;
+                    return opcode == 0xe25 || opcode == 0xe20; // BRX, JMX
+                };
+                const auto loads_texture_bank = [this](u64 word) {
+                    return (word >> 51) == 0x1df2 && ((word >> 36) & 0x1f) == texture_bound; // LDC
+                };
+                table_in_texture_bank = std::ranges::any_of(code, is_indirect_branch) &&
+                                        std::ranges::any_of(code, loads_texture_bank);
+            }
+            return *table_in_texture_bank;
+        };
+        const auto recorded_word = [&](u32 index, u32 offset) -> std::optional<u32> {
+            const auto it = cbuf_values.find(MakeCbufKey(index, offset));
+            return it == cbuf_values.end() ? std::nullopt : std::optional{it->second};
+        };
+        const auto check_named = [&](const auto& desc) -> const char* {
+            if (desc.handle_program != ~0U || desc.count != 1) {
+                return nullptr;
+            }
+            if constexpr (requires { desc.handle_is_pointer_word; }) {
+                if (desc.handle_is_pointer_word) {
+                    return nullptr;
+                }
+            }
+            const bool whole_word =
+                !desc.has_secondary && desc.shift_left == 0 && desc.secondary_shift_left == 0;
+            const u32 secondary_index =
+                desc.has_secondary ? desc.secondary_cbuf_index : desc.cbuf_index;
+            const u32 secondary_offset =
+                desc.has_secondary ? desc.secondary_cbuf_offset : desc.cbuf_offset;
+            if (desc.cbuf_index != texture_bound || secondary_index != texture_bound ||
+                may_have_table_in_texture_bank()) {
+                return nullptr;
+            }
+            // A marked handle word is checked as such below.
+            if (whole_word &&
+                cbuf_handle_words.contains(MakeCbufKey(desc.cbuf_index, desc.cbuf_offset))) {
+                return nullptr;
+            }
+            const auto lhs = recorded_word(desc.cbuf_index, desc.cbuf_offset);
+            const auto rhs = recorded_word(secondary_index, secondary_offset);
+            if (!lhs || !rhs) {
+                return nullptr;
+            }
+            const u32 recorded = (*lhs << desc.shift_left) | (*rhs << desc.secondary_shift_left);
+            const auto type = texture_types.find(recorded);
+            const auto format = texture_pixel_formats.find(recorded);
+            std::optional<Shader::TextureType> translated_type;
+            std::optional<bool> translated_integer;
+            if constexpr (requires { desc.type; desc.is_integer; }) {
+                translated_type = desc.type;
+                translated_integer = desc.is_integer;
+            }
+            if (type == texture_types.end() && format == texture_pixel_formats.end() &&
+                !translated_type) {
+                return nullptr;
+            }
+            const u32 now =
+                whole_word ? live.ReadCbufHandleWord(desc.cbuf_index, desc.cbuf_offset)
+                           : (live.ReadCbufValue(desc.cbuf_index, desc.cbuf_offset)
+                              << desc.shift_left) |
+                                 (live.ReadCbufValue(secondary_index, secondary_offset)
+                                  << desc.secondary_shift_left);
+            if (type != texture_types.end()) {
+                if (live.ReadTextureType(now) != type->second) {
+                    return "texture type";
+                }
+            } else if (translated_type && live.ReadTextureType(now) != *translated_type) {
+                return "texture type";
+            }
+            if (format != texture_pixel_formats.end()) {
+                if (((PixelFormatTraits(live.ReadTexturePixelFormat(now)) ^
+                      PixelFormatTraits(format->second)) &
+                     format_traits) != 0) {
+                    return "texture pixel format";
+                }
+            } else if (translated_integer &&
+                       live.IsTexturePixelFormatInteger(now) != *translated_integer) {
+                return "texture pixel format";
+            }
+            named_words.push_back(MakeCbufKey(desc.cbuf_index, desc.cbuf_offset));
+            named_words.push_back(MakeCbufKey(secondary_index, secondary_offset));
+            return nullptr;
+        };
+        for (const auto& desc : info->texture_descriptors) {
+            if (const char* reason = check_named(desc)) {
+                return fail(reason);
+            }
+        }
+        for (const auto& desc : info->texture_buffer_descriptors) {
+            if (const char* reason = check_named(desc)) {
+                return fail(reason);
+            }
+        }
+    }
+    const auto is_named_word = [&](u64 key) {
+        return std::ranges::find(named_words, key) != named_words.end();
+    };
     std::vector<u32> handles_read;
     for (const auto& [key, value] : cbuf_values) {
         const u32 index = static_cast<u32>(key >> 32);
@@ -1501,7 +1624,7 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
             handles_read.push_back(value);
             continue;
         }
-        if (live_value != value && !is_pointer_word(key)) {
+        if (live_value != value && !is_pointer_word(key) && !is_named_word(key)) {
             return fail("constant buffer value");
         }
     }
