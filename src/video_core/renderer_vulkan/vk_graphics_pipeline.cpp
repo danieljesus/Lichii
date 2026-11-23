@@ -1774,7 +1774,27 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         }
     }
 
+    // EDEN_NX2_MESH_HOIST_PROBE=1 (local probe, not for a PR): of the emulated mesh dispatches,
+    // how many find a render pass open, and how many find the very pass the previous emulated mesh
+    // draw left open (nothing closed it in between), which a hoisted dispatch would not reopen.
+    static const bool hoist_probe{std::getenv("EDEN_NX2_MESH_HOIST_PROBE") != nullptr};
+    static u64 probe_total{}, probe_open{}, probe_same{}, probe_same_fb{};
+    static u64 probe_serial{~0ULL};
+    static const void* probe_framebuffer{};
     if (mesh_emulation) {
+        if (hoist_probe) {
+            const bool open{scheduler.IsRenderPassActive()};
+            ++probe_total;
+            probe_open += open ? 1 : 0;
+            probe_same += (open && scheduler.RenderPassSerial() == probe_serial) ? 1 : 0;
+            probe_same_fb += (probe_framebuffer == texture_cache.GetFramebuffer()) ? 1 : 0;
+            if (probe_total % 2000 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "Mesh hoist probe: {} dispatches, {} with a pass open, {} in the pass the "
+                         "previous mesh draw left open, {} with the previous mesh draw's framebuffer",
+                         probe_total, probe_open, probe_same, probe_same_fb);
+            }
+        }
         // The mesh program runs as a compute dispatch outside the render pass and writes the
         // triangles the draw then reads; both use the descriptor set committed here.
         scheduler.RequestOutsideRenderPassOperationContext();
@@ -1910,6 +1930,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     }
     const u64 render_pass = deferred != nullptr ? scheduler.RenderPassSerial() : 0;
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    if (mesh_emulation && hoist_probe) {
+        probe_serial = scheduler.RenderPassSerial();
+        probe_framebuffer = texture_cache.GetFramebuffer();
+    }
     const bool can_defer = deferred != nullptr && IsBuilt() && !Failed() && !IsMeshPipeline() &&
                            !writes_storage && scheduler.RenderPassSerial() == render_pass &&
                            scheduler.BoundGraphicsPipeline() == this &&
