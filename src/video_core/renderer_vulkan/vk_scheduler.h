@@ -147,6 +147,25 @@ public:
         return fragment_barrier.Pending();
     }
 
+    /// EDEN_NX2_GPU_PROFILE: why buffer copies and clears end an open render pass. The buffer
+    /// ranges each draw reads (descriptors, and the vertex and index buffers bound when it is
+    /// recorded) are kept for the active pass; a copy or clear that ends the pass is classified
+    /// against them, and ReportSubmitCounts logs the result every 10 s.
+    void ProbeBufferBind(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size);
+    void ProbeVertexBind(u32 index, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size);
+    void ProbeIndexBind(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size);
+    /// The draw whose buffers were bound since the last call is recorded in the active pass.
+    void ProbeDrawRecorded();
+    /// The buffers bound since the last call were a dispatch's.
+    void ProbeDispatchRecorded();
+    /// A copy about to end the open pass (CopyBuffer outside the upload command buffer).
+    void ProbePassEndingCopy(VkBuffer dst, VkBuffer src, bool src_stream,
+                             std::span<const VkBufferCopy> copies,
+                             std::source_location caller);
+    /// A clear of `framebuffer` about to end the open pass; `deferrable` when it would have been
+    /// deferred into the next pass's load operation had no pass been open.
+    void ProbePassEndingClear(const Framebuffer* framebuffer, bool deferrable);
+
     void NoteRenderPassStores() {
         render_pass_has_stores = true;
     }

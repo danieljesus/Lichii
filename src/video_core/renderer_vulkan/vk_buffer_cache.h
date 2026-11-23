@@ -6,6 +6,7 @@
 #pragma once
 
 #include <limits>
+#include <source_location>
 
 #include <boost/container/small_vector.hpp>
 
@@ -190,7 +191,8 @@ public:
 
     void CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                    bool can_reorder_upload = false);
+                    bool can_reorder_upload = false,
+                    std::source_location caller = std::source_location::current());
 
     void PostCopyBarrier();
 
@@ -361,8 +363,12 @@ private:
             // A descriptor range of 0 is invalid; an unmapped binding covers the null buffer.
             const VkDeviceSize range = buffer.IsNull() && size == 0 ? NullBufferSize() : size;
             guest_descriptor_queue.AddBuffer(handle, buffer.DeviceAddress(), offset, range);
+            ProbeBufferBind(handle, offset, range);
         }
     }
+
+    /// Scheduler::ProbeBufferBind, out of line (the scheduler is incomplete here).
+    void ProbeBufferBind(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size);
 
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();

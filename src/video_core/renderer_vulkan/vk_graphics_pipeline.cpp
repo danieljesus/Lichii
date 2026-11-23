@@ -1719,6 +1719,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     } else {
         RecordBinding(binding, descriptor_data);
     }
+    scheduler.ProbeDrawRecorded();
     return true;
 }
 

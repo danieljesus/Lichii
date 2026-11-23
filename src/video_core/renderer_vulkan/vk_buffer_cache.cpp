@@ -474,8 +474,14 @@ StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool def
     return staging_pool.Request(size, MemoryUsage::Download, deferred);
 }
 
+void BufferCacheRuntime::ProbeBufferBind(VkBuffer buffer, VkDeviceSize offset,
+                                         VkDeviceSize size) {
+    scheduler.ProbeBufferBind(buffer, offset, size);
+}
+
 void BufferCacheRuntime::BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
                                            VideoCore::Surface::PixelFormat format) {
+    scheduler.ProbeBufferBind(buffer.Handle(), offset, size);
     const bool is_null = buffer.IsNull();
     if (is_null && device.HasNullDescriptor()) {
         guest_descriptor_queue.AddTexelBuffer(VK_NULL_HANDLE, 0, 0, 0, VK_FORMAT_R8_UNORM);
@@ -662,7 +668,7 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
 
 void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                                    bool can_reorder_upload) {
+                                    bool can_reorder_upload, std::source_location caller) {
     if (dst_buffer == VK_NULL_HANDLE || src_buffer == VK_NULL_HANDLE) {
         return;
     }
@@ -690,6 +696,8 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         return;
     }
 
+    scheduler.ProbePassEndingCopy(dst_buffer, src_buffer, src_buffer == staging_pool.StreamBuf(),
+                                  vk_copies, caller);
     scheduler.RequestOutsideRenderPassOperationContext();
     if (barrier && src_buffer == staging_pool.StreamBuf() && !vk_copies.empty()) {
         // Only in-order stream uploads share barriers. Dedicated staging buffers retain their
@@ -803,6 +811,7 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
 void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,
                                          u32 base_vertex, u32 num_indices, VkBuffer buffer,
                                          u32 offset, [[maybe_unused]] u32 size) {
+    scheduler.ProbeIndexBind(buffer, offset, size);
     VkIndexType vk_index_type = MaxwellToVK::IndexFormat(index_format);
     VkDeviceSize vk_offset = offset;
     VkBuffer vk_buffer = buffer;
@@ -878,6 +887,7 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
     if (index >= device.GetMaxVertexInputBindings()) {
         return;
     }
+    scheduler.ProbeVertexBind(index, buffer, offset, size);
     if (buffer != VK_NULL_HANDLE && size != 0 && IsVertexRepacked(index)) {
         const auto repacked =
             vertex_repack_pass->Assemble(buffer, offset, size, u64{offset} + size);
@@ -912,6 +922,8 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     boost::container::static_vector<VkBuffer, VideoCommon::NUM_VERTEX_BUFFERS> buffer_handles(bindings.buffers.size());
     for (u32 i = 0; i < bindings.buffers.size(); ++i) {
         auto handle = bindings.buffers[i]->Handle();
+        scheduler.ProbeVertexBind(bindings.min_index + i, handle, bindings.offsets[i],
+                                  bindings.sizes[i]);
         if (handle == VK_NULL_HANDLE) {
             bindings.offsets[i] = 0;
             bindings.sizes[i] = VK_WHOLE_SIZE;

@@ -2376,11 +2376,12 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
         clear_rect.rect.extent.width >= render_area.width &&
         clear_rect.rect.extent.height >= render_area.height;
-    const bool can_defer_clear = ENABLE_DEFERRED_CLEAR && (!regs.clear_control.use_scissor || clear_covers_render_area) &&
-                                 clear_layers.covers_all_layers &&
-                                 !scheduler.IsRenderPassActive() &&
-                                 (!use_color || color_full_channels) && ds_deferrable;
+    const bool deferrable_without_pass =
+        ENABLE_DEFERRED_CLEAR && (!regs.clear_control.use_scissor || clear_covers_render_area) &&
+        clear_layers.covers_all_layers && (!use_color || color_full_channels) && ds_deferrable;
+    const bool can_defer_clear = deferrable_without_pass && !scheduler.IsRenderPassActive();
     if (!can_defer_clear) {
+        scheduler.ProbePassEndingClear(framebuffer, deferrable_without_pass);
         scheduler.RequestRenderpass(framebuffer);
     }
 
@@ -2494,6 +2495,7 @@ void RasterizerVulkan::DispatchCompute() {
     std::optional<ByteAddressedShadow> byte_addressed_shadow;
     buffer_cache.Nx2CollectListCopies(true);
     SCOPE_EXIT {
+        scheduler.ProbeDispatchRecorded();
         buffer_cache.Nx2CollectListCopies(false);
         if (byte_addressed_shadow) {
             texture_cache_runtime.RetireByteAddressedShadow(*byte_addressed_shadow);
