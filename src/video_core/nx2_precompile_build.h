@@ -96,7 +96,8 @@ std::vector<LearnedPrior> LearnPriors(std::span<const CachedPipeline> records);
 /// The texture bound buffer (the constant buffer non-bindless texture handles are read from) the
 /// recorded programs of each stage that asked a texture question use by majority, each program
 /// counted once. The oracle answers it for programs whose lowering does not fix it. Programs that
-/// asked no texture question are left out: the runtime does not compare their value.
+/// asked no texture question are left out: their value may go unused (FileEnvironment::
+/// AnswersHoldFor compares only the driver folding it selects for native programs).
 struct LearnedTextureBound {
     u32 stage{};
     u32 texture_bound{};

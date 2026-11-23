@@ -1434,14 +1434,16 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
         live.ReadViewportTransformState() != viewport_transform_state) {
         return fail("viewport transform");
     }
-    // Handles of non-bindless textures are read from this constant buffer. Translation asks for it
-    // only for a bound texture instruction (texture_pass), whose handle's type and format it then
-    // reads, so a record that asked no texture question never used it. Its value then matters only
-    // through the driver constant folding it selects (is_proprietary_driver), which must agree.
-    const bool asked_textures =
-        !texture_types.empty() || !texture_pixel_formats.empty() || !cbuf_handle_words.empty();
-    if (asked_textures ? live.TextureBoundBuffer() != texture_bound
-                       : live.IsProprietaryDriver() != IsProprietaryDriver()) {
+    // Handles of non-bindless textures are read from this constant buffer. Translation takes it for
+    // a bound texture instruction (texture_pass), often without asking anything the record would
+    // show (the instruction's own type stands), so a guest program compares it exactly. A native
+    // program's lowering fixes it whenever the code uses one (TEXS), and the live environment takes
+    // the same lowered value; the two differ only where the code does not use it, and the value
+    // then matters only through the driver constant folding it selects (is_proprietary_driver),
+    // which must agree.
+    if (live.TextureBoundBuffer() != texture_bound &&
+        (!Shader::Ampere::HasNativeAddressMap(code) ||
+         live.IsProprietaryDriver() != IsProprietaryDriver())) {
         return fail("texture bound buffer");
     }
     // A passthrough geometry program passes the attributes this mask does not skip.

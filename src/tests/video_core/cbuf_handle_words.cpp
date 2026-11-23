@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/shader_environment.h"
 
@@ -54,6 +55,11 @@ public:
     void SetTextureBound(u32 value, bool proprietary_driver) {
         texture_bound = value;
         is_proprietary_driver = proprietary_driver;
+    }
+    /// Code of a native program: it ends with an address map (Shader::Ampere).
+    void MakeNative() {
+        code = {0x123456789abcdef0, 0, Shader::Ampere::NativeAddressMapMagic};
+        cached_highest = 16;
     }
 
 private:
@@ -189,26 +195,43 @@ TEST_CASE("Markers of the retired layout are dropped", "[video_core]") {
     REQUIRE(std::string_view{why} == "constant buffer value");
 }
 
-TEST_CASE("A record that asked no texture question holds under another texture bound buffer",
-          "[video_core]") {
-    // Translation asks for the bound buffer only for a bound texture instruction; a program that
-    // reads no texture never used it. Recorded with 2 (the record's driver folding is then on).
+TEST_CASE("A native record holds under another texture bound buffer", "[video_core]") {
+    // A native program's lowering fixes the bound buffer whenever its code uses one, the live
+    // environment taking the same value; it differs only where the code does not use it.
+    // Recorded with 2 (the record's driver folding is then on).
     WordEnvironment recorded{{{{1, 0x20}, 5}}, {}};
+    recorded.MakeNative();
     (void)recorded.ReadCbufValue(1, 0x20);
     auto file = Record(recorded);
     const char* why = "";
 
     SECTION("Another value with the same driver constant folding") {
         WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+        live.MakeNative();
         live.SetTextureBound(0, true);
         REQUIRE(file.AnswersHoldFor(live, &why));
     }
     SECTION("Another value that turns the driver constant folding off") {
         WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+        live.MakeNative();
         live.SetTextureBound(0, false);
         REQUIRE(!file.AnswersHoldFor(live, &why));
         REQUIRE(std::string_view{why} == "texture bound buffer");
     }
+}
+
+TEST_CASE("A guest record keeps its texture bound buffer even without texture questions",
+          "[video_core]") {
+    // A bound texture instruction takes the buffer without asking anything the record shows when
+    // its own type stands (texture_pass ResolvedTextureType), so a guest program compares it.
+    WordEnvironment recorded{{{{1, 0x20}, 5}}, {}};
+    (void)recorded.ReadCbufValue(1, 0x20);
+    auto file = Record(recorded);
+    WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+    live.SetTextureBound(0, true);
+    const char* why = "";
+    REQUIRE(!file.AnswersHoldFor(live, &why));
+    REQUIRE(std::string_view{why} == "texture bound buffer");
 }
 
 TEST_CASE("A record that read a texture keeps its texture bound buffer", "[video_core]") {

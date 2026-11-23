@@ -1122,8 +1122,7 @@ std::vector<LearnedTextureBound> LearnTextureBound(std::span<const CachedPipelin
     std::set<std::pair<u32, u64>> seen; // (stage, program hash)
     for (const auto& record : records) {
         for (const auto& env : record.envs) {
-            // Only a program that asked a texture question used the value (FileEnvironment::
-            // AnswersHoldFor checks it for those only).
+            // Only a program that asked a texture question surely used the value.
             if (env.texture_types.empty() && env.texture_pixel_formats.empty()) {
                 continue;
             }
