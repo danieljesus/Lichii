@@ -24,6 +24,7 @@
 #include "shader_recompiler/frontend/ampere/instruction.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/native_lowering.h"
+#include "video_core/pipeline_cache_files.h"
 
 namespace Tegra {
 class Memorymanager;
@@ -35,6 +36,25 @@ struct ProgramRecord;
 } // namespace VideoCommon::ShaderCacheV2
 
 namespace VideoCommon {
+
+/// The read kinds of each word a translation reads, from when Start is called.
+class CbufReadObserver {
+public:
+    void Start() noexcept {
+        observing = true;
+    }
+    void Note(u64 key, u8 kind) {
+        if (observing) {
+            kinds[key] |= kind;
+        }
+    }
+    /// The words read only as whole texture handles since Start, sorted.
+    [[nodiscard]] std::vector<u64> HandleOnlyWords() const;
+
+private:
+    bool observing{};
+    ::Common::unordered_map<u64, u8> kinds;
+};
 
 class GenericEnvironment : public Shader::Environment {
 public:
@@ -73,6 +93,16 @@ public:
     /// Answers the classification of these keys (see MappedStoragePointerKeys) as storage buffer
     /// pointers, whatever the slots hold now; called before the program is translated
     void KeepStoragePointers(std::span<const u64> keys);
+
+    /// From now on, notes how translation reads each constant buffer word (CbufReadObserver).
+    void ObserveCbufReads() noexcept {
+        observer.Start();
+    }
+
+    /// The words translation read only as whole texture handles since ObserveCbufReads, sorted.
+    [[nodiscard]] std::vector<u64> CbufWordsReadOnlyAsHandles() const {
+        return observer.HandleOnlyWords();
+    }
 
     [[nodiscard]] std::optional<u64> Analyze();
 
@@ -173,11 +203,10 @@ protected:
     bool texture_pool_flushed = false;
 
 private:
-    static constexpr u8 CbufReadValue = 1;
-    static constexpr u8 CbufReadHandle = 2;
     /// The words recorded as read only as texture handles
     [[nodiscard]] std::vector<u64> HandleOnlyWords() const;
     bool reading_handle_word = false;
+    CbufReadObserver observer;
 };
 
 class GraphicsEnvironment final : public GenericEnvironment {
@@ -314,17 +343,21 @@ public:
     /// handle (ReadCbufHandleWord), as a value (ReadCbufValue: folded constants, branch tables,
     /// the parts of an assembled handle), or both.
     void ObserveCbufReads() noexcept {
-        observing_reads = true;
+        observer.Start();
     }
 
     /// The words translation read only as whole texture handles since ObserveCbufReads, sorted:
     /// what the record would mark had the build that recorded it marked handle words.
-    [[nodiscard]] std::vector<u64> CbufWordsReadOnlyAsHandles() const;
+    [[nodiscard]] std::vector<u64> CbufWordsReadOnlyAsHandles() const {
+        return observer.HandleOnlyWords();
+    }
 
-    /// Marks these recorded words as read only as texture handles (a precompiled record's kept
-    /// observation), as GenericEnvironment::Serialize marks them: AnswersHoldFor then checks each
-    /// by the texture its live value names. Words the record does not hold are ignored.
-    void MarkCbufHandleWords(std::span<const u64> keys);
+    /// Makes these words, of those the record holds, its marked handle words in place of the ones
+    /// it was loaded with (a precompiled record's kept observation, made by the translation of its
+    /// kept SPIR-V): AnswersHoldFor then checks each by the texture its live value names. The
+    /// recorded handle of a word only the observation marks is still asked of the live state, as
+    /// other readers of that handle were not observed with it.
+    void UseKeptCbufHandleWords(std::span<const u64> keys);
 
     [[nodiscard]] Shader::TextureType ReadTextureType(u32 handle) override;
 
@@ -396,7 +429,10 @@ private:
     ::Common::unordered_map<u64, u32> cbuf_values;
     ::Common::unordered_map<u64, u8> storage_pointer_types;
     ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
-    /// The constant buffer words the record marks as read only as texture handles
+    /// The constant buffer words marked as read only as texture handles: by the record itself, or
+    /// only by a precompiled record's kept observation (UseKeptCbufHandleWords)
+    static constexpr u8 HandleWordRecorded = 1;
+    static constexpr u8 HandleWordObserved = 2;
     ::Common::unordered_map<u64, u8> cbuf_handle_words;
     std::array<u32, 3> workgroup_size{};
     u32 local_memory_size{};
@@ -413,10 +449,8 @@ private:
     std::vector<u32> dropped_texture_handles;
     bool lacks_recorded_value{};
     bool lacks_dropped_value{};
-    bool observing_reads{};
     bool reading_handle_word{};
-    /// Since ObserveCbufReads: 1 read as a value, 2 as a whole handle, 3 both
-    ::Common::unordered_map<u64, u8> cbuf_read_kinds;
+    CbufReadObserver observer;
 };
 
 /// Where a pipeline is in a cache file, from its environment count to the end of its key, and a

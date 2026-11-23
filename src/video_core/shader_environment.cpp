@@ -262,6 +262,9 @@ bool GenericEnvironment::IsNativeProgram() const {
 }
 
 bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+    // The classification reads both pointer words as values, cached or not.
+    observer.Note(MakeCbufKey(index, offset), CbufReadValue);
+    observer.Note(MakeCbufKey(index, offset + 4), CbufReadValue);
     const u64 key = MakeCbufKey(index, offset);
     if (const auto it = storage_pointer_types.find(key); it != storage_pointer_types.end()) {
         return it->second != 0;
@@ -275,6 +278,8 @@ bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
 }
 
 bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    observer.Note(MakeCbufKey(index, offset), CbufReadValue);
+    observer.Note(MakeCbufKey(index, offset + 4), CbufReadValue);
     const u64 key = MakeIndirectCbufKey(index, offset, indirect);
     if (const auto it = storage_pointer_types.find(key); it != storage_pointer_types.end()) {
         return it->second != 0;
@@ -366,13 +371,26 @@ u32 GenericEnvironment::ReadCbufHandleWord(u32 cbuf_index, u32 cbuf_offset) {
 void GenericEnvironment::RecordCbufValue(u32 index, u32 offset, u32 value) {
     const u64 key = MakeCbufKey(index, offset);
     cbuf_values.emplace(key, value);
-    cbuf_reads[key] |= reading_handle_word ? CbufReadHandle : CbufReadValue;
+    const u8 kind = reading_handle_word ? CbufReadHandle : CbufReadValue;
+    cbuf_reads[key] |= kind;
+    observer.Note(key, kind);
+}
+
+std::vector<u64> CbufReadObserver::HandleOnlyWords() const {
+    std::vector<u64> keys;
+    for (const auto& [key, reads] : kinds) {
+        if (CbufReadOnlyAsHandle(reads)) {
+            keys.push_back(key);
+        }
+    }
+    std::ranges::sort(keys);
+    return keys;
 }
 
 std::vector<u64> GenericEnvironment::HandleOnlyWords() const {
     std::vector<u64> markers;
     for (const auto& [key, reads] : cbuf_reads) {
-        if (reads != CbufReadHandle) {
+        if (!CbufReadOnlyAsHandle(reads)) {
             continue;
         }
         if (const auto marker =
@@ -1314,7 +1332,7 @@ void FileEnvironment::Deserialize(std::istream& file, std::streampos end, Record
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&value), sizeof(value));
         if (const auto word = CbufHandleWordFromKey(key)) {
-            cbuf_handle_words.emplace(*word, u8{1});
+            cbuf_handle_words.emplace(*word, HandleWordRecorded);
             continue;
         }
         if (IsRetiredCbufHandleWordKey(key)) {
@@ -1499,7 +1517,13 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
                  format_traits) != 0) {
                 return fail("texture pixel format");
             }
-            handles_read.push_back(value);
+            // A word only the kept observation marks leaves the recorded handle's own answers to
+            // be asked below: another reader of that handle (a word read both ways, an assembled
+            // handle) was not observed with it. A word the record marks itself keeps them as it
+            // always has (handles_read, per value).
+            if (cbuf_handle_words.at(key) == HandleWordRecorded) {
+                handles_read.push_back(value);
+            }
             continue;
         }
         if (live_value != value && !is_pointer_word(key)) {
@@ -1563,6 +1587,9 @@ std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {
 /// Recorded classification of the constant buffer word at `index`/`offset` as a storage buffer
 /// pointer. Without a record, the guess when one is set, else throws.
 bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+    // A recording reads both pointer words as values to classify them (GenericEnvironment).
+    observer.Note(MakeCbufKey(index, offset), CbufReadValue);
+    observer.Note(MakeCbufKey(index, offset + 4), CbufReadValue);
     const auto it = storage_pointer_types.find(MakeCbufKey(index, offset));
     if (it == storage_pointer_types.end()) {
         if (guess) {
@@ -1576,6 +1603,8 @@ bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
 
 /// Same as IsCbufStorageBufferPointer for a pointer read through an indirect table.
 bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    observer.Note(MakeCbufKey(index, offset), CbufReadValue);
+    observer.Note(MakeCbufKey(index, offset + 4), CbufReadValue);
     const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
     if (it == storage_pointer_types.end()) {
         if (guess) {
@@ -1602,21 +1631,13 @@ u32 FileEnvironment::ReadCbufHandleWord(u32 cbuf_index, u32 cbuf_offset) {
     return ReadCbufValue(cbuf_index, cbuf_offset);
 }
 
-std::vector<u64> FileEnvironment::CbufWordsReadOnlyAsHandles() const {
-    std::vector<u64> keys;
-    for (const auto& [key, kinds] : cbuf_read_kinds) {
-        if (kinds == 2) {
-            keys.push_back(key);
-        }
-    }
-    std::ranges::sort(keys);
-    return keys;
-}
-
-void FileEnvironment::MarkCbufHandleWords(std::span<const u64> keys) {
+void FileEnvironment::UseKeptCbufHandleWords(std::span<const u64> keys) {
+    const auto recorded_marks = std::move(cbuf_handle_words);
+    cbuf_handle_words.clear();
     for (const u64 key : keys) {
         if (cbuf_values.contains(key)) {
-            cbuf_handle_words.emplace(key, u8{1});
+            cbuf_handle_words.emplace(key, recorded_marks.contains(key) ? HandleWordRecorded
+                                                                        : HandleWordObserved);
         }
     }
 }
@@ -1625,9 +1646,7 @@ void FileEnvironment::MarkCbufHandleWords(std::span<const u64> keys) {
 /// one is set, else throws.
 u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
     const u64 key = MakeCbufKey(cbuf_index, cbuf_offset);
-    if (observing_reads) {
-        cbuf_read_kinds[key] |= reading_handle_word ? u8{2} : u8{1};
-    }
+    observer.Note(key, reading_handle_word ? CbufReadHandle : CbufReadValue);
     const auto it{cbuf_values.find(key)};
     if (it == cbuf_values.end()) {
         if (guess) {
@@ -2229,10 +2248,10 @@ KeptInfosByEnvironment(
     std::span<const Shader::Info* const, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage>
         slot_infos) {
     std::array<const Shader::Info*, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> infos{};
-    size_t env = 0;
-    for (size_t slot = 0; slot < unique_hashes.size(); ++slot) {
-        if (unique_hashes[slot] != 0) {
-            infos[env++] = slot == 0 ? nullptr : slot_infos[slot - 1];
+    const auto slots = KeptSlotsByEnvironment(unique_hashes);
+    for (size_t env = 0; env < slots.size(); ++env) {
+        if (slots[env] != NoKeptSlot) {
+            infos[env] = slot_infos[slots[env]];
         }
     }
     return infos;
@@ -2270,7 +2289,9 @@ bool ReadKeptHandleWords(std::span<const u8> rest, std::vector<u64>& keys) {
         return false;
     }
     keys.resize(count);
-    std::memcpy(keys.data(), rest.data(), rest.size());
+    if (count != 0) {
+        std::memcpy(keys.data(), rest.data(), rest.size());
+    }
     return true;
 }
 

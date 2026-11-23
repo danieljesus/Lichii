@@ -50,6 +50,13 @@ public:
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
         return std::nullopt;
     }
+    /// A recording classifies a storage pointer by reading both of its words.
+    bool IsCbufStorageBufferPointer(u32 index, u32 offset) override {
+        (void)ReadCbufValue(index, offset);
+        (void)ReadCbufValue(index, offset + 4);
+        storage_pointer_types.emplace((u64{index} << 32) | offset, u8{1});
+        return true;
+    }
     /// The live register value, and the driver constant folding the backends derive from it.
     void SetTextureBound(u32 value, bool proprietary_driver) {
         texture_bound = value;
@@ -371,27 +378,27 @@ TEST_CASE("A word the preparation read only as a handle is checked by the textur
     const char* why = "";
     SECTION("Another handle naming a texture of the same type") {
         auto file = OldLayoutRecord();
-        file.MarkCbufHandleWords(observed);
+        file.UseKeptCbufHandleWords(observed);
         WordEnvironment live{{{{2, 0x10}, 9}}, {{7, Color2D}, {9, Color2D}}};
         REQUIRE(file.AnswersHoldFor(live, &why));
     }
     SECTION("Another handle naming a texture of another type") {
         auto file = OldLayoutRecord();
-        file.MarkCbufHandleWords(observed);
+        file.UseKeptCbufHandleWords(observed);
         WordEnvironment live{{{{2, 0x10}, 9}}, {{7, Color2D}, {9, Color3D}}};
         REQUIRE(!file.AnswersHoldFor(live, &why));
         REQUIRE(std::string_view{why} == "texture type");
     }
     SECTION("Not observed (read both ways, a part, or no kept observation): exact") {
         auto file = OldLayoutRecord();
-        file.MarkCbufHandleWords({});
+        file.UseKeptCbufHandleWords({});
         WordEnvironment live{{{{2, 0x10}, 9}}, {{7, Color2D}, {9, Color2D}}};
         REQUIRE(!file.AnswersHoldFor(live, &why));
         REQUIRE(std::string_view{why} == "constant buffer value");
     }
     SECTION("A word the record does not hold is not marked") {
         auto file = OldLayoutRecord();
-        file.MarkCbufHandleWords(std::vector<u64>{Key(2, 0x20)});
+        file.UseKeptCbufHandleWords(std::vector<u64>{Key(2, 0x20)});
         WordEnvironment live{{{{2, 0x10}, 9}}, {{7, Color2D}, {9, Color2D}}};
         REQUIRE(!file.AnswersHoldFor(live, &why));
         REQUIRE(std::string_view{why} == "constant buffer value");
@@ -419,13 +426,69 @@ TEST_CASE("Kept handle words follow the info exactly", "[video_core]") {
 
 TEST_CASE("Each environment's pipeline slot", "[video_core]") {
     using VideoCommon::NoKeptSlot;
-    const auto slots = VideoCommon::KeptSlotsByEnvironment(std::array<u64, 6>{0, 77, 88, 0, 0, 55});
+    const std::array<u64, 6> task_mesh{0, 77, 88, 0, 0, 55};
+    const auto slots = VideoCommon::KeptSlotsByEnvironment(task_mesh);
     REQUIRE(slots[0] == 0);
     REQUIRE(slots[1] == 1);
     REQUIRE(slots[2] == 4);
     REQUIRE(slots[3] == NoKeptSlot);
-    const auto with_a = VideoCommon::KeptSlotsByEnvironment(std::array<u64, 6>{10, 11, 0, 0, 0, 55});
+    const std::array<u64, 6> vertex_a{10, 11, 0, 0, 0, 55};
+    const auto with_a = VideoCommon::KeptSlotsByEnvironment(vertex_a);
     REQUIRE(with_a[0] == NoKeptSlot);
     REQUIRE(with_a[1] == 0);
     REQUIRE(with_a[2] == 4);
+}
+
+TEST_CASE("A record's own marks give way to the kept observation", "[video_core]") {
+    // Marked by the build that recorded it, but this build's translation read the word both ways.
+    WordEnvironment recorded{{{{2, 0x10}, 7}}, {{7, Color2D}}};
+    (void)recorded.ReadTextureType(recorded.ReadCbufHandleWord(2, 0x10));
+    auto file = Record(recorded);
+    WordEnvironment same{{{{2, 0x10}, 9}}, {{7, Color2D}, {9, Color2D}}};
+    const char* why = "";
+    REQUIRE(file.AnswersHoldFor(same, &why)); // the record's own mark, without a kept list
+    file.UseKeptCbufHandleWords({});
+    WordEnvironment again{{{{2, 0x10}, 9}}, {{7, Color2D}, {9, Color2D}}};
+    REQUIRE(!file.AnswersHoldFor(again, &why));
+    REQUIRE(std::string_view{why} == "constant buffer value");
+}
+
+TEST_CASE("A kept mark still asks the recorded handle of its other readers", "[video_core]") {
+    // Word 0x10 was read only as a handle, word 0x14 (same handle 7) both ways. Live, 0x10 names
+    // another 2D texture while 0x14 still holds 7, whose texture is now 3D: the kept SPIR-V was
+    // made for a 2D texture 7.
+    WordEnvironment recorded{{{{2, 0x10}, 7}, {{2, 0x14}, 7}}, {{7, Color2D}}};
+    (void)recorded.ReadTextureType(recorded.ReadCbufValue(2, 0x10));
+    (void)recorded.ReadCbufValue(2, 0x14);
+    auto file = Record(recorded);
+    file.UseKeptCbufHandleWords(std::vector<u64>{Key(2, 0x10)});
+    WordEnvironment live{{{{2, 0x10}, 9}, {{2, 0x14}, 7}}, {{7, Color3D}, {9, Color2D}}};
+    const char* why = "";
+    REQUIRE(!file.AnswersHoldFor(live, &why));
+    REQUIRE(std::string_view{why} == "texture type");
+}
+
+TEST_CASE("Storage pointer words are observed as read by value", "[video_core]") {
+    // A recording reads both words of a pointer to classify it; the record answers the
+    // classification without reading them, and the observation must see them read alike.
+    WordEnvironment recorded{{{{2, 0x10}, 0x1000}, {{2, 0x14}, 0}}, {}};
+    (void)recorded.IsCbufStorageBufferPointer(2, 0x10);
+    auto file = Record(recorded);
+    Shader::Environment& env = file;
+    file.ObserveCbufReads();
+    (void)env.IsCbufStorageBufferPointer(2, 0x10);
+    (void)env.ReadCbufHandleWord(2, 0x10);
+    REQUIRE(file.CbufWordsReadOnlyAsHandles().empty());
+}
+
+TEST_CASE("A record's own mark the observation confirms keeps its checks", "[video_core]") {
+    // The record marked the word itself (a current build, or the builder's oracle, whose handles
+    // are tokens): its handle is checked by the live word alone, as without a kept list.
+    WordEnvironment recorded{{{{2, 0x10}, 7}}, {{7, Color2D}}};
+    (void)recorded.ReadTextureType(recorded.ReadCbufHandleWord(2, 0x10));
+    auto file = Record(recorded);
+    file.UseKeptCbufHandleWords(std::vector<u64>{Key(2, 0x10)});
+    WordEnvironment live{{{{2, 0x10}, 9}}, {{7, Color3D}, {9, Color2D}}};
+    const char* why = "";
+    REQUIRE(file.AnswersHoldFor(live, &why));
 }

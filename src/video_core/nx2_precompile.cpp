@@ -405,7 +405,8 @@ public:
     }
     u32 ReadCbufValue(u32 bank, u32 offset) override {
         const u64 key = CbufKey(bank, offset);
-        cbuf_reads[key] |= reading_handle ? 2 : 1;
+        cbuf_reads[key] |=
+            reading_handle ? VideoCommon::CbufReadHandle : VideoCommon::CbufReadValue;
         if (const auto it = cbuf_values.find(key); it != cbuf_values.end())
             return it->second;
         u32 value = 0;
@@ -492,7 +493,7 @@ public:
         // Words read only as texture handles, marked as GenericEnvironment::Serialize marks them
         std::vector<u64> handle_words;
         for (const auto& [key, reads] : cbuf_reads) {
-            if (reads != 2) {
+            if (!VideoCommon::CbufReadOnlyAsHandle(reads)) {
                 continue;
             }
             if (const auto marker = VideoCommon::CbufHandleWordKey(static_cast<u32>(key >> 32),
@@ -560,7 +561,7 @@ public:
     std::map<u64, Shader::TextureType> slot_types;
 
 private:
-    std::map<u64, u8> cbuf_reads; ///< 1 read as a value, 2 as a texture handle word
+    std::map<u64, u8> cbuf_reads; ///< VideoCommon::CbufReadValue / CbufReadHandle bits
     bool reading_handle{};
     std::unordered_map<u32, u64> token_slot;
     const PackageProgram& program;

@@ -450,7 +450,8 @@ void CountPrecompiledReason(const char* reason) {
 }
 
 // NX2INFO7: each kept info is followed by the constant buffer words its translation read only as
-// whole texture handles (AppendKeptHandleWords). NX2INFO6: infos keep requires_full_guest_warps, and the kept SPIR-V of a software HMMA may use
+// whole texture handles (AppendKeptHandleWords).
+// NX2INFO6: infos keep requires_full_guest_warps, and the kept SPIR-V of a software HMMA may use
 // the staged exchange, which older files do not have.
 // NX2INFO5: texture descriptors keep is_descriptor_array and handle_is_pointer_word, and infos
 // demoted_conditional_barrier, uses_barrier_vote and binds_unmapped_pointer_word (NX2INFO3:
@@ -3476,7 +3477,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
     const auto slots = VideoCommon::KeptSlotsByEnvironment(graphics_key.unique_hashes);
     for (size_t i = 0; i < live.size(); ++i) {
         if (slots[i] != VideoCommon::NoKeptSlot) {
-            (*recorded)[i].MarkCbufHandleWords(handle_words[slots[i]]);
+            (*recorded)[i].UseKeptCbufHandleWords(handle_words[slots[i]]);
         }
     }
     for (size_t i = 0; i < live.size(); ++i) {
@@ -3644,7 +3645,7 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
                 continue;
             }
             // Checked as the record's marked handle words are (see the graphics pipelines).
-            recorded.MarkCbufHandleWords(handle_words);
+            recorded.UseKeptCbufHandleWords(handle_words);
         } catch (const std::exception&) {
             CountPrecompiledReason("files unreadable");
             CloseQuietly(precompiled_file);
@@ -3719,6 +3720,12 @@ void PipelineCache::AuditPrecompiled(std::span<Shader::Environment* const> envs,
         std::array<std::vector<u8>, Maxwell::MaxShaderStage> live_info;
         std::array<bool, Maxwell::MaxShaderStage> present{};
         main_pools.ReleaseContents();
+        // What this translation reads only as whole handles, to compare with the kept list.
+        for (auto* const env : envs) {
+            if (auto* const generic = dynamic_cast<GenericEnvironment*>(env)) {
+                generic->ObserveCbufReads();
+            }
+        }
         if (compute) {
             Shader::Maxwell::Flow::CFG cfg{*envs[0], main_pools.flow_block,
                                            envs[0]->StartAddress()};
@@ -3747,6 +3754,13 @@ void PipelineCache::AuditPrecompiled(std::span<Shader::Environment* const> envs,
             }
         }
         bool same = true;
+        std::array<size_t, Maxwell::MaxShaderProgram> audit_slots{};
+        if (compute) {
+            audit_slots.fill(VideoCommon::NoKeptSlot);
+            audit_slots[0] = 0;
+        } else {
+            audit_slots = VideoCommon::KeptSlotsByEnvironment(graphics_key.unique_hashes);
+        }
         for (size_t stage = 0; stage < present.size(); ++stage) {
             if (present[stage] != (record.infos[stage] != NoInfo)) {
                 differ(stage, "stages");
@@ -3761,11 +3775,26 @@ void PipelineCache::AuditPrecompiled(std::span<Shader::Environment* const> envs,
             precompiled_infos_file.clear();
             precompiled_infos_file.seekg(static_cast<std::streamoff>(offset));
             precompiled_infos_file.read(reinterpret_cast<char*>(kept_info.data()), size);
-            // Compared without the handle words kept after the info.
+            // The info, then the words its translation read only as whole handles, which must be
+            // the ones this translation read so.
             Shader::Info kept_parsed{};
             std::span<const u8> rest{kept_info};
-            if (Shader::DeserializeInfo(rest, kept_parsed)) {
-                kept_info.resize(kept_info.size() - rest.size());
+            std::vector<u64> kept_words;
+            if (!Shader::DeserializeInfo(rest, kept_parsed) ||
+                !VideoCommon::ReadKeptHandleWords(rest, kept_words)) {
+                differ(stage, "kept handle words (unreadable)");
+                same = false;
+                continue;
+            }
+            kept_info.resize(kept_info.size() - rest.size());
+            const size_t env_index = static_cast<size_t>(
+                std::ranges::find(audit_slots, stage) - audit_slots.begin());
+            const auto* const generic = env_index < envs.size()
+                                            ? dynamic_cast<GenericEnvironment*>(envs[env_index])
+                                            : nullptr;
+            if (!generic || generic->CbufWordsReadOnlyAsHandles() != kept_words) {
+                differ(stage, "words read only as handles");
+                same = false;
             }
             if (kept_info != live_info[stage]) {
                 differ(stage, "infos");

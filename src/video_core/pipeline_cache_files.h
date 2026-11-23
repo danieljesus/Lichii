@@ -49,6 +49,17 @@ inline constexpr u32 CbufHandleWordMark = 0xc0000000;
 /// shifted words. Loading drops them, so such a record needs every value the same.
 inline constexpr u32 CbufHandleWordMarkRetired = 0x80000000;
 
+/// How translation read a constant buffer word: as a value (ReadCbufValue: a folded constant, a
+/// branch table, a storage pointer word, a part of an assembled handle), as a whole texture handle
+/// (ReadCbufHandleWord), or both (the bits combined).
+constexpr u8 CbufReadValue = 1;
+constexpr u8 CbufReadHandle = 2;
+
+/// Whether a word read so was read only as a whole texture handle: the words a record marks.
+[[nodiscard]] constexpr bool CbufReadOnlyAsHandle(u8 reads) {
+    return reads == CbufReadHandle;
+}
+
 /// The marker key of the word at (`index`, `offset`), or nothing for one out of its range.
 [[nodiscard]] constexpr std::optional<u64> CbufHandleWordKey(u32 index, u32 offset) {
     if (index >= 0x4000 || offset >= 0x10000) {
