@@ -840,6 +840,49 @@ TEST_CASE("NCA with a valid AES-CTR-EX table opens in a container that claims mo
     REQUIRE(nca.Open(size_t{1} << 41) == ResultSuccess);
 }
 
+TEST_CASE("NCA in a patch layout rejects the tables a container claims but the file does not "
+          "hold, without allocating them",
+          "[core][file_sys]") {
+    // As in a patch NCA, the indirect table is read through the AES-CTR-EX layer, whose table
+    // must follow it. So a claim that covers an indirect table the file does not hold covers the
+    // AES-CTR-EX table too, and that table, read first, rejects the section.
+    auto nca = MakeAesCtrExNca();
+    nca.header.fs_info[0].end_sector = 0xFFFFFF06;
+    nca.fs.patch_info.indirect_size = s64{1} << 40;
+    nca.fs.patch_info.aes_ctr_ex_offset = 0x8000 + (s64{1} << 40);
+    REQUIRE(nca.Open(size_t{1} << 41) == ResultNcaBaseStorageOutOfRangeB);
+}
+
+TEST_CASE("AES-CTR-EX storage reports a read past its data storage's stored bytes",
+          "[core][file_sys]") {
+    // One entry that leaves [0, 0x8000) not encrypted, over 0x4000 stored bytes that a range
+    // claims to be 0x8000.
+    std::vector<u8> table(0x8000);
+    const BucketTree::NodeHeader node{0, 1, 0x8000};
+    Put(table, 0, node);
+    Put(table, sizeof(node), s64{0});
+    Put(table, 0x4000, node);
+    AesCtrCounterExtendedStorage::Entry entry{};
+    entry.encryption_value = AesCtrCounterExtendedStorage::Entry::Encryption::NotEncrypted;
+    Put(table, 0x4000 + sizeof(node), entry);
+    const auto table_file = MakeFile(std::move(table));
+    std::vector<u8> data(0x4000, 7);
+
+    std::unique_ptr<AesCtrCounterExtendedStorage::IDecryptor> decryptor;
+    REQUIRE(AesCtrCounterExtendedStorage::CreateSoftwareDecryptor(&decryptor) == ResultSuccess);
+    static constexpr std::array<u8, AesCtrStorage::KeySize> key{3};
+    AesCtrCounterExtendedStorage storage;
+    REQUIRE(storage.Initialize(key.data(), key.size(), 0, 0,
+                               std::make_shared<OffsetVfsFile>(MakeFile(data), 0x8000, 0),
+                               std::make_shared<OffsetVfsFile>(table_file, 0x4000, 0),
+                               std::make_shared<OffsetVfsFile>(table_file, 0x4000, 0x4000), 1,
+                               std::move(decryptor)) == ResultSuccess);
+    std::vector<u8> buffer(0x4000);
+    REQUIRE(storage.Read(buffer.data(), 0x4000, 0) == 0x4000);
+    REQUIRE(buffer == data);
+    REQUIRE(storage.Read(buffer.data(), 0x200, 0x4000) == 0);
+}
+
 TEST_CASE("NCA rejects an AES-CTR-EX table its container claims but does not hold, without "
           "allocating it",
           "[core][file_sys]") {

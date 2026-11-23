@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <string_view>
 #include <vector>
 
 #include "common/logging.h"
@@ -51,7 +52,9 @@ s64 GetBodySize(const std::shared_ptr<NcaReader>& reader) {
 // the container whose size the container's header gives. A table read into memory whole is
 // therefore read a piece at a time, so the buffer only grows as far as the storage returns
 // bytes, and a table the file does not hold in full is rejected.
-bool ReadWholeTable(const VirtualFile& storage, s64 size, std::vector<u8>& out) {
+// table names the table and declared_size is the size its header gives, for the log.
+bool ReadWholeTable(const VirtualFile& storage, s64 size, std::vector<u8>& out,
+                    std::string_view table, s64 declared_size) {
     constexpr s64 PieceSize = s64{1} << 20;
     out.clear();
     for (s64 done = 0; done < size;) {
@@ -61,8 +64,8 @@ bool ReadWholeTable(const VirtualFile& storage, s64 size, std::vector<u8>& out) 
             storage->Read(out.data() + done, static_cast<size_t>(piece), static_cast<size_t>(done));
         if (read != static_cast<size_t>(piece)) {
             LOG_ERROR(Loader,
-                      "NCA table of {} bytes is not stored in full: {} of {} bytes read at {}",
-                      size, read, piece, done);
+                      "NCA {} table of {} bytes is not stored in full: {} of {} bytes read at {}",
+                      table, declared_size, read, piece, done);
             out.clear();
             out.shrink_to_fit();
             return false;
@@ -593,7 +596,7 @@ Result NcaFileSystemDriver::CreateSparseStorageMetaStorage(VirtualFile* out,
     std::vector<u8> meta_data;
     R_UNLESS(ReadWholeTable(decrypted_storage,
                             Common::AlignDown(static_cast<s64>(meta_size), NcaHeader::CtrBlockSize),
-                            meta_data),
+                            meta_data, "sparse", meta_size),
              ResultNcaBaseStorageOutOfRangeB);
     meta_data.resize(static_cast<size_t>(meta_size));
 
@@ -931,7 +934,9 @@ Result NcaFileSystemDriver::CreateAesCtrExStorageMetaStorage(
 
     // Create buffered storage.
     std::vector<u8> meta_data;
-    R_UNLESS(ReadWholeTable(meta_storage, meta_size, meta_data), ResultNcaBaseStorageOutOfRangeB);
+    R_UNLESS(ReadWholeTable(meta_storage, meta_size, meta_data, "AES-CTR-EX",
+                            patch_info.aes_ctr_ex_size),
+             ResultNcaBaseStorageOutOfRangeB);
 
     auto buffered_storage = std::make_shared<VectorVfsFile>(std::move(meta_data));
     R_UNLESS(buffered_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
@@ -1055,7 +1060,8 @@ Result NcaFileSystemDriver::CreateIndirectStorageMetaStorage(VirtualFile* out,
 
     // Create buffered storage.
     std::vector<u8> meta_data;
-    R_UNLESS(ReadWholeTable(meta_storage, patch_info.indirect_size, meta_data),
+    R_UNLESS(ReadWholeTable(meta_storage, patch_info.indirect_size, meta_data, "indirect",
+                            patch_info.indirect_size),
              ResultNcaBaseStorageOutOfRangeE);
 
     auto buffered_storage = std::make_shared<VectorVfsFile>(std::move(meta_data));
