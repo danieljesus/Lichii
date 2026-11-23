@@ -39,6 +39,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/submission_package.h"
+#include "core/file_sys/vfs/vfs_offset.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/loader/loader.h"
@@ -134,6 +135,32 @@ TEST_CASE("PFS0 rejects a table larger than the file without allocating it",
     Put(bytes, 8, u32{0xFFFFFFFF});
     PartitionFilesystem pfs{MakeFile(std::move(bytes))};
     REQUIRE(pfs.GetStatus() == Loader::ResultStatus::ErrorIncorrectPFSFileSize);
+}
+
+TEST_CASE("PFS0 reports an entry past the end of its file at its declared size",
+          "[core][file_sys]") {
+    auto bytes =
+        MakePfs0WithFiles({{"a", std::vector<u8>(0x100, 1)}, {"b", std::vector<u8>(0x100, 2)}});
+    bytes.pop_back();
+    const PartitionFilesystem truncated{MakeFile(std::move(bytes))};
+    REQUIRE(truncated.GetStatus() == Loader::ResultStatus::Success);
+    REQUIRE(truncated.GetFile("a")->GetSize() == 0x100);
+    REQUIRE(truncated.GetFile("b")->GetSize() == 0x100);
+    REQUIRE(truncated.GetFileSizes().at("b") == 0x100);
+    REQUIRE(truncated.GetFile("a")->GetHeldSize() == 0x100);
+    REQUIRE(truncated.GetFile("b")->GetHeldSize() == 0xFF);
+}
+
+TEST_CASE("A range of a file holds only what its base holds from its offset", "[core][file_sys]") {
+    const auto base = MakeFile(std::vector<u8>(0x1000));
+    REQUIRE(OffsetVfsFile{base, 0x800, 0x400}.GetHeldSize() == 0x800);
+    REQUIRE(OffsetVfsFile{base, 0x2000, 0x400}.GetHeldSize() == 0xC00);
+    REQUIRE(OffsetVfsFile{base, 0x2000, 0x1000}.GetHeldSize() == 0);
+    REQUIRE(OffsetVfsFile{base, 0x2000, 0x3000}.GetHeldSize() == 0);
+    // Through a range of a range, as an NCA in a partition of an XCI is.
+    const auto outer = std::make_shared<OffsetVfsFile>(base, size_t{1} << 40, 0x100);
+    REQUIRE(outer->GetSize() == size_t{1} << 40);
+    REQUIRE(OffsetVfsFile{outer, size_t{1} << 39, 0x200}.GetHeldSize() == 0xD00);
 }
 
 TEST_CASE("PFS0 with more than 65535 entries reads every entry", "[core][file_sys]") {
