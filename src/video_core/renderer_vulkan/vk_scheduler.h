@@ -202,6 +202,14 @@ public:
     }
 
     /// Changes whenever a render pass begins or ends.
+    // TEST ONLY: the compute probe (EDEN_NX2_TEST_COMPUTE_LOG, EDEN_NX2_TEST_SKIP_ALTERNATE).
+    [[nodiscard]] u64 TestRecordSerial() const noexcept {
+        return record_serial;
+    }
+    [[nodiscard]] bool TestTraceRecording() const noexcept {
+        return trace_gpu_recording;
+    }
+
     u64 RenderPassSerial() const {
         return render_pass_serial;
     }

@@ -2599,6 +2599,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 }
 
 void RasterizerVulkan::DispatchCompute() {
+    const u64 test_entry_serial{scheduler.TestRecordSerial()}; // TEST ONLY
+    const u64 test_entry_pass{scheduler.RenderPassSerial()};   // TEST ONLY
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     FlushWork(true);
     gpu_memory->FlushCaching();
@@ -2801,8 +2803,41 @@ void RasterizerVulkan::DispatchCompute() {
     if (!replacement) {
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
     }
+    {
+        // TEST ONLY: EDEN_NX2_TEST_COMPUTE_LOG logs every direct dispatch of one frame in 300.
+        static const bool test_log{std::getenv("EDEN_NX2_TEST_COMPUTE_LOG") != nullptr};
+        static u64 test_last_end_serial{}, test_last_end_pass{}, test_index{}, test_frame{~0ULL};
+        if (test_log && render_trace_frame % 300 == 7) {
+            if (test_frame != render_trace_frame) {
+                test_frame = render_trace_frame;
+                test_index = 0;
+            }
+            const Shader::Info& info{pipeline->StageInfo()};
+            const u32 bx{qmd.block_dim_x}, by{qmd.block_dim_y}, bz{qmd.block_dim_z};
+            LOG_INFO(Render_Vulkan,
+                     "TEST compute frame {} #{} {:016x} grid {}x{}x{} block {}x{}x{} ({} "
+                     "invocations) cbufs {} ssbos {} textures {} images {}; recorded since the "
+                     "last dispatch {} (a pass between: {}), while setting this one up {}",
+                     render_trace_frame, test_index++, pipeline->ShaderHash(), dim[0], dim[1],
+                     dim[2], bx, by, bz, u64{dim[0]} * dim[1] * dim[2] * bx * by * bz,
+                     info.constant_buffer_descriptors.size(),
+                     info.storage_buffers_descriptors.size(), info.texture_descriptors.size(),
+                     info.image_descriptors.size(), test_entry_serial - test_last_end_serial,
+                     test_entry_pass != test_last_end_pass,
+                     scheduler.TestRecordSerial() - test_entry_serial);
+        }
+        test_last_end_serial = scheduler.TestRecordSerial() + 1;
+        test_last_end_pass = scheduler.RenderPassSerial();
+    }
     scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind),
                       replacement, barrier_recorded](vk::CommandBuffer cmdbuf) {
+        // TEST ONLY: EDEN_NX2_TEST_SKIP_ALTERNATE drops every second direct dispatch of the
+        // frames the GPU trace samples (wrong picture there; for timing only).
+        static const bool test_skip{std::getenv("EDEN_NX2_TEST_SKIP_ALTERNATE") != nullptr};
+        static u64 test_skip_count{};
+        if (test_skip && scheduler.TestTraceRecording() && (test_skip_count++ & 1) != 0) {
+            return;
+        }
         if (!barrier_recorded) {
             RecordDispatchBarrier(cmdbuf);
         }
