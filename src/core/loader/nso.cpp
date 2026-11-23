@@ -199,14 +199,12 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                     }
                 }
 
-                // memcpy takes no null pointers, not even for zero bytes: an empty segment leaves
-                // its buffer, and an image of empty segments the code set, without one.
-                if (nso_header.segments[i].size != 0) {
-                    std::memcpy(codeset.memory.data() + module_start +
-                                    nso_header.segments[i].location,
-                                decompressed_size.data(), nso_header.segments[i].size);
-                }
-            } else if (nso_header.segments[i].size != 0) {
+                std::memcpy(
+                    codeset.memory.data() + module_start + nso_header.segments[i].location,
+                    decompressed_size.data(),
+                    nso_header.segments[i].size
+                );
+            } else {
                 // Not compressed
                 std::memcpy(
                     codeset.memory.data() + module_start + nso_header.segments[i].location,
