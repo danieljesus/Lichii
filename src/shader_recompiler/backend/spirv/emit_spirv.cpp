@@ -419,7 +419,7 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
             LOG_DEBUG(Shader_SPIRV, "Fp32 denorm preserve used in shader without host support");
         }
     }
-    if (ctx.native_half_rounding) {
+    if (ctx.native_half_rounding && ctx.native_half_rounding_modes) {
         // The software matrix functions convert to fp16 natively (emit_spirv_tensor.cpp).
         ctx.AddCapability(spv::Capability::DenormPreserve);
         ctx.AddCapability(spv::Capability::RoundingModeRTE);
@@ -678,6 +678,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
         cooperative_hmma ? std::nullopt : ReserveSoftwareHmmaScratch(profile, program)};
     EmitContext ctx{profile, runtime_info, program, bindings, cooperative_hmma};
     ctx.tensor_scratch_word = tensor_scratch_word;
+    ctx.tensor_scratch_8x8x8 = tensor_scratch_word.has_value() && UsesCooperativeHmma8x8x8(program);
     ctx.software_hmma_scratch_word = software_hmma_scratch_word;
     DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
@@ -697,6 +698,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
         PatchCooperativeHmma(code, *ctx.cooperative_hmma);
     }
     program.info.uses_cooperative_matrix = ctx.cooperative_hmma.has_value();
+    program.info.requires_full_guest_warps = software_hmma_scratch_word.has_value();
     return code;
 }
 

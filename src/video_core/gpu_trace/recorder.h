@@ -4,8 +4,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -78,5 +80,49 @@ void NotePresent(std::span<const Tegra::FramebufferConfig> layers,
 /// records the memory the CPU wrote since the last command, then the command.
 void OnCommand(Core::System& system, bool channels_pending, const Tegra::CommandList* submit,
                s32 channel, bool tick);
+
+/// A requested recording waits for its snapshot, which needs a command boundary with no suspended
+/// channel.
+[[nodiscard]] inline bool WaitsForSnapshot() {
+    return g_requested.load(std::memory_order_relaxed) &&
+           !g_recording.load(std::memory_order_relaxed);
+}
+
+/// Whether the GPU thread holds back new commands so its suspended channels can drain for the
+/// snapshot. Games that keep two channels waiting on each other (Ocarina of Time: one on a
+/// semaphore, the other on a list copy) have one suspended at every command boundary while new
+/// commands keep coming, so the snapshot never came. Held for at most HoldLimit at a time, since a
+/// suspended channel may wait for a command still in the queue; then commands run for Backoff
+/// before the next attempt. GPU thread only.
+class SnapshotHold {
+public:
+    using Clock = std::chrono::steady_clock;
+    static constexpr std::chrono::milliseconds HoldLimit{250};
+    static constexpr std::chrono::milliseconds Backoff{1000};
+
+    [[nodiscard]] bool Hold(Clock::time_point now, bool waits_for_snapshot) {
+        if (!waits_for_snapshot) {
+            holding_since.reset();
+            resume_after = {};
+            return false;
+        }
+        if (now < resume_after) {
+            return false;
+        }
+        if (!holding_since) {
+            holding_since = now;
+        }
+        if (now - *holding_since < HoldLimit) {
+            return true;
+        }
+        holding_since.reset();
+        resume_after = now + Backoff;
+        return false;
+    }
+
+private:
+    std::optional<Clock::time_point> holding_since;
+    Clock::time_point resume_after{};
+};
 
 } // namespace VideoCommon::GpuTrace

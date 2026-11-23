@@ -91,6 +91,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto& acquire_stats = VideoCommon::g_acquire_stats;
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
+        VideoCommon::GpuTrace::SnapshotHold snapshot_hold;
         namespace BackIdleTrace = VideoCommon::BackIdleTrace;
         using FrontState = BackIdleTrace::FrontState;
         while (!stop_token.stop_requested()) {
@@ -112,7 +113,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 if (split.Active()) {
                     VideoCommon::FrontQmdView::Get().MaybeTakeOver(split);
                 }
-                const bool popped = state.queue.TryPop(next);
+                // A requested GPU trace starts with no channel suspended: hold new commands back
+                // for a while so the suspended ones can finish.
+                const bool hold = snapshot_hold.Hold(std::chrono::steady_clock::now(),
+                                                     VideoCommon::GpuTrace::WaitsForSnapshot());
+                const bool popped = !hold && state.queue.TryPop(next);
                 if (popped) {
                     BackIdleTrace::SetFrontState(FrontState::Parse);
                 }

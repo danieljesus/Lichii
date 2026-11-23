@@ -848,24 +848,52 @@ TEST_CASE("Native matrix lowering selects compact software helpers without legac
     REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
 }
 
+namespace {
+constexpr u32 OpGroupNonUniformShuffle = 345;
+constexpr u32 OpDecorate = 71;
+constexpr u32 OpControlBarrier = 224;
+constexpr u32 OpExecutionMode = 16;
+constexpr u32 OpFConvert = 115;
+constexpr u32 DecorationBuiltIn = 11;
+constexpr u32 BuiltInSubgroupId = 40;
+constexpr u32 ExecutionModeDenormPreserve = 4459;
+constexpr u32 ExecutionModeRoundingModeRTE = 4462;
+/// Words a 64-invocation workgroup's two warps exchange through: six a lane.
+constexpr u32 StagedBytes = 2 * 32 * 6 * 4;
+
+/// The profile an Apple GPU gets through MoltenVK (vk_pipeline_cache.cpp).
+void SlowShuffles(TensorProgram& fixture) {
+    fixture.profile.has_slow_dynamic_shuffle = true;
+    fixture.profile.support_compute_full_subgroups = true;
+    fixture.profile.compute_subgroups_are_guest_warps = true;
+}
+
+bool Shuffles(const std::vector<u32>& code) {
+    return !Instructions(code, OpGroupNonUniformShuffle).empty();
+}
+
+bool HasExecutionMode(const std::vector<u32>& code, u32 mode, u32 width) {
+    return std::ranges::any_of(Instructions(code, OpExecutionMode), [&](const auto& words) {
+        return words.size() == 3 && words[1] == mode && words[2] == width;
+    });
+}
+} // Anonymous namespace
+
 TEST_CASE("Software HMMA exchanges fragments through shared memory where shuffles are slow",
           "[video_core][tensor][ampere]") {
-    constexpr u32 OpGroupNonUniformShuffle = 345;
-    constexpr u32 OpDecorate = 71;
-    constexpr u32 OpControlBarrier = 224;
-    constexpr u32 DecorationBuiltIn = 11;
-    constexpr u32 BuiltInSubgroupId = 40;
     for (const u32 depth : {8U, 16U}) {
         TensorProgram shuffled{1, depth};
         const auto reference = shuffled.Emit();
-        REQUIRE_FALSE(Instructions(reference, OpGroupNonUniformShuffle).empty());
+        REQUIRE(Shuffles(reference));
+        REQUIRE_FALSE(shuffled.program.info.requires_full_guest_warps);
 
         TensorProgram staged{1, depth};
-        staged.profile.has_slow_dynamic_shuffle = true;
+        SlowShuffles(staged);
         const auto code = staged.Emit(depth == 8 ? "software-staged-k8" : "software-staged-k16");
-        // Six words a lane for each warp of the 64-invocation workgroup.
-        REQUIRE(staged.program.shared_memory_size == 2 * 32 * 6 * 4);
-        REQUIRE(Instructions(code, OpGroupNonUniformShuffle).empty());
+        REQUIRE(staged.program.shared_memory_size == StagedBytes);
+        REQUIRE_FALSE(Shuffles(code));
+        // SubgroupId names the warp: the pipeline has to run full 32-lane subgroups.
+        REQUIRE(staged.program.info.requires_full_guest_warps);
         REQUIRE(std::ranges::any_of(Instructions(code, OpDecorate), [](const auto& words) {
             return words.size() == 3 && words[1] == DecorationBuiltIn &&
                    words[2] == BuiltInSubgroupId;
@@ -873,10 +901,203 @@ TEST_CASE("Software HMMA exchanges fragments through shared memory where shuffle
         // One barrier after the warp writes its words, one before the next HMMA writes again.
         REQUIRE(Instructions(code, OpControlBarrier).size() == 2);
     }
-    // A workgroup that is not whole warps keeps the shuffles.
-    TensorProgram partial{1, 16};
-    partial.program.workgroup_size = {48, 1, 1};
-    partial.profile.has_slow_dynamic_shuffle = true;
-    REQUIRE_FALSE(Instructions(partial.Emit(), OpGroupNonUniformShuffle).empty());
-    REQUIRE(partial.program.shared_memory_size == 0);
+}
+
+TEST_CASE("Software HMMA keeps its shuffles where subgroups may not be whole warps",
+          "[video_core][tensor][ampere]") {
+    const auto require_shuffles = [](TensorProgram& fixture) {
+        REQUIRE(Shuffles(fixture.Emit()));
+        REQUIRE(fixture.program.shared_memory_size == 0);
+        REQUIRE_FALSE(fixture.program.info.requires_full_guest_warps);
+    };
+    SECTION("A workgroup that is not whole warps") {
+        TensorProgram fixture{1, 16};
+        SlowShuffles(fixture);
+        fixture.program.workgroup_size = {48, 1, 1};
+        require_shuffles(fixture);
+    }
+    SECTION("Subgroups that are not 32 lanes, or can't be made so") {
+        TensorProgram fixture{1, 16};
+        SlowShuffles(fixture);
+        fixture.profile.compute_subgroups_are_guest_warps = false;
+        require_shuffles(fixture);
+    }
+    SECTION("Subgroups wider than a warp") {
+        TensorProgram fixture{1, 16};
+        SlowShuffles(fixture);
+        fixture.profile.max_subgroup_size = 64;
+        require_shuffles(fixture);
+    }
+    SECTION("No full subgroups") {
+        TensorProgram fixture{1, 16};
+        SlowShuffles(fixture);
+        fixture.profile.support_compute_full_subgroups = false;
+        require_shuffles(fixture);
+    }
+    SECTION("The exchange does not fit the device's shared memory") {
+        TensorProgram fixture{1, 16};
+        SlowShuffles(fixture);
+        fixture.program.shared_memory_size = 31500; // 31504 aligned, + 1536 past 32768
+        fixture.profile.max_compute_shared_memory_size = 32768;
+        REQUIRE(Shuffles(fixture.Emit()));
+        REQUIRE(fixture.program.shared_memory_size == 31500);
+        REQUIRE_FALSE(fixture.program.info.requires_full_guest_warps);
+    }
+}
+
+TEST_CASE("Software HMMA's exchange goes after the program's own shared memory",
+          "[video_core][tensor][ampere]") {
+    TensorProgram fixture{1, 16};
+    SlowShuffles(fixture);
+    fixture.program.shared_memory_size = 1000;
+    fixture.profile.max_compute_shared_memory_size = 32768;
+    const auto code = fixture.Emit();
+    REQUIRE_FALSE(Shuffles(code));
+    // 1000 bytes rounded up to 16, then the exchange: no word of the program's is reused.
+    REQUIRE(fixture.program.hmma_scratch.has_value());
+    REQUIRE(fixture.program.hmma_scratch->word == 1008 / 4);
+    REQUIRE(fixture.program.shared_memory_size == 1008 + StagedBytes);
+}
+
+TEST_CASE("Emitting an HMMA program twice reserves its shared memory once",
+          "[video_core][tensor][ampere]") {
+    SECTION("Software exchange") {
+        TensorProgram fixture{1, 16};
+        SlowShuffles(fixture);
+        const auto first = fixture.Emit();
+        const u32 size = fixture.program.shared_memory_size;
+        REQUIRE(fixture.Emit() == first);
+        REQUIRE(fixture.program.shared_memory_size == size);
+    }
+    SECTION("16x16x16 cooperative matrices") {
+        TensorProgram fixture{3, 16};
+        fixture.profile.support_cooperative_hmma_16x16x16 = true;
+        const auto first = fixture.Emit();
+        const u32 size = fixture.program.shared_memory_size;
+        REQUIRE(size > 0);
+        REQUIRE(fixture.Emit() == first);
+        REQUIRE(fixture.program.shared_memory_size == size);
+    }
+}
+
+TEST_CASE("Software HMMA's native rounding declares no mode the device lacks",
+          "[video_core][tensor][ampere]") {
+    // MoltenVK on an Apple GPU: float controls, but neither fp16 RTE nor denorm preservation.
+    TensorProgram apple{1, 16};
+    SlowShuffles(apple);
+    apple.profile.support_float_controls = true;
+    apple.profile.fp16_conversion_rounds_rte_with_denorms = true;
+    const auto code = apple.Emit("software-native-rounding-implicit");
+    REQUIRE_FALSE(Instructions(code, OpFConvert).empty());
+    for (const u32 width : {16U, 64U}) {
+        REQUIRE_FALSE(HasExecutionMode(code, ExecutionModeDenormPreserve, width));
+        REQUIRE_FALSE(HasExecutionMode(code, ExecutionModeRoundingModeRTE, width));
+    }
+    // A device that supports the modes still gets them for its native rounding.
+    TensorProgram supported{1, 16};
+    supported.profile.support_float_controls = true;
+    supported.profile.support_fp16_rounding_rte = true;
+    supported.profile.support_fp16_denorm_preserve = true;
+    supported.profile.fp16_float_controls_independent_of_fp32 = true;
+    supported.profile.support_separate_denorm_behavior = true;
+    supported.profile.support_separate_rounding_mode = true;
+    const auto with_modes = supported.Emit();
+    REQUIRE_FALSE(Instructions(with_modes, OpFConvert).empty());
+    REQUIRE(HasExecutionMode(with_modes, ExecutionModeDenormPreserve, 16));
+    REQUIRE(HasExecutionMode(with_modes, ExecutionModeRoundingModeRTE, 16));
+    // A shader that flushes fp16 denormals keeps the software rounding.
+    TensorProgram flushing{1, 16};
+    flushing.profile.support_float_controls = true;
+    flushing.profile.fp16_conversion_rounds_rte_with_denorms = true;
+    flushing.program.info.uses_fp16_denorms_flush = true;
+    REQUIRE(Instructions(flushing.Emit(), OpFConvert).empty());
+}
+
+namespace {
+constexpr u32 OpTypeCooperativeMatrixKHR = 4456;
+constexpr u32 OpTypeFloat = 22;
+/// Words a 64-invocation workgroup's two warps use on 8x8x8 matrices: 320 a warp.
+constexpr u32 Hmma8x8x8Bytes = 2 * 320 * 4;
+
+/// An Apple GPU with VK_KHR_cooperative_matrix (MoltenVK): 8x8x8 shapes only.
+void Apple8x8x8(TensorProgram& fixture) {
+    fixture.profile.support_cooperative_hmma_8x8x8 = true;
+    fixture.profile.compute_subgroups_are_guest_warps = true;
+    fixture.profile.support_float_controls = true;
+    fixture.profile.fp16_conversion_rounds_rte_with_denorms = true;
+}
+} // Anonymous namespace
+
+TEST_CASE("8x8x8 cooperative HMMA runs each K half as one product per 8 rows",
+          "[video_core][tensor][ampere]") {
+    for (const u32 depth : {8U, 16U}) {
+        for (const u32 count : {1U, 3U}) {
+            TensorProgram fixture{count, depth};
+            Apple8x8x8(fixture);
+            const auto code = fixture.Emit("cooperative-8x8x8-k" + std::to_string(depth) + "-n" +
+                                           std::to_string(count));
+            REQUIRE(HasCapability(code, CAPABILITY_COOPERATIVE_MATRIX));
+            RequireVulkanMemoryModel(code);
+            REQUIRE(fixture.program.info.uses_cooperative_matrix);
+            REQUIRE(fixture.program.shared_memory_size == Hmma8x8x8Bytes);
+            // Two 8-row halves, each with one product per K half.
+            REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_MUL_ADD).size() ==
+                    count * 2 * (depth / 8));
+            REQUIRE_FALSE(Shuffles(code));
+            // fp16 A and B, fp32 accumulator, all 8x8 at subgroup scope.
+            const auto types = Instructions(code, OpTypeCooperativeMatrixKHR);
+            REQUIRE(types.size() == 3);
+            const auto floats = Instructions(code, OpTypeFloat);
+            const auto width_of = [&](u32 id) {
+                for (const auto& words : floats) {
+                    if (words[0] == id) {
+                        return words[1];
+                    }
+                }
+                return 0U;
+            };
+            std::array<u32, 3> widths{};
+            for (const auto& words : types) {
+                REQUIRE(words.size() == 6);
+                widths[std::min<size_t>(&words - &types[0], 2)] = width_of(words[1]);
+            }
+            std::ranges::sort(widths);
+            REQUIRE(widths == std::array<u32, 3>{16, 16, 32});
+            // The rounding between K halves converts natively, with no mode the device lacks.
+            REQUIRE_FALSE(Instructions(code, OpFConvert).empty());
+            REQUIRE_FALSE(HasExecutionMode(code, ExecutionModeDenormPreserve, 16));
+        }
+    }
+}
+
+TEST_CASE("8x8x8 cooperative HMMA needs warps as subgroups and native fp16 rounding",
+          "[video_core][tensor][ampere]") {
+    SECTION("Subgroups that may not be warps") {
+        TensorProgram fixture{1, 16};
+        Apple8x8x8(fixture);
+        fixture.profile.compute_subgroups_are_guest_warps = false;
+        const auto code = fixture.Emit();
+        REQUIRE(Instructions(code, OP_COOPERATIVE_MATRIX_MUL_ADD).empty());
+        REQUIRE(fixture.program.shared_memory_size == 0);
+    }
+    SECTION("No native fp16 rounding") {
+        TensorProgram fixture{1, 16};
+        Apple8x8x8(fixture);
+        fixture.profile.fp16_conversion_rounds_rte_with_denorms = false;
+        REQUIRE(Instructions(fixture.Emit(), OP_COOPERATIVE_MATRIX_MUL_ADD).empty());
+    }
+    SECTION("16x16x16 matrices come first") {
+        TensorProgram fixture{1, 16};
+        Apple8x8x8(fixture);
+        fixture.profile.support_cooperative_hmma_16x16x16 = true;
+        fixture.Emit();
+        REQUIRE(fixture.program.shared_memory_size == 2 * 384 * 4);
+    }
+    SECTION("Emitted twice, one area") {
+        TensorProgram fixture{1, 16};
+        Apple8x8x8(fixture);
+        const auto first = fixture.Emit();
+        REQUIRE(fixture.Emit() == first);
+        REQUIRE(fixture.program.shared_memory_size == Hmma8x8x8Bytes);
+    }
 }

@@ -349,11 +349,16 @@ bool Snapshot(Recorder& r, Core::System& system) {
             }
         }
     }
-    // GPU-written data the caches hold goes to guest memory first, so the copy below has it.
+    // GPU-written data the texture and buffer caches hold goes to guest memory first, so the copy
+    // below has it. Not the query cache's: flushed over every mapped range (3.5 GB in Ocarina of
+    // Time), the GPU ran garbage right after (draws of billions of vertices, unknown engines) and
+    // aborted within a frame on an M6, likely from reports written into memory the guest had
+    // reused. A report the guest reads later lands when it reads it, as without a trace.
     split.Run([&] {
         auto* const rasterizer = gpu.Renderer().ReadRasterizer();
         for (const SmmuMapRecord& run : runs) {
-            rasterizer->FlushRegion(run.device_address, run.size);
+            rasterizer->FlushRegion(run.device_address, run.size,
+                                    CacheType::TextureCache | CacheType::BufferCache);
         }
     });
     {

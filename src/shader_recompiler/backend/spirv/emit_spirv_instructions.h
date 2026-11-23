@@ -662,5 +662,7 @@ bool UsesCooperativeHmma(const Profile& profile, const IR::Program& program);
 /// word where it starts.
 std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Program& program);
 std::optional<u32> ReserveSoftwareHmmaScratch(const Profile& profile, IR::Program& program);
+/// Whether ReserveCooperativeHmmaScratch gave the program the 8x8x8 path's shared memory.
+bool UsesCooperativeHmma8x8x8(const IR::Program& program);
 
 } // namespace Shader::Backend::SPIRV

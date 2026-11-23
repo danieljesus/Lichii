@@ -604,6 +604,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     if (driver_id == VK_DRIVER_ID_MESA_TURNIP) {
         supported_subgroup_stages &= ~(1u << static_cast<u32>(Shader::Stage::Geometry));
     }
+    // PCI vendor ID Apple's own GPUs report (not Intel or AMD GPUs in a Mac).
+    const bool is_apple_gpu = device.GetVendorID() == 0x106B;
     profile = Shader::Profile{
         .supported_spirv = device.SupportedSpirvVersion(),
         .unified_descriptor_binding = true,
@@ -706,8 +708,15 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
         .has_broken_spirv_fragment_shuffle = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY,
-        .fp16_conversion_rounds_rte_with_denorms = device.IsMoltenVK(),
-        .has_slow_dynamic_shuffle = device.IsMoltenVK(),
+        // Measured on Apple GPUs only (an M6): Intel and AMD Macs keep the default paths.
+        .fp16_conversion_rounds_rte_with_denorms = device.IsMoltenVK() && is_apple_gpu,
+        .has_slow_dynamic_shuffle = device.IsMoltenVK() && is_apple_gpu,
+        .support_compute_full_subgroups = device.IsComputeFullSubgroupsSupported(),
+        .compute_subgroups_are_guest_warps =
+            (device.IsExtSubgroupSizeControlSupported() &&
+             device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)) ||
+            (device.GetMinSubgroupSize() == 32 && device.GetMaxSubgroupSize() == 32) ||
+            (is_apple_gpu && device.GetMaxSubgroupSize() == 32),
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
@@ -724,6 +733,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         !profile.support_cooperative_hmma && device.IsCooperativeHmma16x16x16Supported();
     if (profile.support_cooperative_hmma_16x16x16) {
         LOG_INFO(Render_Vulkan, "Guest tensor operations run on 16x16x16 cooperative matrices");
+    }
+    profile.support_cooperative_hmma_8x8x8 = !profile.support_cooperative_hmma &&
+                                             !profile.support_cooperative_hmma_16x16x16 &&
+                                             device.IsCooperativeHmma8x8x8Supported();
+    if (profile.support_cooperative_hmma_8x8x8) {
+        LOG_INFO(Render_Vulkan, "Guest tensor operations run on 8x8x8 cooperative matrices");
     }
     if (profile.has_broken_mesh_user_sgprs) {
         LOG_INFO(Render_Vulkan, "RADV before 26.2.5: native mesh shaders read the grid size to "

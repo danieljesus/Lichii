@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,13 @@ struct Program {
     u32 invocations{};
     u32 local_memory_size{};
     u32 shared_memory_size{};
+    /// Shared memory an HMMA path appended after the program's own, once: emitting the program
+    /// again (Nx2Perf::Verify emits twice) finds it here instead of appending another
+    struct HmmaScratch {
+        u32 kind;
+        u32 word;
+    };
+    std::optional<HmmaScratch> hmma_scratch;
     bool is_geometry_passthrough{};
     MeshInfo mesh{};
     /// Sets of storage buffer descriptor indices, and the global accesses routed among one of them
