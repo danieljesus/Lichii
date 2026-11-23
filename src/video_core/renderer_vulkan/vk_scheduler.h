@@ -121,6 +121,12 @@ public:
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
 
+    /// DispatchWork, except while the active pass has a slot hoisted commands can still join:
+    /// then the work stays on this thread (`full`: the chunk is full and is held; otherwise
+    /// nothing is sent) until the slot goes, a dispatch that cannot wait comes, or the hold
+    /// reaches its bound (MAX_HELD_CHUNKS chunks, MAX_HOLD).
+    void DispatchWorkOrHold(bool full);
+
     /// Requests to begin a renderpass.
     void RequestRenderpass(const Framebuffer* framebuffer,
                            std::source_location location = std::source_location::current());
@@ -260,7 +266,7 @@ public:
         if (chunk->Record(command)) {
             return;
         }
-        DispatchWork();
+        DispatchWorkOrHold(true);
         (void)chunk->Record(command);
     }
 
@@ -393,6 +399,10 @@ private:
     /// OpenHoistSlot's slot, while Hoist may still add to it (only the recording thread
     /// touches it: it is dropped before its chunk goes to the worker).
     std::shared_ptr<std::vector<HoistedCommand>> hoist_slot;
+    std::chrono::steady_clock::time_point hold_start{};
+    bool holding{}; ///< Since the first held chunk or skipped dispatch
+    static constexpr size_t MAX_HELD_CHUNKS = 4;
+    static constexpr std::chrono::microseconds MAX_HOLD{2000};
     u64 hoist_pass_serial{};   ///< render_pass_serial of the pass the slot precedes
     u64 hoist_record_serial{}; ///< record_serial right after the slot was recorded
     bool hoist_awaits_pass{};  ///< The pass after the slot has not begun yet
@@ -655,6 +665,8 @@ private:
     DeferredClear deferred_clear;
 
     std::unique_ptr<CommandChunk> chunk;
+    /// Full chunks DispatchWorkOrHold kept back while the slot could still be used, in order.
+    std::vector<std::unique_ptr<CommandChunk>> held_chunks;
     std::function<void()> on_submit;
 
     State state;

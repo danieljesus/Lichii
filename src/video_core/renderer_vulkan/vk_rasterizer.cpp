@@ -4274,7 +4274,7 @@ void RasterizerVulkan::FlushWork() {
     case SubmissionPolicy::Action::None:
         break;
     case SubmissionPolicy::Action::Dispatch:
-        scheduler.DispatchWork();
+        scheduler.DispatchWorkOrHold(false);
         break;
     case SubmissionPolicy::Action::Flush:
         scheduler.Flush();

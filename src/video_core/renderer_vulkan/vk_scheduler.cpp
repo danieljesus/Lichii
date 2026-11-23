@@ -44,6 +44,14 @@ std::atomic<u64> g_profile_finishes{};
 std::atomic<u64> g_profile_skipped_flushes{};
 std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
+// DispatchWorkOrHold: holds (from the first kept chunk or skipped dispatch to the release), the
+// chunks and skipped dispatches in them, releases at the bound, and the longest hold.
+std::atomic<u64> g_profile_holds{};
+std::atomic<u64> g_profile_held_chunks{};
+std::atomic<u64> g_profile_skipped_dispatches{};
+std::atomic<u64> g_profile_hold_bound{};
+std::atomic<u64> g_profile_hold_max_chunks{};
+std::atomic<u64> g_profile_hold_max_us{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
 
@@ -79,6 +87,18 @@ void ReportSubmitCounts() {
              static_cast<double>(g_profile_renderpasses.exchange(0)) / seconds,
              static_cast<double>(g_profile_finishes.exchange(0)) / seconds,
              static_cast<double>(g_profile_finish_ns.exchange(0)) / 1e6 / seconds);
+    if (const u64 holds = g_profile_holds.exchange(0); holds != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Work held for a hoist slot per second: {:.1f} holds, {:.1f} full chunks held, "
+                 "{:.1f} dispatches skipped, {:.1f} released at the bound; longest {} chunks, "
+                 "{:.2f} ms",
+                 static_cast<double>(holds) / seconds,
+                 static_cast<double>(g_profile_held_chunks.exchange(0)) / seconds,
+                 static_cast<double>(g_profile_skipped_dispatches.exchange(0)) / seconds,
+                 static_cast<double>(g_profile_hold_bound.exchange(0)) / seconds,
+                 g_profile_hold_max_chunks.exchange(0),
+                 static_cast<double>(g_profile_hold_max_us.exchange(0)) / 1000.0);
+    }
     std::vector<std::pair<u64, std::string>> ends;
     {
         std::scoped_lock lock{g_profile_end_mutex};
@@ -380,9 +400,61 @@ void Scheduler::Hoist(HoistedCommand&& command) {
     hoist_slot->push_back(std::move(command));
 }
 
+void Scheduler::DispatchWorkOrHold(bool full) {
+    const bool slot_usable = hoist_slot && !hoist_awaits_pass && state.renderpass &&
+                             render_pass_serial == hoist_pass_serial && !uploads_pending;
+    if (slot_usable) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!holding) {
+            holding = true;
+            hold_start = now;
+        }
+        const bool at_bound =
+            held_chunks.size() + (full ? 1 : 0) > MAX_HELD_CHUNKS || now - hold_start >= MAX_HOLD;
+        if (!at_bound) {
+            const bool profile = VideoCommon::Nx2Profile::Enabled();
+            if (!full) {
+                if (profile) {
+                    g_profile_skipped_dispatches.fetch_add(1, std::memory_order_relaxed);
+                }
+                return;
+            }
+            if (chunk && !chunk->Empty()) {
+                held_chunks.push_back(std::move(chunk));
+                AcquireNewChunk();
+                if (profile) {
+                    g_profile_held_chunks.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            return;
+        }
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            g_profile_hold_bound.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    DispatchWork();
+}
+
 void Scheduler::DispatchWork() {
     // The worker runs the slot's commands from here on.
     hoist_slot.reset();
+    if (holding) {
+        holding = false;
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            const u64 us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                std::chrono::steady_clock::now() - hold_start)
+                                                .count());
+            g_profile_holds.fetch_add(1, std::memory_order_relaxed);
+            u64 chunks = held_chunks.size();
+            u64 max_chunks = g_profile_hold_max_chunks.load(std::memory_order_relaxed);
+            while (chunks > max_chunks &&
+                   !g_profile_hold_max_chunks.compare_exchange_weak(max_chunks, chunks)) {
+            }
+            u64 max_us = g_profile_hold_max_us.load(std::memory_order_relaxed);
+            while (us > max_us && !g_profile_hold_max_us.compare_exchange_weak(max_us, us)) {
+            }
+        }
+    }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
@@ -390,19 +462,28 @@ void Scheduler::DispatchWork() {
         // The worker must receive everything recorded so far.
         FlushUploads();
     }
-    if (chunk && !chunk->Empty()) {
+    const bool send_chunk = chunk && !chunk->Empty();
+    if (send_chunk || !held_chunks.empty()) {
         // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
         // draws): skip it while the worker is still busy, it pops the queue before waiting.
         bool wake;
         {
             std::scoped_lock ql{queue_mutex};
-            work_queue.push(std::move(chunk));
+            for (auto& held : held_chunks) {
+                work_queue.push(std::move(held));
+            }
+            if (send_chunk) {
+                work_queue.push(std::move(chunk));
+            }
             wake = worker_waiting;
         }
+        held_chunks.clear();
         if (wake) {
             event_cv.notify_all();
         }
-        AcquireNewChunk();
+        if (send_chunk) {
+            AcquireNewChunk();
+        }
     }
 }
 
@@ -436,6 +517,10 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
                                     const VkClearValue* clear_values, u32 clear_value_count) {
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Work held for the previous pass's slot goes before this pass begins.
+    if (holding) {
+        DispatchWork();
     }
     // On MoltenVK every pass gets a slot right before it, not only a pass an emulated mesh
     // dispatch kept in place opens: the first emulated mesh draw of a pass that another draw
