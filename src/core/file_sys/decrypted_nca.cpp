@@ -181,7 +181,8 @@ VirtualFile DenseSparseSection(const NcaReader& reader, const NcaFsHeaderReader&
     const s64 physical_offset = info.physical_offset;
     const s64 physical_size = info.GetPhysicalSize();
     if (physical_offset < 0 || info.bucket.offset < 0 || info.bucket.size <= 0 ||
-        physical_offset + physical_size > static_cast<s64>(nca->GetSize())) {
+        physical_offset + physical_size > static_cast<s64>(nca->GetSize()) ||
+        info.bucket.size > static_cast<s64>(nca->GetHeldSize())) {
         error = "sparse data is out of range";
         return nullptr;
     }
@@ -197,16 +198,11 @@ VirtualFile DenseSparseSection(const NcaReader& reader, const NcaFsHeaderReader&
         CtrKey(reader), AesCtrStorage::KeySize, iv.data(), iv.size());
     const auto aligned =
         std::make_shared<AlignmentMatchingStorage<NcaHeader::CtrBlockSize, 1>>(std::move(ctr));
-    // Read up to the table's last whole block, as the driver does: its encrypted storage ends at
-    // the table's size, and the bucket tree reads whole nodes only, never a shorter tail.
-    std::vector<u8> meta;
-    if (!ReadWholeTable(
-            aligned, Common::AlignDown(static_cast<s64>(info.bucket.size), NcaHeader::CtrBlockSize),
-            meta, "sparse", info.bucket.size)) {
+    std::vector<u8> meta(static_cast<std::size_t>(info.bucket.size));
+    if (aligned->Read(meta.data(), meta.size(), 0) != meta.size()) {
         error = "cannot read the sparse table";
         return nullptr;
     }
-    meta.resize(static_cast<std::size_t>(info.bucket.size));
     const auto node_size = SparseStorage::QueryNodeStorageSize(table.entry_count);
     const auto entry_size = SparseStorage::QueryEntryStorageSize(table.entry_count);
     if (node_size + entry_size > static_cast<s64>(meta.size())) {
@@ -246,8 +242,10 @@ VirtualFile DenseSparseSection(const NcaReader& reader, const NcaFsHeaderReader&
 
 // One section, decrypted the way the update and base readers of the console decrypt it.
 // A sparse section is given here as its dense ciphertext.
+// nca is the NCA's file, which holds the section's tables.
 VirtualFile DecryptSection(const NcaReader& reader, const NcaFsHeaderReader& header,
-                           VirtualFile raw, s64 fs_offset, std::string name, std::string& error) {
+                           const VirtualFile& nca, VirtualFile raw, s64 fs_offset, std::string name,
+                           std::string& error) {
     const s64 size = static_cast<s64>(raw->GetSize());
     const auto type = header.GetEncryptionType();
     if (type == EncryptionType::None) {
@@ -280,13 +278,15 @@ VirtualFile DecryptSection(const NcaReader& reader, const NcaFsHeaderReader& hea
             }
             const auto meta_size = Common::AlignUp(static_cast<s64>(patch.aes_ctr_ex_size),
                                                    NcaHeader::XtsBlockSize);
-            std::vector<u8> meta;
-            if (patch.aes_ctr_ex_offset < 0 || meta_size < 0 ||
-                meta_size > size - patch.aes_ctr_ex_offset ||
-                !ReadWholeTable(std::make_shared<OffsetVfsFile>(
-                                    base_ctr, static_cast<std::size_t>(meta_size),
-                                    static_cast<std::size_t>(patch.aes_ctr_ex_offset)),
-                                meta_size, meta, "AES-CTR-EX", patch.aes_ctr_ex_size)) {
+            // The table lies in the NCA's file: a sparse section's size is virtual.
+            if (meta_size > static_cast<s64>(nca->GetHeldSize())) {
+                error = "AES-CTR-EX table out of range";
+                return nullptr;
+            }
+            std::vector<u8> meta(meta_size);
+            if (patch.aes_ctr_ex_offset + meta_size > size ||
+                base_ctr->Read(meta.data(), meta.size(), patch.aes_ctr_ex_offset) !=
+                    meta.size()) {
                 error = "AES-CTR-EX table out of range";
                 return nullptr;
             }
@@ -525,7 +525,7 @@ VirtualFile OpenDecryptedNca(VirtualFile nca, std::string& error) {
         } else {
             raw = std::make_shared<OffsetVfsFile>(nca, end - offset, offset);
         }
-        auto plain = DecryptSection(reader, fs_header, std::move(raw), offset,
+        auto plain = DecryptSection(reader, fs_header, nca, std::move(raw), offset,
                                     fmt::format("fs{}", i), error);
         if (plain == nullptr) {
             error = fmt::format("FS section {}: {}", i, error);

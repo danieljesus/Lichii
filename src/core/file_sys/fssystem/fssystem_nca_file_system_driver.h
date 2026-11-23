@@ -7,8 +7,6 @@
 
 #include <type_traits>
 #include <cstddef>
-#include <string_view>
-#include <vector>
 #include "core/file_sys/fssystem/fssystem_compression_common.h"
 #include "core/file_sys/fssystem/fssystem_nca_header.h"
 #include "core/file_sys/vfs/vfs.h"
@@ -218,12 +216,6 @@ private:
     NcaFsHeader m_data;
     s32 m_fs_index;
 };
-
-/// Reads a table of size bytes from storage into out a piece at a time, so the buffer only grows
-/// as far as the storage returns bytes. Returns false, logging the table's name and the size its
-/// header declares, when the storage does not hold the table in full.
-bool ReadWholeTable(const VirtualFile& storage, s64 size, std::vector<u8>& out,
-                    std::string_view table, s64 declared_size);
 
 class NcaFileSystemDriver {
     LICHII_NON_COPYABLE(NcaFileSystemDriver);

@@ -172,9 +172,7 @@ size_t AesCtrCounterExtendedStorage::Read(u8* buffer, size_t size, size_t offset
     ASSERT(table_offsets.IsInclude(offset, size));
 
     // Read the data.
-    if (m_data_storage->Read(buffer, size, offset) != size) {
-        return 0;
-    }
+    m_data_storage->Read(buffer, size, offset);
 
     // Find the offset in our tree.
     BucketTree::Visitor visitor;

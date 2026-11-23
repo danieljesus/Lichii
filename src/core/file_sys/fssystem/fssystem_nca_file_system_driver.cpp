@@ -3,12 +3,8 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include <bit>
-#include <string_view>
-#include <vector>
 
-#include "common/logging.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_xts_storage.h"
@@ -46,6 +42,12 @@ constexpr bool IsRangeWithin(s64 offset, s64 size, s64 end) {
 // are read into memory whole are also checked against the bytes the NCAs actually store.
 s64 GetBodySize(const std::shared_ptr<NcaReader>& reader) {
     return reader != nullptr ? static_cast<s64>(reader->GetSharedBodyStorage()->GetSize()) : 0;
+}
+
+// A table read into memory whole lies in the NCA's own file, so it cannot be larger than the bytes
+// that file holds, whatever size the file's container claims and whatever layers lie between.
+s64 GetBodyHeldSize(const std::shared_ptr<NcaReader>& reader) {
+    return reader != nullptr ? static_cast<s64>(reader->GetSharedBodyStorage()->GetHeldSize()) : 0;
 }
 
 class SharedNcaBodyStorage : public IReadOnlyStorage {
@@ -89,34 +91,6 @@ using IntegrityLevelInfo = NcaFsHeader::HashData::IntegrityMetaInfo::LevelHashIn
 using IntegrityDataInfo = IntegrityLevelInfo::HierarchicalIntegrityVerificationLevelInformation;
 
 } // namespace
-
-// The body storage's size is not always the file's: a range of a container is opened at the size
-// the container gives, and some layers never read short. A table read into memory whole is
-// therefore read a piece at a time, so the buffer only grows as far as the storage returns bytes,
-// and a table the file does not hold in full is rejected.
-bool ReadWholeTable(const VirtualFile& storage, s64 size, std::vector<u8>& out,
-                    std::string_view table, s64 declared_size) {
-    constexpr s64 PieceSize = s64{1} << 20;
-    out.clear();
-    for (s64 done = 0; done < size;) {
-        const s64 piece = std::min(PieceSize, size - done);
-        out.resize(static_cast<size_t>(done + piece));
-        const size_t read =
-            storage->Read(out.data() + done, static_cast<size_t>(piece), static_cast<size_t>(done));
-        if (read != static_cast<size_t>(piece)) {
-            LOG_ERROR(Loader,
-                      "NCA {} table is not stored in full: {} bytes declared, {} to read, the "
-                      "read stopped at {}",
-                      table, declared_size, size, done + static_cast<s64>(read));
-            out.clear();
-            out.shrink_to_fit();
-            return false;
-        }
-        done += piece;
-    }
-    out.shrink_to_fit();
-    return true;
-}
 
 Result NcaFileSystemDriver::OpenStorageWithContext(VirtualFile* out,
                                                    NcaFsHeaderReader* out_header_reader,
@@ -589,16 +563,10 @@ Result NcaFileSystemDriver::CreateSparseStorageMetaStorage(VirtualFile* out,
                                     offset + meta_offset, sparse_info.MakeAesCtrUpperIv(upper_iv),
                                     AlignmentStorageRequirement::None));
 
-    // Create buffered storage. AES-CTR decrypts whole blocks and the encrypted storage ends at
-    // the table's size, so a last block the table fills only in part cannot be read: the table
-    // is read up to its last whole block. The bucket tree reads whole nodes only, so it never
-    // reads that tail, which is left zero.
-    std::vector<u8> meta_data;
-    R_UNLESS(ReadWholeTable(decrypted_storage,
-                            Common::AlignDown(static_cast<s64>(meta_size), NcaHeader::CtrBlockSize),
-                            meta_data, "sparse", meta_size),
-             ResultNcaBaseStorageOutOfRangeB);
-    meta_data.resize(static_cast<size_t>(meta_size));
+    // Create buffered storage.
+    R_UNLESS(meta_size <= GetBodyHeldSize(m_reader), ResultNcaBaseStorageOutOfRangeB);
+    std::vector<u8> meta_data(meta_size);
+    decrypted_storage->Read(meta_data.data(), meta_size, 0);
 
     auto buffered_storage = std::make_shared<VectorVfsFile>(std::move(meta_data));
     R_UNLESS(buffered_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
@@ -933,10 +901,9 @@ Result NcaFileSystemDriver::CreateAesCtrExStorageMetaStorage(
     R_UNLESS(meta_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
 
     // Create buffered storage.
-    std::vector<u8> meta_data;
-    R_UNLESS(ReadWholeTable(meta_storage, meta_size, meta_data, "AES-CTR-EX",
-                            patch_info.aes_ctr_ex_size),
-             ResultNcaBaseStorageOutOfRangeB);
+    R_UNLESS(meta_size <= GetBodyHeldSize(m_reader), ResultNcaBaseStorageOutOfRangeB);
+    std::vector<u8> meta_data(meta_size);
+    meta_storage->Read(meta_data.data(), meta_size, 0);
 
     auto buffered_storage = std::make_shared<VectorVfsFile>(std::move(meta_data));
     R_UNLESS(buffered_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
@@ -1059,10 +1026,10 @@ Result NcaFileSystemDriver::CreateIndirectStorageMetaStorage(VirtualFile* out,
     R_UNLESS(meta_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
 
     // Create buffered storage.
-    std::vector<u8> meta_data;
-    R_UNLESS(ReadWholeTable(meta_storage, patch_info.indirect_size, meta_data, "indirect",
-                            patch_info.indirect_size),
+    R_UNLESS(patch_info.indirect_size <= GetBodyHeldSize(m_reader),
              ResultNcaBaseStorageOutOfRangeE);
+    std::vector<u8> meta_data(patch_info.indirect_size);
+    meta_storage->Read(meta_data.data(), patch_info.indirect_size, 0);
 
     auto buffered_storage = std::make_shared<VectorVfsFile>(std::move(meta_data));
     R_UNLESS(buffered_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
@@ -1368,9 +1335,7 @@ Result NcaFileSystemDriver::CreateIntegrityVerificationStorageForMeta(
                            base_storage->GetSize()),
              ResultNcaBaseStorageOutOfRangeB);
     NcaMetaDataHashData meta_data_hash_data;
-    R_UNLESS(base_storage->ReadObject(std::addressof(meta_data_hash_data),
-                                      meta_data_hash_data_offset) == sizeof(meta_data_hash_data),
-             ResultNcaBaseStorageOutOfRangeB);
+    base_storage->ReadObject(std::addressof(meta_data_hash_data), meta_data_hash_data_offset);
     R_UNLESS(meta_data_hash_data.layer_info_offset >= offset &&
                  meta_data_hash_data.layer_info_offset - offset <= meta_data_hash_data_offset,
              ResultRomNcaInvalidIntegrityLayerInfoOffset);
