@@ -356,9 +356,13 @@ public:
     /// classifications and the other recorded answers must be the same. Sets `why` to the first
     /// answer that differs. `format_traits` limits the pixel format traits compared to those the
     /// program's translation used (PixelFormatTraits bits; see PipelineCache's precompiled
-    /// pipelines).
+    /// pipelines). `info` is the program's kept translation, when there is one: a translation with
+    /// no handle descriptor on the recorded texture bound buffer (but a handle program's) had no
+    /// bound texture instruction, so that value then counts only through the driver constant
+    /// folding it selects.
     [[nodiscard]] bool AnswersHoldFor(Shader::Environment& live, const char** why = nullptr,
-                                      u32 format_traits = ~0U);
+                                      u32 format_traits = ~0U,
+                                      const Shader::Info* info = nullptr);
 
     /// Pixel format traits translation uses: integer formats (sampled textures).
     static constexpr u32 FormatTraitInteger = 1;
@@ -496,5 +500,16 @@ void CheckComputeRecord(const FileEnvironment& env, u32 shared_memory_size,
 /// changed since, it returns false and leaves the file as it was.
 bool RemovePipelines(std::stop_token stop, const std::filesystem::path& filename, u32 cache_version,
                      u64 loaded_size, std::vector<PipelineRecord> records);
+
+/// A graphics pipeline's kept translation for each of its environments, in their order. The
+/// environments are the key's programs in slot order, empty slots skipped (ShaderCache::
+/// GetGraphicsEnvironments; slot 0 is vertex A), and `slot_infos` are by slot from vertex B to
+/// fragment, as the precompiled store keeps them; a task or mesh program sits in a vertex or
+/// tessellation slot. A vertex A program has none.
+std::array<const Shader::Info*, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram>
+KeptInfosByEnvironment(
+    std::span<const u64, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> unique_hashes,
+    std::span<const Shader::Info* const, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage>
+        slot_infos);
 
 } // namespace VideoCommon
