@@ -280,6 +280,11 @@ public:
         return !pending_sync.empty();
     }
 
+    bool HasSyncWrites() const override {
+        // PresyncWrites moved the pending syncs here, or dropped them on tiler drivers.
+        return !sync_values_stash.empty();
+    }
+
     void SyncWrites() override {
         if (sync_values_stash.empty()) {
             return;

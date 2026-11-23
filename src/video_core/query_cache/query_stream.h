@@ -49,6 +49,11 @@ public:
         /* Do Nothing */
     }
 
+    /// After PresyncWrites: whether SyncWrites still has values to write.
+    virtual bool HasSyncWrites() const {
+        return HasPendingSync();
+    }
+
     virtual void SyncWrites() {
         /* Do Nothing */
     }

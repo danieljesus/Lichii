@@ -503,9 +503,18 @@ void QueryCacheBase<Traits>::NotifyWFI() {
     }
 
     impl->ForEachStreamer([](StreamerInterface* streamer) { streamer->PresyncWrites(); });
-    impl->runtime.Barriers(true);
+    // On tiler drivers the samples streamer drops its syncs in PresyncWrites; when nothing else
+    // has values to write, the barriers would only end the render pass.
+    bool has_writes = false;
+    impl->ForEachStreamer(
+        [&has_writes](StreamerInterface* streamer) { has_writes |= streamer->HasSyncWrites(); });
+    if (has_writes) {
+        impl->runtime.Barriers(true);
+    }
     impl->ForEachStreamer([](StreamerInterface* streamer) { streamer->SyncWrites(); });
-    impl->runtime.Barriers(false);
+    if (has_writes) {
+        impl->runtime.Barriers(false);
+    }
 }
 
 template <typename Traits>
