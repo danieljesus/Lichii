@@ -108,7 +108,10 @@ public:
     template <typename Func>
     void TraceGpuWork(vk::CommandBuffer cmdbuf, u64 hash, u64 fragment_hash,
                       std::array<u32, 3> size, Func&& work) {
-        if (!trace_gpu_recording || !trace_work_pool || trace_work_count == TraceMaxWork) {
+        // TEST ONLY: EDEN_NX2_TEST_NO_WORK_TIMESTAMPS keeps the pass timestamps but drops these.
+        static const bool test_no_work{std::getenv("EDEN_NX2_TEST_NO_WORK_TIMESTAMPS") != nullptr};
+        if (!trace_gpu_recording || !trace_work_pool || trace_work_count == TraceMaxWork ||
+            test_no_work) {
             work();
             return;
         }
