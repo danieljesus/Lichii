@@ -93,6 +93,20 @@ struct LearnedPrior {
 };
 std::vector<LearnedPrior> LearnPriors(std::span<const CachedPipeline> records);
 
+/// The texture bound buffer (the constant buffer non-bindless texture handles are read from) the
+/// recorded programs of each stage use by majority, each program counted once. The oracle answers
+/// it for programs whose lowering does not fix it; stages differ (in recorded play vertex programs
+/// mostly use 0, pixel programs 2), so the engine's 2 alone misses most vertex programs.
+struct LearnedTextureBound {
+    u32 stage{};
+    u32 texture_bound{};
+};
+std::vector<LearnedTextureBound> LearnTextureBound(std::span<const CachedPipeline> records);
+
+/// The texture bound buffer the oracle gives a program of `stage` whose lowering does not fix it:
+/// the stage's learned majority, or the engine's 2 when no program of that stage was recorded.
+u32 OracleTextureBound(std::span<const LearnedTextureBound> learned, u32 stage);
+
 /// One extracted program (nx2-precompile extract), in extract order.
 struct ExtractedProgram {
     u64 fingerprint{};

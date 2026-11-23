@@ -98,6 +98,36 @@ TEST_CASE("Nx2Precompile: priors keep the majority answer when it is not mapped"
     REQUIRE_FALSE(priors[0].indirect);
 }
 
+TEST_CASE("Nx2Precompile: the oracle's texture bound buffer is each stage's recorded majority",
+          "[video_core]") {
+    const auto env = [](u32 stage, u64 code_word, u32 texture_bound) {
+        CachedEnv out;
+        out.stage = stage;
+        out.code.resize(16);
+        std::memcpy(out.code.data(), &code_word, sizeof(code_word));
+        out.code_size = out.code.size();
+        out.texture_bound = texture_bound;
+        out.sph.assign(0x50, 0);
+        return out;
+    };
+    // Vertex programs 1 and 2 read their handles from buffer 0 and program 3 from 2; program 1 is
+    // recorded three times and counts once. The pixel programs use 2.
+    std::vector<CachedPipeline> records;
+    const std::vector<std::pair<u64, u32>> vertices{{1, 0}, {1, 0}, {1, 0}, {2, 0}, {3, 2}};
+    for (const auto& [vertex, bound] : vertices) {
+        records.push_back({.envs = {env(0, vertex, bound), env(4, 100 + vertex, 2)},
+                           .key = std::vector<u8>(1056, 0)});
+    }
+    const auto learned = LearnTextureBound(records);
+    REQUIRE(learned.size() == 2);
+    // A predicted vertex program whose lowering does not fix it gets 0, a pixel program 2.
+    REQUIRE(OracleTextureBound(learned, 0) == 0);
+    REQUIRE(OracleTextureBound(learned, 4) == 2);
+    // A stage nothing was recorded for, and a build without recordings, keep the engine's 2.
+    REQUIRE(OracleTextureBound(learned, 8) == 2);
+    REQUIRE(OracleTextureBound(LearnTextureBound({}), 0) == 2);
+}
+
 TEST_CASE("Nx2Precompile: older shader archive versions nobody drew are left out",
           "[video_core]") {
     // Two versions of one archive, each with a vertex and a pixel program; the recorded play drew
