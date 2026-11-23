@@ -50,6 +50,11 @@ public:
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
         return std::nullopt;
     }
+    /// The live register value, and the driver constant folding the backends derive from it.
+    void SetTextureBound(u32 value, bool proprietary_driver) {
+        texture_bound = value;
+        is_proprietary_driver = proprietary_driver;
+    }
 
 private:
     std::map<std::pair<u32, u32>, u32> words;
@@ -182,4 +187,37 @@ TEST_CASE("Markers of the retired layout are dropped", "[video_core]") {
                          {{1, Color2D}, {2, Color2D}, {3, Color2D}, {6, Color3D}}};
     REQUIRE(!file.AnswersHoldFor(live, &why));
     REQUIRE(std::string_view{why} == "constant buffer value");
+}
+
+TEST_CASE("A record that asked no texture question holds under another texture bound buffer",
+          "[video_core]") {
+    // Translation asks for the bound buffer only for a bound texture instruction; a program that
+    // reads no texture never used it. Recorded with 2 (the record's driver folding is then on).
+    WordEnvironment recorded{{{{1, 0x20}, 5}}, {}};
+    (void)recorded.ReadCbufValue(1, 0x20);
+    auto file = Record(recorded);
+    const char* why = "";
+
+    SECTION("Another value with the same driver constant folding") {
+        WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+        live.SetTextureBound(0, true);
+        REQUIRE(file.AnswersHoldFor(live, &why));
+    }
+    SECTION("Another value that turns the driver constant folding off") {
+        WordEnvironment live{{{{1, 0x20}, 5}}, {}};
+        live.SetTextureBound(0, false);
+        REQUIRE(!file.AnswersHoldFor(live, &why));
+        REQUIRE(std::string_view{why} == "texture bound buffer");
+    }
+}
+
+TEST_CASE("A record that read a texture keeps its texture bound buffer", "[video_core]") {
+    WordEnvironment recorded{{{{2, 0x10}, 7}}, {{7, Color2D}}};
+    (void)recorded.ReadTextureType(recorded.ReadCbufHandleWord(2, 0x10));
+    auto file = Record(recorded);
+    WordEnvironment live{{{{2, 0x10}, 7}}, {{7, Color2D}}};
+    live.SetTextureBound(0, true);
+    const char* why = "";
+    REQUIRE(!file.AnswersHoldFor(live, &why));
+    REQUIRE(std::string_view{why} == "texture bound buffer");
 }

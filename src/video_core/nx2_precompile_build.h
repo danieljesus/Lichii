@@ -94,9 +94,9 @@ struct LearnedPrior {
 std::vector<LearnedPrior> LearnPriors(std::span<const CachedPipeline> records);
 
 /// The texture bound buffer (the constant buffer non-bindless texture handles are read from) the
-/// recorded programs of each stage use by majority, each program counted once. The oracle answers
-/// it for programs whose lowering does not fix it; stages differ (in recorded play vertex programs
-/// mostly use 0, pixel programs 2), so the engine's 2 alone misses most vertex programs.
+/// recorded programs of each stage that asked a texture question use by majority, each program
+/// counted once. The oracle answers it for programs whose lowering does not fix it. Programs that
+/// asked no texture question are left out: the runtime does not compare their value.
 struct LearnedTextureBound {
     u32 stage{};
     u32 texture_bound{};

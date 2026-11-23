@@ -1434,8 +1434,14 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
         live.ReadViewportTransformState() != viewport_transform_state) {
         return fail("viewport transform");
     }
-    // Handles of non-bindless textures are read from this constant buffer.
-    if (live.TextureBoundBuffer() != texture_bound) {
+    // Handles of non-bindless textures are read from this constant buffer. Translation asks for it
+    // only for a bound texture instruction (texture_pass), whose handle's type and format it then
+    // reads, so a record that asked no texture question never used it. Its value then matters only
+    // through the driver constant folding it selects (is_proprietary_driver), which must agree.
+    const bool asked_textures =
+        !texture_types.empty() || !texture_pixel_formats.empty() || !cbuf_handle_words.empty();
+    if (asked_textures ? live.TextureBoundBuffer() != texture_bound
+                       : live.IsProprietaryDriver() != IsProprietaryDriver()) {
         return fail("texture bound buffer");
     }
     // A passthrough geometry program passes the attributes this mask does not skip.

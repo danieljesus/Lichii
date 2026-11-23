@@ -4,6 +4,7 @@
 #include <array>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -100,22 +101,28 @@ TEST_CASE("Nx2Precompile: priors keep the majority answer when it is not mapped"
 
 TEST_CASE("Nx2Precompile: the oracle's texture bound buffer is each stage's recorded majority",
           "[video_core]") {
-    const auto env = [](u32 stage, u64 code_word, u32 texture_bound) {
+    const auto env = [](u32 stage, u64 code_word, u32 texture_bound, bool textures = true) {
         CachedEnv out;
         out.stage = stage;
         out.code.resize(16);
         std::memcpy(out.code.data(), &code_word, sizeof(code_word));
         out.code_size = out.code.size();
         out.texture_bound = texture_bound;
+        if (textures) {
+            out.texture_types = {{7, 2}};
+        }
         out.sph.assign(0x50, 0);
         return out;
     };
     // Vertex programs 1 and 2 read their handles from buffer 0 and program 3 from 2; program 1 is
-    // recorded three times and counts once. The pixel programs use 2.
+    // recorded three times and counts once. Programs 4 and 5 asked no texture question: their 2
+    // is not compared at run time and does not vote. The pixel programs use 2.
     std::vector<CachedPipeline> records;
-    const std::vector<std::pair<u64, u32>> vertices{{1, 0}, {1, 0}, {1, 0}, {2, 0}, {3, 2}};
-    for (const auto& [vertex, bound] : vertices) {
-        records.push_back({.envs = {env(0, vertex, bound), env(4, 100 + vertex, 2)},
+    const std::vector<std::tuple<u64, u32, bool>> vertices{
+        {1, 0, true}, {1, 0, true}, {1, 0, true}, {2, 0, true},
+        {3, 2, true}, {4, 2, false}, {5, 2, false}};
+    for (const auto& [vertex, bound, textures] : vertices) {
+        records.push_back({.envs = {env(0, vertex, bound, textures), env(4, 100 + vertex, 2)},
                            .key = std::vector<u8>(1056, 0)});
     }
     const auto learned = LearnTextureBound(records);
