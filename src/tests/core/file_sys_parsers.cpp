@@ -26,6 +26,10 @@
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/errors.h"
+#include "core/file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h"
+#include "core/file_sys/fssystem/fssystem_aes_ctr_storage.h"
+#include "core/file_sys/fssystem/fssystem_aes_xts_storage.h"
+#include "core/file_sys/fssystem/fssystem_alignment_matching_storage.h"
 #include "core/file_sys/fssystem/fssystem_bucket_tree.h"
 #include "core/file_sys/fssystem/fssystem_compression_configuration.h"
 #include "core/file_sys/fssystem/fssystem_crypto_configuration.h"
@@ -39,6 +43,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/submission_package.h"
+#include "core/file_sys/vfs/vfs_offset.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/file_sys/xts_archive.h"
 #include "core/hle/service/acc/profile_manager.h"
@@ -366,6 +371,32 @@ TEST_CASE("NCA with an AES-XTS section opens a storage", "[core][file_sys]") {
     auto nca = MakeSha256Nca();
     nca.fs.encryption_type = NcaFsHeader::EncryptionType::AesXts;
     REQUIRE(nca.Open() == ResultSuccess);
+}
+
+// An AES-XTS section as the driver reads it: AES-XTS under an alignment matching storage.
+VirtualFile MakeXtsSection(VirtualFile base) {
+    static constexpr std::array<u8, AesXtsStorage::KeySize> key1{1};
+    static constexpr std::array<u8, AesXtsStorage::KeySize> key2{2};
+    std::array<u8, AesXtsStorage::IvSize> iv{};
+    AesXtsStorage::MakeAesXtsIv(iv.data(), iv.size(), 0xC00, NcaHeader::XtsBlockSize);
+    return std::make_shared<AlignmentMatchingStorage<NcaHeader::XtsBlockSize, 1>>(
+        std::make_shared<AesXtsStorage>(std::move(base), key1.data(), key2.data(),
+                                        AesXtsStorage::KeySize, iv.data(), AesXtsStorage::IvSize,
+                                        NcaHeader::XtsBlockSize));
+}
+
+TEST_CASE("AES-XTS section reads up to its last block, and reports a read past its stored bytes",
+          "[core][file_sys]") {
+    std::vector<u8> buffer(0x4000);
+    const auto section = MakeXtsSection(MakeFile(std::vector<u8>(0x4000)));
+    REQUIRE(section->Read(buffer.data(), 0x4000, 0) == 0x4000);
+    REQUIRE(section->Read(buffer.data(), 0x10, 0x4000 - 0x10) == 0x10);
+    REQUIRE(section->Read(buffer.data(), 0x1F0, 0x3E08) == 0x1F0);
+
+    const auto claimed = MakeXtsSection(
+        std::make_shared<OffsetVfsFile>(MakeFile(std::vector<u8>(0x4000)), 0x8000, 0));
+    REQUIRE(claimed->Read(buffer.data(), 0x4000, 0) == 0x4000);
+    REQUIRE(claimed->Read(buffer.data(), 0x200, 0x4000) == 0);
 }
 
 /// Takes the installed header key out of memory for one test and puts it back after, so the
@@ -756,6 +787,36 @@ PlaintextNca MakeIndirectNca(s64 end) {
 
 TEST_CASE("NCA with a valid indirect table opens", "[core][file_sys]") {
     REQUIRE(MakeIndirectNca(0x8000).Open() == ResultSuccess);
+}
+
+TEST_CASE("AES-CTR-EX storage reports a read past its data storage's stored bytes",
+          "[core][file_sys]") {
+    // One entry that leaves [0, 0x8000) not encrypted, over 0x4000 stored bytes that a range
+    // claims to be 0x8000.
+    std::vector<u8> table(0x8000);
+    const BucketTree::NodeHeader node{0, 1, 0x8000};
+    Put(table, 0, node);
+    Put(table, sizeof(node), s64{0});
+    Put(table, 0x4000, node);
+    AesCtrCounterExtendedStorage::Entry entry{};
+    entry.encryption_value = AesCtrCounterExtendedStorage::Entry::Encryption::NotEncrypted;
+    Put(table, 0x4000 + sizeof(node), entry);
+    const auto table_file = MakeFile(std::move(table));
+    std::vector<u8> data(0x4000, 7);
+
+    std::unique_ptr<AesCtrCounterExtendedStorage::IDecryptor> decryptor;
+    REQUIRE(AesCtrCounterExtendedStorage::CreateSoftwareDecryptor(&decryptor) == ResultSuccess);
+    static constexpr std::array<u8, AesCtrStorage::KeySize> key{3};
+    AesCtrCounterExtendedStorage storage;
+    REQUIRE(storage.Initialize(key.data(), key.size(), 0, 0,
+                               std::make_shared<OffsetVfsFile>(MakeFile(data), 0x8000, 0),
+                               std::make_shared<OffsetVfsFile>(table_file, 0x4000, 0),
+                               std::make_shared<OffsetVfsFile>(table_file, 0x4000, 0x4000), 1,
+                               std::move(decryptor)) == ResultSuccess);
+    std::vector<u8> buffer(0x4000);
+    REQUIRE(storage.Read(buffer.data(), 0x4000, 0) == 0x4000);
+    REQUIRE(buffer == data);
+    REQUIRE(storage.Read(buffer.data(), 0x200, 0x4000) == 0);
 }
 
 TEST_CASE("NCA rejects a hash region larger than the file behind an indirect layer",

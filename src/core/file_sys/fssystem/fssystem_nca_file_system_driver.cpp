@@ -1325,7 +1325,9 @@ Result NcaFileSystemDriver::CreateIntegrityVerificationStorageForMeta(
                            base_storage->GetSize()),
              ResultNcaBaseStorageOutOfRangeB);
     NcaMetaDataHashData meta_data_hash_data;
-    base_storage->ReadObject(std::addressof(meta_data_hash_data), meta_data_hash_data_offset);
+    R_UNLESS(base_storage->ReadObject(std::addressof(meta_data_hash_data),
+                                      meta_data_hash_data_offset) == sizeof(meta_data_hash_data),
+             ResultNcaBaseStorageOutOfRangeB);
     R_UNLESS(meta_data_hash_data.layer_info_offset >= offset &&
                  meta_data_hash_data.layer_info_offset - offset <= meta_data_hash_data_offset,
              ResultRomNcaInvalidIntegrityLayerInfoOffset);
