@@ -46,17 +46,41 @@ std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
+struct SubmitSiteCount {
+    u64 submits{};
+    u64 ending_pass{};
+};
+std::map<std::string, SubmitSiteCount> g_profile_submit_sites;
+
+std::string_view SiteFile(const char* file) {
+    std::string_view name{file};
+    if (const auto slash = name.find_last_of('/'); slash != std::string_view::npos) {
+        name.remove_prefix(slash + 1);
+    }
+    return name;
+}
 
 void CountRenderPassEnd(const char* file, u32 line) {
     if (!VideoCommon::Nx2Profile::Enabled()) {
         return;
     }
-    std::string_view name{file};
-    if (const auto slash = name.find_last_of('/'); slash != std::string_view::npos) {
-        name.remove_prefix(slash + 1);
+    std::scoped_lock lock{g_profile_end_mutex};
+    ++g_profile_ends[fmt::format("{}:{}", SiteFile(file), line)];
+}
+
+/// One submission by `kind` (flush, finish, deferred: a DeferFlush request FlushDeferred
+/// submitted; absorbed: a pending request a later flush took along, not a submission).
+void CountSubmitSite(std::string_view kind, const std::source_location& location,
+                     bool ends_pass) {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
     }
     std::scoped_lock lock{g_profile_end_mutex};
-    ++g_profile_ends[fmt::format("{}:{}", name, line)];
+    auto& count =
+        g_profile_submit_sites[fmt::format("{} {}:{}", kind, SiteFile(location.file_name()),
+                                           location.line())];
+    ++count.submits;
+    count.ending_pass += ends_pass ? 1 : 0;
 }
 
 void ReportSubmitCounts() {
@@ -91,6 +115,22 @@ void ReportSubmitCounts() {
     for (size_t i = 0; i < ends.size() && i < 16; ++i) {
         LOG_INFO(Render_Vulkan, "Render pass ends {:.0f}/s at {}",
                  static_cast<double>(ends[i].first) / seconds, ends[i].second);
+    }
+    std::vector<std::pair<SubmitSiteCount, std::string>> sites;
+    {
+        std::scoped_lock lock{g_profile_end_mutex};
+        for (const auto& [site, count] : g_profile_submit_sites) {
+            sites.emplace_back(count, site);
+        }
+        g_profile_submit_sites.clear();
+    }
+    std::ranges::sort(sites, [](const auto& a, const auto& b) {
+        return a.first.submits > b.first.submits;
+    });
+    for (size_t i = 0; i < sites.size() && i < 24; ++i) {
+        LOG_INFO(Render_Vulkan, "Submit site {:.1f}/s ({:.1f}/s ending an open pass): {}",
+                 static_cast<double>(sites[i].first.submits) / seconds,
+                 static_cast<double>(sites[i].first.ending_pass) / seconds, sites[i].second);
     }
 }
 }
@@ -194,6 +234,10 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
+    if (flush_pending && !flushing_deferred) {
+        CountSubmitSite("absorbed", deferred_location, false);
+    }
+    CountSubmitSite(flushing_deferred ? "deferred" : "flush", location, state.renderpass != VK_NULL_HANDLE);
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
@@ -212,7 +256,7 @@ void Scheduler::CountSkippedFlush() {
     }
 }
 
-bool Scheduler::DeferFlush() {
+bool Scheduler::DeferFlush(std::source_location location) {
     // Fences come one per compute release: ~11,500 a second in Hyrule Warriors: Age of
     // Imprisonment fights, each a queue submission (~22,000 a second with the others), which
     // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
@@ -229,13 +273,18 @@ bool Scheduler::DeferFlush() {
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
         return false;
     }
+    if (!flush_pending) {
+        deferred_location = location;
+    }
     flush_pending = true;
     return true;
 }
 
 void Scheduler::FlushDeferred() {
     if (flush_pending) {
-        Flush();
+        flushing_deferred = true;
+        Flush({}, {}, deferred_location);
+        flushing_deferred = false;
     }
 }
 
@@ -274,6 +323,10 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
+    if (flush_pending) {
+        CountSubmitSite("absorbed", deferred_location, false);
+    }
+    CountSubmitSite("finish", location, state.renderpass != VK_NULL_HANDLE);
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
