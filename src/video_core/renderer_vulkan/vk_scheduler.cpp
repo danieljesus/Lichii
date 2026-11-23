@@ -437,6 +437,14 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
     }
+    // On MoltenVK every pass gets a slot right before it, not only a pass an emulated mesh
+    // dispatch kept in place opens: the first emulated mesh draw of a pass that another draw
+    // began then runs its dispatch there too.
+    const bool slot_ready =
+        hoist_awaits_pass && record_serial == hoist_record_serial && !uploads_pending;
+    if (device.IsMoltenVK() && !slot_ready) {
+        OpenHoistSlot();
+    }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
     ++render_pass_serial;
