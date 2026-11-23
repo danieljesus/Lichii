@@ -249,6 +249,7 @@ TEST_CASE("NSO argument block holds its header and the arguments", "[core][loade
     CHECK(std::string(reinterpret_cast<const char*>(block.data()) + sizeof(header), 15) ==
           "homebrew --flag");
     CHECK(block[sizeof(header) + 15] == 0);
+}
 
 namespace {
 
