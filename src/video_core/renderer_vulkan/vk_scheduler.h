@@ -177,7 +177,17 @@ public:
         render_pass_has_stores = true;
         // A draw that writes buffers or images: a command hoisted over it could read them too
         // early.
-        hoist_slot.reset();
+        TestDropSlot(1);
+    }
+
+    // TEST ONLY: why the last slot went (0 never opened, 1 storage writer in the pass, 2 transform
+    // feedback, 3 chunk to the worker, 4 something recorded before the pass began, 5 pass ended).
+    int test_hoist_drop{};
+    void TestDropSlot(int reason) {
+        if (hoist_slot) {
+            hoist_slot.reset();
+            test_hoist_drop = reason;
+        }
     }
 
     /// A command Hoist places at an earlier point of the command buffer.
@@ -190,7 +200,7 @@ public:
 
     /// Drops the slot: what is recorded next may write what a hoisted command would read.
     void CloseHoistSlot() {
-        hoist_slot.reset();
+        TestDropSlot(2);
     }
 
     /// Whether a command can run at the slot instead of here: the pass that began after the slot

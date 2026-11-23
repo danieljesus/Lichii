@@ -681,7 +681,7 @@ void Scheduler::ProbePassEndingClear(const Framebuffer* framebuffer, bool deferr
 
 void Scheduler::DispatchWork() {
     // The worker runs the slot's commands from here on.
-    hoist_slot.reset();
+    TestDropSlot(3);
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
@@ -749,7 +749,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
             hoist_pass_serial = render_pass_serial;
         } else {
             // Something else was recorded, or an upload batched, between the slot and this pass.
-            hoist_slot.reset();
+            TestDropSlot(4);
         }
     }
     state.renderpass = renderpass;
@@ -1613,7 +1613,7 @@ void Scheduler::EndRenderPass()
         if (!state.renderpass) {
             return;
         }
-        hoist_slot.reset();
+        TestDropSlot(5);
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;

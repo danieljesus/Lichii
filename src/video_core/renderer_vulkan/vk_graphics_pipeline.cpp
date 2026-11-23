@@ -1720,6 +1720,26 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             ++test_hoisted;
             scheduler.Hoist(std::move(dispatch));
         } else {
+            // TEST ONLY: why this dispatch stays in its place.
+            static std::array<u64, 10> test_reasons{};
+            static u64 test_refused{};
+            const size_t reason = writes_storage           ? 6
+                                  : !IsBuilt()             ? 7
+                                  : mesh_reads_target      ? 8
+                                  : !scheduler.HasHoistSlot()
+                                      ? static_cast<size_t>(scheduler.test_hoist_drop)
+                                      : 9;
+            ++test_reasons[reason];
+            if (++test_refused % 2000 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "Mesh dispatches not hoisted: {} - no slot since: never {}, storage "
+                         "writer {}, transform feedback {}, chunk to worker {}, recorded before "
+                         "pass {}, pass ended {}; pipeline writes storage {}, not built {}, "
+                         "samples its target {}, slot open but draw does not continue its pass {}",
+                         test_refused, test_reasons[0], test_reasons[1], test_reasons[2],
+                         test_reasons[3], test_reasons[4], test_reasons[5], test_reasons[6],
+                         test_reasons[7], test_reasons[8], test_reasons[9]);
+            }
             scheduler.RequestOutsideRenderPassOperationContext();
             if (!IsBuilt()) {
                 scheduler.Record([this](vk::CommandBuffer) {
