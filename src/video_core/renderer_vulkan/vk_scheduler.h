@@ -165,6 +165,13 @@ public:
     /// A clear of `framebuffer` about to end the open pass; `deferrable` when it would have been
     /// deferred into the next pass's load operation had no pass been open.
     void ProbePassEndingClear(const Framebuffer* framebuffer, bool deferrable);
+    /// A query sync at a wait for idle: QueryCacheRuntime::Barriers(true) and (false) around the
+    /// copies SyncValues records (ProbeQuerySyncCopy, each with its destination range).
+    void ProbeQuerySyncBegin();
+    void ProbeQuerySyncCopy(VkBuffer dst, VkDeviceSize offset, VkDeviceSize size);
+    void ProbeQuerySyncEnd();
+    /// A buffer copy reading `src` (a download or a buffer-to-buffer copy), for the query probe.
+    void ProbeCopySource(VkBuffer src, std::span<const VkBufferCopy> copies);
 
     void NoteRenderPassStores() {
         render_pass_has_stores = true;

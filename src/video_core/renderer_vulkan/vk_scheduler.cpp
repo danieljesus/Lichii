@@ -82,6 +82,34 @@ struct PassEndProbe {
     };
     std::map<std::string, CopyCount> copies;
     std::map<std::string, u64> clears;
+    // Query syncs: each one's destinations stay watched until the pass that begins after it has
+    // ended (two pass begins later), which is as far as a deferral to a pass end would move them.
+    struct QueryWindow {
+        std::vector<ProbeRange> dests;
+        u64 begin_serial{}; ///< render_pass_serial at the sync
+        bool draw{};
+        bool dispatch{};
+        bool copy{};
+    };
+    std::vector<QueryWindow> windows;
+    bool sync_open{};
+    bool sync_closed_pass{};
+    u64 sync_copies{};
+    u64 sync_bytes{};
+    std::vector<ProbeRange> sync_dests;
+    struct QueryCount {
+        u64 syncs{};
+        u64 closed_pass{};
+        u64 empty{};           ///< no copy recorded between the barriers
+        u64 empty_closed{};    ///< of those, ones that closed a pass
+        u64 copies{};
+        u64 bytes{};
+        u64 windows{};         ///< syncs with copies whose window ended
+        u64 read_by_draw{};
+        u64 read_by_dispatch{};
+        u64 read_by_copy{};
+        u64 unread{};
+    } queries;
 };
 PassEndProbe g_probe;
 
@@ -121,6 +149,52 @@ void ReportPassEndProbe(double seconds) {
                  static_cast<double>(count) / seconds, kind);
     }
     g_probe.clears.clear();
+    const auto& q = g_probe.queries;
+    if (q.syncs != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Query syncs {:.1f}/s: {:.1f}/s closed an open pass, {:.1f}/s copied nothing "
+                 "({:.1f}/s of those closed a pass); {:.1f} copies/s, {:.0f} bytes/s; of the "
+                 "syncs with copies, until the next pass ended: {:.1f}/s read by a draw, {:.1f}/s "
+                 "by a dispatch, {:.1f}/s by a copy, {:.1f}/s by none",
+                 static_cast<double>(q.syncs) / seconds, static_cast<double>(q.closed_pass) / seconds,
+                 static_cast<double>(q.empty) / seconds, static_cast<double>(q.empty_closed) / seconds,
+                 static_cast<double>(q.copies) / seconds, static_cast<double>(q.bytes) / seconds,
+                 static_cast<double>(q.read_by_draw) / seconds,
+                 static_cast<double>(q.read_by_dispatch) / seconds,
+                 static_cast<double>(q.read_by_copy) / seconds,
+                 static_cast<double>(q.unread) / seconds);
+    }
+    g_probe.queries = {};
+}
+
+void ProbeCheckWindows(const std::vector<ProbeRange>& reads, bool PassEndProbe::QueryWindow::*hit) {
+    for (auto& window : g_probe.windows) {
+        if (window.*hit) {
+            continue;
+        }
+        for (const ProbeRange& read : reads) {
+            if (ProbeOverlaps(window.dests, read.buffer, read.begin, read.end)) {
+                window.*hit = true;
+                break;
+            }
+        }
+    }
+}
+
+void ProbeCloseWindows(u64 render_pass_serial, bool all) {
+    auto& windows = g_probe.windows;
+    auto& q = g_probe.queries;
+    std::erase_if(windows, [&](const PassEndProbe::QueryWindow& window) {
+        if (!all && render_pass_serial < window.begin_serial + 2) {
+            return false;
+        }
+        ++q.windows;
+        q.read_by_draw += window.draw ? 1 : 0;
+        q.read_by_dispatch += window.dispatch ? 1 : 0;
+        q.read_by_copy += window.copy ? 1 : 0;
+        q.unread += !window.draw && !window.dispatch && !window.copy ? 1 : 0;
+        return true;
+    });
 }
 
 void ReportSubmitCounts() {
@@ -429,6 +503,7 @@ void Scheduler::ProbeDrawRecorded() {
         g_probe.pass_reads.clear();
     }
     auto& reads = g_probe.pass_reads;
+    const size_t first = reads.size();
     reads.insert(reads.end(), g_probe.pending.begin(), g_probe.pending.end());
     g_probe.pending.clear();
     for (const ProbeRange& range : g_probe.vertex) {
@@ -439,10 +514,70 @@ void Scheduler::ProbeDrawRecorded() {
     if (g_probe.index.buffer != VK_NULL_HANDLE) {
         reads.push_back(g_probe.index);
     }
+    if (!g_probe.windows.empty()) {
+        const std::vector<ProbeRange> draw_reads(reads.begin() + first, reads.end());
+        ProbeCheckWindows(draw_reads, &PassEndProbe::QueryWindow::draw);
+    }
 }
 
 void Scheduler::ProbeDispatchRecorded() {
+    if (!g_probe.windows.empty()) {
+        ProbeCheckWindows(g_probe.pending, &PassEndProbe::QueryWindow::dispatch);
+    }
     g_probe.pending.clear();
+}
+
+void Scheduler::ProbeQuerySyncBegin() {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    g_probe.sync_open = true;
+    g_probe.sync_closed_pass = state.renderpass != VK_NULL_HANDLE;
+    g_probe.sync_copies = 0;
+    g_probe.sync_bytes = 0;
+    g_probe.sync_dests.clear();
+}
+
+void Scheduler::ProbeQuerySyncCopy(VkBuffer dst, VkDeviceSize offset, VkDeviceSize size) {
+    if (!g_probe.sync_open) {
+        return;
+    }
+    ++g_probe.sync_copies;
+    g_probe.sync_bytes += size;
+    g_probe.sync_dests.push_back(MakeProbeRange(dst, offset, size));
+}
+
+void Scheduler::ProbeQuerySyncEnd() {
+    if (!g_probe.sync_open) {
+        return;
+    }
+    g_probe.sync_open = false;
+    auto& q = g_probe.queries;
+    ++q.syncs;
+    q.closed_pass += g_probe.sync_closed_pass ? 1 : 0;
+    q.copies += g_probe.sync_copies;
+    q.bytes += g_probe.sync_bytes;
+    if (g_probe.sync_copies == 0) {
+        ++q.empty;
+        q.empty_closed += g_probe.sync_closed_pass ? 1 : 0;
+        return;
+    }
+    g_probe.windows.push_back({
+        .dests = std::move(g_probe.sync_dests),
+        .begin_serial = render_pass_serial,
+    });
+    g_probe.sync_dests = {};
+}
+
+void Scheduler::ProbeCopySource(VkBuffer src, std::span<const VkBufferCopy> copies) {
+    if (g_probe.windows.empty()) {
+        return;
+    }
+    std::vector<ProbeRange> reads;
+    for (const VkBufferCopy& copy : copies) {
+        reads.push_back(MakeProbeRange(src, copy.srcOffset, copy.size));
+    }
+    ProbeCheckWindows(reads, &PassEndProbe::QueryWindow::copy);
 }
 
 void Scheduler::ProbePassEndingCopy(VkBuffer dst, VkBuffer src, bool src_stream,
@@ -556,6 +691,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
         g_probe.pass_images = framebuffer->Images();
         g_probe.pass_num_images = framebuffer->NumImages();
         g_probe.pass_area = framebuffer->RenderArea();
+        ProbeCloseWindows(render_pass_serial + 1, false);
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();

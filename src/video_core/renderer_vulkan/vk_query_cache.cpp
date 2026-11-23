@@ -1755,6 +1755,9 @@ void QueryCacheRuntime::Barriers(bool is_prebarrier) {
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
     };
+    if (is_prebarrier) {
+        impl->scheduler.ProbeQuerySyncBegin();
+    }
     impl->scheduler.RequestOutsideRenderPassOperationContext();
     if (is_prebarrier) {
         impl->scheduler.Record([](vk::CommandBuffer cmdbuf) {
@@ -1766,6 +1769,7 @@ void QueryCacheRuntime::Barriers(bool is_prebarrier) {
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
                                    vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER_HOST, 0, WRITE_BARRIER);
         });
+        impl->scheduler.ProbeQuerySyncEnd();
     }
 }
 
@@ -1861,6 +1865,12 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
         src_buffer = base_src_buffer;
     }
 
+    for (size_t i = 0; i < impl->buffers_to_upload_to.size(); ++i) {
+        for (const VkBufferCopy& copy : impl->copies_setup[i]) {
+            impl->scheduler.ProbeQuerySyncCopy(impl->buffers_to_upload_to[i].first,
+                                               copy.dstOffset, copy.size);
+        }
+    }
     impl->scheduler.RequestOutsideRenderPassOperationContext();
     impl->scheduler.Record([src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to), vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
         size_t size = dst_buffers.size();
