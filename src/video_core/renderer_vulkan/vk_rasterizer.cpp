@@ -1871,6 +1871,7 @@ void RasterizerVulkan::DrawIndirect() {
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;
+        scheduler.StampDrawRead(buffer->Handle(), 0, VK_WHOLE_SIZE);
         if (params.is_byte_count) {
             scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
                               stride = params.stride](vk::CommandBuffer cmdbuf) {
@@ -1886,6 +1887,7 @@ void RasterizerVulkan::DrawIndirect() {
             const auto count = buffer_cache.GetDrawIndirectCount();
             const auto& draw_buffer = count.first;
             const auto& offset_base = count.second;
+            scheduler.StampDrawRead(draw_buffer->Handle(), 0, VK_WHOLE_SIZE);
             scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
                               buffer_obj = buffer->Handle(), offset_base, offset,
                               params](vk::CommandBuffer cmdbuf) {

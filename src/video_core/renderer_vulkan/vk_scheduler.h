@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <queue>
 #include <source_location>
@@ -173,6 +174,27 @@ public:
     /// feedback, or the slot's commands went to the worker thread). The caller answers for the
     /// command not reading what that pass renders.
     [[nodiscard]] bool CanHoist(const Framebuffer* framebuffer) const;
+
+    /// Whether the active pass has a slot a command recorded now could run at instead.
+    [[nodiscard]] bool HasUsableSlot() const {
+        return hoist_slot && !hoist_awaits_pass && state.renderpass &&
+               render_pass_serial == hoist_pass_serial && !uploads_pending;
+    }
+
+    /// Buffer ranges draws read (descriptors, texel, vertex, index and indirect buffers), for
+    /// moving an upload into the slot only when no draw of the active pass read its destination.
+    void StampDrawRead(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size);
+    void NoteVertexBufferBound(u32 index, VkBuffer buffer, VkDeviceSize offset,
+                               VkDeviceSize size);
+    void NoteIndexBufferBound(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size);
+    /// The draw whose buffers were bound since the last call is recorded: stamps the vertex and
+    /// index buffers it reads, which stay bound without a bind for later draws.
+    void NoteDrawRecorded();
+    /// Whether a draw recorded in the active pass so far read any of `ranges` of `buffer`.
+    [[nodiscard]] bool ReadInActivePass(VkBuffer buffer,
+                                        std::span<const VkBufferCopy> copies) const;
+    /// EDEN_NX2_GPU_PROFILE: an upload that ended the active pass or moved into its slot.
+    static void CountSlotUpload(bool moved, bool overlap);
 
     /// Runs `command` at the slot. Only right after CanHoist returned true.
     void Hoist(HoistedCommand&& command);
@@ -393,6 +415,21 @@ private:
     /// OpenHoistSlot's slot, while Hoist may still add to it (only the recording thread
     /// touches it: it is dropped before its chunk goes to the worker).
     std::shared_ptr<std::vector<HoistedCommand>> hoist_slot;
+    struct DrawRead {
+        u64 draw{}; ///< draw_sequence of the last draw that read it
+        VkDeviceSize begin{};
+        VkDeviceSize end{};
+    };
+    std::unordered_map<VkBuffer, DrawRead> draw_reads;
+    u64 draw_sequence{};   ///< Draws recorded; the one being prepared has this number
+    u64 pass_first_draw{}; ///< draw_sequence when the active pass began
+    struct BoundRange {
+        VkBuffer buffer{};
+        VkDeviceSize offset{};
+        VkDeviceSize size{};
+    };
+    std::array<BoundRange, 32> bound_vertex{};
+    BoundRange bound_index{};
     u64 hoist_pass_serial{};   ///< render_pass_serial of the pass the slot precedes
     u64 hoist_record_serial{}; ///< record_serial right after the slot was recorded
     bool hoist_awaits_pass{};  ///< The pass after the slot has not begun yet

@@ -361,8 +361,12 @@ private:
             // A descriptor range of 0 is invalid; an unmapped binding covers the null buffer.
             const VkDeviceSize range = buffer.IsNull() && size == 0 ? NullBufferSize() : size;
             guest_descriptor_queue.AddBuffer(handle, buffer.DeviceAddress(), offset, range);
+            StampDrawRead(handle, offset, range);
         }
     }
+
+    /// Scheduler::StampDrawRead, out of line (the scheduler is incomplete here).
+    void StampDrawRead(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size);
 
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();

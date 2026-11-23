@@ -44,6 +44,9 @@ std::atomic<u64> g_profile_finishes{};
 std::atomic<u64> g_profile_skipped_flushes{};
 std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
+std::atomic<u64> g_profile_slot_uploads_moved{};
+std::atomic<u64> g_profile_slot_uploads_overlap{};
+std::atomic<u64> g_profile_slot_uploads_no_slot{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
 
@@ -79,6 +82,16 @@ void ReportSubmitCounts() {
              static_cast<double>(g_profile_renderpasses.exchange(0)) / seconds,
              static_cast<double>(g_profile_finishes.exchange(0)) / seconds,
              static_cast<double>(g_profile_finish_ns.exchange(0)) / 1e6 / seconds);
+    if (const u64 moved = g_profile_slot_uploads_moved.exchange(0),
+        overlap = g_profile_slot_uploads_overlap.exchange(0),
+        no_slot = g_profile_slot_uploads_no_slot.exchange(0);
+        moved + overlap + no_slot != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Uploads that would end the pass per second: {:.1f} moved into its slot, {:.1f} "
+                 "kept for a destination a draw of the pass read, {:.1f} kept with no usable slot",
+                 static_cast<double>(moved) / seconds, static_cast<double>(overlap) / seconds,
+                 static_cast<double>(no_slot) / seconds);
+    }
     std::vector<std::pair<u64, std::string>> ends;
     {
         std::scoped_lock lock{g_profile_end_mutex};
@@ -380,6 +393,68 @@ void Scheduler::Hoist(HoistedCommand&& command) {
     hoist_slot->push_back(std::move(command));
 }
 
+void Scheduler::StampDrawRead(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+    if (buffer == VK_NULL_HANDLE) {
+        return;
+    }
+    const VkDeviceSize end = size == VK_WHOLE_SIZE ? ~VkDeviceSize{} : offset + size;
+    DrawRead& read = draw_reads[buffer];
+    if (read.draw >= pass_first_draw && read.end != read.begin) {
+        read.begin = (std::min)(read.begin, offset);
+        read.end = (std::max)(read.end, end);
+    } else {
+        read.begin = offset;
+        read.end = end;
+    }
+    read.draw = draw_sequence;
+}
+
+void Scheduler::NoteVertexBufferBound(u32 index, VkBuffer buffer, VkDeviceSize offset,
+                                      VkDeviceSize size) {
+    if (index < bound_vertex.size()) {
+        bound_vertex[index] = {buffer, offset, size};
+    }
+    StampDrawRead(buffer, offset, size);
+}
+
+void Scheduler::NoteIndexBufferBound(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+    bound_index = {buffer, offset, size};
+    StampDrawRead(buffer, offset, size);
+}
+
+void Scheduler::NoteDrawRecorded() {
+    for (const BoundRange& range : bound_vertex) {
+        StampDrawRead(range.buffer, range.offset, range.size);
+    }
+    StampDrawRead(bound_index.buffer, bound_index.offset, bound_index.size);
+    ++draw_sequence;
+    if (draw_reads.size() > 4096) {
+        std::erase_if(draw_reads, [this](const auto& entry) {
+            return entry.second.draw < pass_first_draw;
+        });
+    }
+}
+
+bool Scheduler::ReadInActivePass(VkBuffer buffer, std::span<const VkBufferCopy> copies) const {
+    const auto it = draw_reads.find(buffer);
+    if (it == draw_reads.end() || it->second.draw < pass_first_draw) {
+        return false;
+    }
+    return std::ranges::any_of(copies, [&](const VkBufferCopy& copy) {
+        return copy.dstOffset < it->second.end && it->second.begin < copy.dstOffset + copy.size;
+    });
+}
+
+void Scheduler::CountSlotUpload(bool moved, bool overlap) {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    (moved     ? g_profile_slot_uploads_moved
+     : overlap ? g_profile_slot_uploads_overlap
+               : g_profile_slot_uploads_no_slot)
+        .fetch_add(1, std::memory_order_relaxed);
+}
+
 void Scheduler::DispatchWork() {
     // The worker runs the slot's commands from here on.
     hoist_slot.reset();
@@ -448,6 +523,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
     ++render_pass_serial;
+    pass_first_draw = draw_sequence;
     if (hoist_awaits_pass) {
         hoist_awaits_pass = false;
         if (record_serial == hoist_record_serial && !uploads_pending) {
