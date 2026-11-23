@@ -1117,6 +1117,32 @@ std::vector<LearnedPrior> LearnPriors(std::span<const CachedPipeline> records) {
     return priors;
 }
 
+std::vector<LearnedTextureBound> LearnTextureBound(std::span<const CachedPipeline> records) {
+    std::map<u32, Counter<u32>> votes;
+    std::set<std::pair<u32, u64>> seen; // (stage, program hash)
+    for (const auto& record : records) {
+        for (const auto& env : record.envs) {
+            // Only a program that asked a texture question surely used the value.
+            if (env.texture_types.empty() && env.texture_pixel_formats.empty()) {
+                continue;
+            }
+            if (seen.insert({env.stage, NativeShaderHash(env.code)}).second) {
+                ++votes[env.stage][env.texture_bound];
+            }
+        }
+    }
+    std::vector<LearnedTextureBound> learned;
+    for (const auto& [stage, counter] : votes) {
+        learned.push_back({.stage = stage, .texture_bound = counter.MostCommon(1).front().first});
+    }
+    return learned;
+}
+
+u32 OracleTextureBound(std::span<const LearnedTextureBound> learned, u32 stage) {
+    const auto it = std::ranges::find(learned, stage, &LearnedTextureBound::stage);
+    return it != learned.end() ? it->texture_bound : 2;
+}
+
 // ------------------------------------------------------------------------------------------------
 // game_tables.py
 

@@ -246,10 +246,19 @@ struct Priors {
     std::map<std::tuple<u32, u32, u32, u32>, u8> indirect;
     // (stage, bank, offset) -> texture type of size queries without a sampling instruction.
     std::map<std::tuple<u32, u32, u32>, Shader::TextureType> txq_types;
+    // Each stage's recorded texture bound buffer (LearnTextureBound); none: the engine's 2.
+    std::vector<LearnedTextureBound> texture_bound;
 
-    /// learn_priors.py's answers, as FromFile reads them from its JSON.
-    static Priors FromLearned(std::span<const LearnedPrior> learned) {
+    [[nodiscard]] u32 TextureBound(Stage stage) const {
+        return OracleTextureBound(texture_bound, static_cast<u32>(stage));
+    }
+
+    /// learn_priors.py's answers, as FromFile reads them from its JSON, and the texture bound
+    /// buffers the recordings use.
+    static Priors FromLearned(std::span<const LearnedPrior> learned,
+                              std::span<const LearnedTextureBound> texture_bound = {}) {
         Priors priors;
+        priors.texture_bound.assign(texture_bound.begin(), texture_bound.end());
         for (const auto& entry : learned) {
             if (entry.indirect) {
                 priors.indirect[{entry.stage, entry.bank, entry.offset, entry.table}] = entry.answer;
@@ -335,7 +344,8 @@ public:
             const u64 size = sph.LocalMemorySize() + sph.common3.shader_local_memory_crs_size;
             local_memory = static_cast<u32>(size);
         }
-        texture_bound = lowered.texture_bound != ~0U ? lowered.texture_bound : 2;
+        texture_bound =
+            lowered.texture_bound != ~0U ? lowered.texture_bound : priors.TextureBound(stage);
         if (program.control.size() >= 0x48) {
             const u32 begin = Load<u32>(program.control, 0x40);
             const u32 end = Load<u32>(program.control, 0x44);
@@ -1802,7 +1812,14 @@ bool BuildImpl(const FileSys::Nx2ShaderExtract::Result& extracted,
     const auto learned = LearnPriors(records);
     note(fmt::format("{} recorded pipelines, {} storage pointer priors", records.size(),
                      learned.size()));
-    const Priors priors = Priors::FromLearned(learned);
+    const auto texture_bound = LearnTextureBound(records);
+    std::string bound_by_stage;
+    for (const auto& [stage, value] : texture_bound) {
+        bound_by_stage += fmt::format(", {} {}", stage < StageNames.size() ? StageNames[stage] : "?",
+                                      value);
+    }
+    note(fmt::format("texture bound buffer by stage (otherwise 2){}", bound_by_stage));
+    const Priors priors = Priors::FromLearned(learned, texture_bound);
     if (stop.stop_requested()) {
         return false;
     }
