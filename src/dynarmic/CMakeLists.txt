@@ -94,9 +94,12 @@ else()
         -Wcast-qual
         -pedantic
         -Wno-missing-braces
-        -fno-rtti
         #-fno-exceptions
     )
+    # Not on Apple, for the reason given where src/CMakeLists.txt sets it.
+    if (NOT APPLE)
+        list(APPEND DYNARMIC_CXX_FLAGS -fno-rtti)
+    endif()
     if (CXX_GCC)
         # GCC produces bogus -Warray-bounds warnings from xbyak headers for code paths that are not
         # actually reachable.  Specifically, it happens in cases where some code casts an Operand&

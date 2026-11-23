@@ -170,9 +170,13 @@ else()
     if (NOT MSVC)
         add_compile_options(
             $<$<COMPILE_LANGUAGE:C,CXX>:-fwrapv>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-pipe>
-            # Disable RTTI (C++ only)
-            $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+            $<$<COMPILE_LANGUAGE:C,CXX>:-pipe>)
+        # Disable RTTI (C++ only). Not on Apple: there each object built without RTTI gets its own
+        # hidden copy of the standard exception type_info, so exceptions thrown inside the system
+        # libc++ (std::stoi, iostreams) no longer match a catch of their std:: type.
+        if (NOT APPLE)
+            add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+        endif()
     endif()
 
     if (ENABLE_WERROR)
