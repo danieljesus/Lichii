@@ -3442,9 +3442,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
             format_traits |= FileEnvironment::FormatTraitSnorm;
         }
     }
+    // Each environment's kept translation. The environments are the key's programs in slot order
+    // (ShaderCache::GetGraphicsEnvironments) and the infos are by slot, vertex B to fragment; a
+    // task or mesh program sits in a vertex or tessellation slot.
+    std::array<const Shader::Info*, 5> env_infos{};
+    for (size_t slot = 0, env = 0; slot < info_ptrs.size() && env < live.size(); ++slot) {
+        if (graphics_key.unique_hashes[slot + 1] != 0) {
+            env_infos[env++] = info_ptrs[slot];
+        }
+    }
     for (size_t i = 0; i < live.size(); ++i) {
         const char* why = "";
-        if (!(*recorded)[i].AnswersHoldFor(*live[i], &why, format_traits)) {
+        if (!(*recorded)[i].AnswersHoldFor(*live[i], &why, format_traits, env_infos[i])) {
             CountPrecompiledReason(why);
             return nullptr;
         }
@@ -3614,7 +3623,7 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
             format_traits |= FileEnvironment::FormatTraitSnorm;
         }
         const char* why = "";
-        if (!recorded.AnswersHoldFor(env, &why, format_traits)) {
+        if (!recorded.AnswersHoldFor(env, &why, format_traits, &info)) {
             if (!first_reason) {
                 first_reason = why;
             }

@@ -1418,7 +1418,7 @@ u32 PixelFormatTraits(Shader::TexturePixelFormat format) {
 } // Anonymous namespace
 
 bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why,
-                                     u32 format_traits) {
+                                     u32 format_traits, const Shader::Info* info) {
     const auto fail = [why](const char* reason) {
         if (why) {
             *why = reason;
@@ -1434,8 +1434,27 @@ bool FileEnvironment::AnswersHoldFor(Shader::Environment& live, const char** why
         live.ReadViewportTransformState() != viewport_transform_state) {
         return fail("viewport transform");
     }
-    // Handles of non-bindless textures are read from this constant buffer.
-    if (live.TextureBoundBuffer() != texture_bound) {
+    // Handles of non-bindless textures are read from this constant buffer. Translation reads it in
+    // one place, texture_pass MakeInst, for a bound texture instruction, whose descriptor (texture,
+    // image, texture buffer or image buffer: the kinds that read a handle) takes it as its bank. A
+    // bindless instruction's descriptor takes the bank its handle was tracked to, or, for a handle
+    // a handle program computes from a storage buffer, bank 0 as a placeholder (handle_program set).
+    // So a kept translation with no descriptor on the recorded bank other than a handle program's
+    // had no bound instruction, and the value can matter to it only through the driver constant
+    // folding it selects (is_proprietary_driver), which must agree. A descriptor on that bank may
+    // be a bound instruction's or a bindless one's: the value is then compared, as it is without a
+    // kept translation.
+    const auto on_bound_bank = [this](const auto& descriptors) {
+        return std::ranges::any_of(descriptors, [this](const auto& desc) {
+            return desc.handle_program == ~0U && desc.cbuf_index == texture_bound;
+        });
+    };
+    const bool may_read_bound = !info || on_bound_bank(info->texture_descriptors) ||
+                                on_bound_bank(info->image_descriptors) ||
+                                on_bound_bank(info->texture_buffer_descriptors) ||
+                                on_bound_bank(info->image_buffer_descriptors);
+    if (live.TextureBoundBuffer() != texture_bound &&
+        (may_read_bound || live.IsProprietaryDriver() != IsProprietaryDriver())) {
         return fail("texture bound buffer");
     }
     // A passthrough geometry program passes the attributes this mask does not skip.
