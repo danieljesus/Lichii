@@ -922,10 +922,13 @@ bool GraphicsPipeline::ConfigureRender(const BackHalf& half,
         }
     }
     buffer_cache.runtime.Arena().PlayCollected(half.commands, half.stamp);
+    bool mesh_reads_target{};
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
+        mesh_reads_target = HoistsMeshDispatches() && scheduler.HasHoistSlot() &&
+                            texture_cache.SamplesRenderTarget(view_span);
         texture_cache.CheckFeedbackLoop(view_span);
         CheckColorFeedbackLoop(view_span, stages_present, fragment_entry);
         if (scheduler.HasFragmentBarrier() &&
@@ -937,7 +940,7 @@ bool GraphicsPipeline::ConfigureRender(const BackHalf& half,
         return false;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
-    return ConfigureDraw(rescaling, render_area, nullptr);
+    return ConfigureDraw(rescaling, render_area, nullptr, mesh_reads_target);
 }
 
 u64 KeptGraphicsStages::Bytes() const noexcept {
