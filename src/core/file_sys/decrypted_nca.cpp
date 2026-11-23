@@ -197,11 +197,16 @@ VirtualFile DenseSparseSection(const NcaReader& reader, const NcaFsHeaderReader&
         CtrKey(reader), AesCtrStorage::KeySize, iv.data(), iv.size());
     const auto aligned =
         std::make_shared<AlignmentMatchingStorage<NcaHeader::CtrBlockSize, 1>>(std::move(ctr));
-    std::vector<u8> meta(static_cast<std::size_t>(info.bucket.size));
-    if (aligned->Read(meta.data(), meta.size(), 0) != meta.size()) {
+    // Read up to the table's last whole block, as the driver does: its encrypted storage ends at
+    // the table's size, and the bucket tree reads whole nodes only, never a shorter tail.
+    std::vector<u8> meta;
+    if (!ReadWholeTable(
+            aligned, Common::AlignDown(static_cast<s64>(info.bucket.size), NcaHeader::CtrBlockSize),
+            meta, "sparse", info.bucket.size)) {
         error = "cannot read the sparse table";
         return nullptr;
     }
+    meta.resize(static_cast<std::size_t>(info.bucket.size));
     const auto node_size = SparseStorage::QueryNodeStorageSize(table.entry_count);
     const auto entry_size = SparseStorage::QueryEntryStorageSize(table.entry_count);
     if (node_size + entry_size > static_cast<s64>(meta.size())) {
@@ -275,10 +280,13 @@ VirtualFile DecryptSection(const NcaReader& reader, const NcaFsHeaderReader& hea
             }
             const auto meta_size = Common::AlignUp(static_cast<s64>(patch.aes_ctr_ex_size),
                                                    NcaHeader::XtsBlockSize);
-            std::vector<u8> meta(meta_size);
-            if (patch.aes_ctr_ex_offset + meta_size > size ||
-                base_ctr->Read(meta.data(), meta.size(), patch.aes_ctr_ex_offset) !=
-                    meta.size()) {
+            std::vector<u8> meta;
+            if (patch.aes_ctr_ex_offset < 0 || meta_size < 0 ||
+                meta_size > size - patch.aes_ctr_ex_offset ||
+                !ReadWholeTable(std::make_shared<OffsetVfsFile>(
+                                    base_ctr, static_cast<std::size_t>(meta_size),
+                                    static_cast<std::size_t>(patch.aes_ctr_ex_offset)),
+                                meta_size, meta, "AES-CTR-EX", patch.aes_ctr_ex_size)) {
                 error = "AES-CTR-EX table out of range";
                 return nullptr;
             }

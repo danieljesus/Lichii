@@ -25,6 +25,7 @@
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/content_archive.h"
+#include "core/file_sys/decrypted_nca.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_storage.h"
@@ -314,6 +315,59 @@ TEST_CASE("RomFS rejects a tree deeper than a Horizon path allows", "[core][file
     REQUIRE(ExtractRomFS(MakeFile(MakeDeepRomFS(100000))) == nullptr);
 }
 
+// What an NCA read of a file: the largest single read asked of it and the sum of all of them.
+// A table buffered whole, even where allocating it succeeds, shows as one read of its size.
+struct ReadCounter {
+    size_t largest = 0;
+    u64 total = 0;
+};
+
+class CountingFile final : public VfsFile {
+public:
+    CountingFile(VirtualFile base_, ReadCounter& counter_)
+        : base{std::move(base_)}, counter{counter_} {}
+    std::string GetName() const override {
+        return base->GetName();
+    }
+    size_t GetSize() const override {
+        return base->GetSize();
+    }
+    bool Resize(size_t) override {
+        return false;
+    }
+    VirtualDir GetContainingDirectory() const override {
+        return nullptr;
+    }
+    bool IsWritable() const override {
+        return false;
+    }
+    bool IsReadable() const override {
+        return true;
+    }
+    size_t Read(u8* data, size_t length, size_t offset) const override {
+        counter.largest = std::max(counter.largest, length);
+        counter.total += length;
+        return base->Read(data, length, offset);
+    }
+    size_t Write(const u8*, size_t, size_t) override {
+        return 0;
+    }
+    bool Rename(std::string_view) override {
+        return false;
+    }
+
+private:
+    VirtualFile base;
+    ReadCounter& counter;
+};
+
+// A table that is not stored must be given up after a piece or two, not read whole.
+void RequireFewReads(const ReadCounter& reads) {
+    INFO("largest read " << reads.largest << ", total " << reads.total);
+    REQUIRE(reads.largest <= (size_t{2} << 20));
+    REQUIRE(reads.total <= (u64{8} << 20));
+}
+
 // A plaintext NCA, which nx2 opens without a header key, with one RomFS section spanning
 // [0xC00, 0x4C00) whose FS header and contents the test fills in.
 struct PlaintextNca {
@@ -332,14 +386,18 @@ struct PlaintextNca {
         fs.encryption_type = NcaFsHeader::EncryptionType::None;
     }
 
-    Result Open() const {
+    std::vector<u8> Bytes() const {
         std::vector<u8> bytes(std::max<size_t>(0x4C00, 0xC00 + section.size()));
         std::memcpy(bytes.data(), &header, sizeof(header));
         std::memcpy(bytes.data() + sizeof(header), &fs, sizeof(fs));
         std::copy(section.begin(), section.end(), bytes.begin() + 0xC00);
+        return bytes;
+    }
 
+    // Opens the first section of the NCA that file holds.
+    static Result OpenFile(VirtualFile file) {
         auto reader = std::make_shared<NcaReader>();
-        R_TRY(reader->Initialize(MakeFile(std::move(bytes)), GetCryptoConfiguration(),
+        R_TRY(reader->Initialize(std::move(file), GetCryptoConfiguration(),
                                  GetNcaCompressionConfiguration()));
         NcaFileSystemDriver driver{reader};
         VirtualFile storage;
@@ -347,6 +405,20 @@ struct PlaintextNca {
         R_TRY(driver.OpenStorage(&storage, &header_reader, 0));
         R_UNLESS(storage != nullptr, ResultInvalidNcaFsHeader);
         R_SUCCEED();
+    }
+
+    // claimed_size, when larger than the bytes, is a size a container claims for the NCA: the
+    // file is opened as a range of that size over the bytes it really holds.
+    // reads, when given, counts what the NCA reads of the file.
+    Result Open(size_t claimed_size = 0, ReadCounter* reads = nullptr) const {
+        VirtualFile file = MakeFile(Bytes());
+        if (claimed_size > file->GetSize()) {
+            file = std::make_shared<OffsetVfsFile>(std::move(file), claimed_size, 0);
+        }
+        if (reads != nullptr) {
+            file = std::make_shared<CountingFile>(std::move(file), *reads);
+        }
+        return OpenFile(std::move(file));
     }
 };
 
@@ -789,6 +861,76 @@ TEST_CASE("NCA with a valid indirect table opens", "[core][file_sys]") {
     REQUIRE(MakeIndirectNca(0x8000).Open() == ResultSuccess);
 }
 
+TEST_CASE("NCA with a valid indirect table opens in a container that claims more than it holds",
+          "[core][file_sys]") {
+    REQUIRE(MakeIndirectNca(0x8000).Open(size_t{1} << 41) == ResultSuccess);
+}
+
+TEST_CASE("NCA rejects an indirect table its container claims but does not hold, without "
+          "allocating it",
+          "[core][file_sys]") {
+    auto nca = MakeIndirectNca(0x8000);
+    nca.header.fs_info[0].end_sector = 0xFFFFFF06;
+    nca.fs.patch_info.indirect_size = s64{1} << 40;
+    ReadCounter reads;
+    REQUIRE(nca.Open(size_t{1} << 41, &reads) == ResultNcaBaseStorageOutOfRangeE);
+    RequireFewReads(reads);
+}
+
+TEST_CASE("NCA rejects an indirect table its container claims but does not hold behind AES-XTS",
+          "[core][file_sys]") {
+    auto nca = MakeIndirectNca(0x8000);
+    nca.fs.encryption_type = NcaFsHeader::EncryptionType::AesXts;
+    nca.header.fs_info[0].end_sector = 0xFFFFFF06;
+    nca.fs.patch_info.indirect_size = s64{1} << 40;
+    ReadCounter reads;
+    REQUIRE(nca.Open(size_t{1} << 41, &reads) == ResultNcaBaseStorageOutOfRangeE);
+    RequireFewReads(reads);
+}
+
+// MakeIndirectNca's section with an AES-CTR-EX table after its indirect table, mapping the data
+// before it as not encrypted. The section is not encrypted, so neither is the table.
+PlaintextNca MakeAesCtrExNca() {
+    auto nca = MakeIndirectNca(0x8000);
+    nca.header.fs_info[0].end_sector = 6 + 0x18000 / 0x200;
+    nca.section.resize(0x18000);
+    const BucketTree::NodeHeader node{0, 1, 0x10000};
+    Put(nca.section, 0x10000, node);
+    Put(nca.section, 0x10000 + sizeof(node), s64{0});
+    Put(nca.section, 0x14000, node);
+    AesCtrCounterExtendedStorage::Entry entry{};
+    entry.encryption_value = AesCtrCounterExtendedStorage::Entry::Encryption::NotEncrypted;
+    Put(nca.section, 0x14000 + sizeof(node), entry);
+    BucketTree::Header header;
+    header.Format(1);
+    nca.fs.patch_info.aes_ctr_ex_offset = 0x10000;
+    nca.fs.patch_info.aes_ctr_ex_size = 0x8000;
+    std::memcpy(nca.fs.patch_info.aes_ctr_ex_header.data(), &header, sizeof(header));
+    return nca;
+}
+
+TEST_CASE("NCA with a valid AES-CTR-EX table opens in a container that claims more than it holds",
+          "[core][file_sys]") {
+    const auto nca = MakeAesCtrExNca();
+    REQUIRE(nca.Open() == ResultSuccess);
+    REQUIRE(nca.Open(size_t{1} << 41) == ResultSuccess);
+}
+
+TEST_CASE("NCA in a patch layout rejects the tables a container claims but the file does not "
+          "hold, without allocating them",
+          "[core][file_sys]") {
+    // As in a patch NCA, the indirect table is read through the AES-CTR-EX layer, whose table
+    // must follow it. So a claim that covers an indirect table the file does not hold covers the
+    // AES-CTR-EX table too, and that table, read first, rejects the section.
+    auto nca = MakeAesCtrExNca();
+    nca.header.fs_info[0].end_sector = 0xFFFFFF06;
+    nca.fs.patch_info.indirect_size = s64{1} << 40;
+    nca.fs.patch_info.aes_ctr_ex_offset = 0x8000 + (s64{1} << 40);
+    ReadCounter reads;
+    REQUIRE(nca.Open(size_t{1} << 41, &reads) == ResultNcaBaseStorageOutOfRangeB);
+    RequireFewReads(reads);
+}
+
 TEST_CASE("AES-CTR-EX storage reports a read past its data storage's stored bytes",
           "[core][file_sys]") {
     // One entry that leaves [0, 0x8000) not encrypted, over 0x4000 stored bytes that a range
@@ -817,6 +959,131 @@ TEST_CASE("AES-CTR-EX storage reports a read past its data storage's stored byte
     REQUIRE(storage.Read(buffer.data(), 0x4000, 0) == 0x4000);
     REQUIRE(buffer == data);
     REQUIRE(storage.Read(buffer.data(), 0x200, 0x4000) == 0);
+}
+
+TEST_CASE("NCA rejects an AES-CTR-EX table its container claims but does not hold, without "
+          "allocating it",
+          "[core][file_sys]") {
+    auto nca = MakeAesCtrExNca();
+    nca.header.fs_info[0].end_sector = 0xFFFFFF06;
+    nca.fs.patch_info.aes_ctr_ex_size = s64{1} << 40;
+    ReadCounter reads;
+    REQUIRE(nca.Open(size_t{1} << 41, &reads) == ResultNcaBaseStorageOutOfRangeB);
+    RequireFewReads(reads);
+}
+
+// A section behind a sparse layer whose one entry reads [0, 0x8000) as zeros. The sparse table
+// lies 0x8000 into the section, encrypted with the NCA's AES-CTR key as the driver decrypts it.
+PlaintextNca MakeSparseNca(s64 table_size = 0x8000, s64 virtual_size = 0x8000) {
+    auto nca = MakeSha256Nca();
+    nca.header.fs_info[0].end_sector = 6 + 0x10200 / 0x200;
+    nca.section.resize(0x10200);
+    const BucketTree::NodeHeader node{0, 1, virtual_size};
+    Put(nca.section, 0x8000, node);
+    Put(nca.section, 0x8000 + sizeof(node), s64{0});
+    Put(nca.section, 0xC000, node);
+    IndirectStorage::Entry entry{};
+    entry.storage_index = 1;
+    Put(nca.section, 0xC000 + sizeof(node), entry);
+    BucketTree::Header header;
+    header.Format(1);
+    auto& sparse = nca.fs.sparse_info;
+    sparse.generation = 1;
+    sparse.physical_offset = 0;
+    sparse.bucket.offset = 0xC00 + 0x8000;
+    sparse.bucket.size = table_size;
+    std::memcpy(sparse.bucket.header.data(), &header, sizeof(header));
+
+    auto reader = std::make_shared<NcaReader>();
+    REQUIRE(reader->Initialize(MakeFile(nca.Bytes()), GetCryptoConfiguration(),
+                               GetNcaCompressionConfiguration()) == ResultSuccess);
+    std::array<u8, AesCtrStorage::IvSize> iv{};
+    AesCtrStorage::MakeIv(iv.data(), iv.size(),
+                          sparse.MakeAesCtrUpperIv(nca.fs.aes_ctr_upper_iv).value,
+                          sparse.bucket.offset);
+    const AesCtrStorage ctr{
+        MakeFile(std::vector<u8>(nca.section.begin() + 0x8000, nca.section.end())),
+        reader->GetDecryptionKey(NcaHeader::DecryptionKey_AesCtr), AesCtrStorage::KeySize,
+        iv.data(), iv.size()};
+    REQUIRE(ctr.Read(nca.section.data() + 0x8000, 0x8000, 0) == 0x8000);
+    return nca;
+}
+
+TEST_CASE("NCA with a valid sparse table opens in a container that claims more than it holds",
+          "[core][file_sys]") {
+    const auto nca = MakeSparseNca();
+    REQUIRE(nca.Open() == ResultSuccess);
+    REQUIRE(nca.Open(size_t{1} << 41) == ResultSuccess);
+}
+
+TEST_CASE("NCA with a sparse table whose size ends inside a block opens", "[core][file_sys]") {
+    for (const s64 size : {s64{0x8001}, s64{0x8005}, s64{0x800F}, s64{0x8105}}) {
+        INFO("table size " << size);
+        REQUIRE(MakeSparseNca(size).Open() == ResultSuccess);
+    }
+}
+
+TEST_CASE("NCA rejects an indirect table over a sparse layer's zeros that the file does not "
+          "hold, also inside a PFS0 entry that claims it",
+          "[core][file_sys]") {
+    // A small sparse table whose one entry reads a huge virtual range as zeros: a layer that
+    // never reads short, so only a truthful body size bounds the indirect table over it.
+    auto nca = MakeSparseNca(0x8000, s64{1} << 41);
+    nca.fs.patch_info.indirect_offset = 0;
+    nca.fs.patch_info.indirect_size = s64{1} << 40;
+    REQUIRE(nca.Open() == ResultNcaBaseStorageOutOfRangeE);
+
+    // Inside a PFS0 the NCA's size is its entry's: an entry claiming more than the file holds
+    // keeps the bytes the file has, so the NCA's own check rejects the table as it does above.
+    const auto name = "00000000000000000000000000000000.nca";
+    auto bytes = MakePfs0WithFiles({{name, nca.Bytes()}});
+    Put(bytes, 0x10 + 8, u64{1} << 41);
+    const PartitionFilesystem pfs{MakeFile(std::move(bytes))};
+    REQUIRE(pfs.GetStatus() == Loader::ResultStatus::Success);
+    const auto entry = pfs.GetFile(name);
+    REQUIRE(entry->GetSize() == nca.Bytes().size());
+    REQUIRE(PlaintextNca::OpenFile(entry) == ResultNcaBaseStorageOutOfRangeE);
+}
+
+TEST_CASE("NCA rejects a sparse table its container claims but does not hold, without "
+          "allocating it",
+          "[core][file_sys]") {
+    const auto nca = MakeSparseNca(s64{1} << 40);
+    ReadCounter reads;
+    REQUIRE(nca.Open(size_t{1} << 41, &reads) == ResultNcaBaseStorageOutOfRangeB);
+    RequireFewReads(reads);
+}
+
+TEST_CASE("Decrypting an NCA reads its sparse table only as far as the file holds it",
+          "[core][file_sys]") {
+    std::string error;
+    const auto valid = OpenDecryptedNca(MakeFile(MakeSparseNca(0x8000, 0x10200).Bytes()), error);
+    INFO(error);
+    REQUIRE(valid != nullptr);
+
+    const auto nca = MakeSparseNca(s64{1} << 40);
+    ReadCounter reads;
+    error.clear();
+    const auto claimed = std::make_shared<OffsetVfsFile>(MakeFile(nca.Bytes()), size_t{1} << 41, 0);
+    REQUIRE(OpenDecryptedNca(std::make_shared<CountingFile>(claimed, reads), error) == nullptr);
+    UNSCOPED_INFO(error);
+    REQUIRE(error.find("cannot read the sparse table") != std::string::npos);
+    RequireFewReads(reads);
+}
+
+TEST_CASE("Decrypting an NCA reads its AES-CTR-EX table only as far as the file holds it",
+          "[core][file_sys]") {
+    auto nca = MakeAesCtrExNca();
+    nca.fs.encryption_type = NcaFsHeader::EncryptionType::AesCtrEx;
+    nca.header.fs_info[0].end_sector = 0xFFFFFF06;
+    nca.fs.patch_info.aes_ctr_ex_size = s64{1} << 40;
+    ReadCounter reads;
+    std::string error;
+    const auto claimed = std::make_shared<OffsetVfsFile>(MakeFile(nca.Bytes()), size_t{1} << 41, 0);
+    REQUIRE(OpenDecryptedNca(std::make_shared<CountingFile>(claimed, reads), error) == nullptr);
+    UNSCOPED_INFO(error);
+    REQUIRE(error.find("AES-CTR-EX table out of range") != std::string::npos);
+    RequireFewReads(reads);
 }
 
 TEST_CASE("NCA rejects a hash region larger than the file behind an indirect layer",
