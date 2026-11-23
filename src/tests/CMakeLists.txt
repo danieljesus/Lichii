@@ -170,6 +170,7 @@ add_executable(tests
     video_core/ampere_tennis_tessellation.cpp
     video_core/pipeline_cache_files.cpp
     video_core/cbuf_handle_words.cpp
+    video_core/cbuf_handle_word_throw.cpp
     video_core/shader_cache_v2.cpp
     video_core/evicted_pointer_slots.cpp
     video_core/shader_cache_v2_programs.cpp

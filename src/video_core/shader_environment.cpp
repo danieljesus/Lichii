@@ -28,6 +28,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include <ranges>
 #include "shader_recompiler/environment.h"
@@ -355,10 +356,12 @@ bool GenericEnvironment::CanBeSerialized() const noexcept {
 }
 
 u32 GenericEnvironment::ReadCbufHandleWord(u32 cbuf_index, u32 cbuf_offset) {
+    // Cleared even when the read throws: later reads would be noted as handle reads.
     reading_handle_word = true;
-    const u32 value = ReadCbufValue(cbuf_index, cbuf_offset);
-    reading_handle_word = false;
-    return value;
+    SCOPE_EXIT {
+        reading_handle_word = false;
+    };
+    return ReadCbufValue(cbuf_index, cbuf_offset);
 }
 
 void GenericEnvironment::RecordCbufValue(u32 index, u32 offset, u32 value) {
