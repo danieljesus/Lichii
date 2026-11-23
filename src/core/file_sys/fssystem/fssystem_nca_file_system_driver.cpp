@@ -7,6 +7,7 @@
 #include <bit>
 #include <vector>
 
+#include "common/logging.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_xts_storage.h"
@@ -56,13 +57,19 @@ bool ReadWholeTable(const VirtualFile& storage, s64 size, std::vector<u8>& out) 
     for (s64 done = 0; done < size;) {
         const s64 piece = std::min(PieceSize, size - done);
         out.resize(static_cast<size_t>(done + piece));
-        if (storage->Read(out.data() + done, static_cast<size_t>(piece),
-                          static_cast<size_t>(done)) != static_cast<size_t>(piece)) {
+        const size_t read =
+            storage->Read(out.data() + done, static_cast<size_t>(piece), static_cast<size_t>(done));
+        if (read != static_cast<size_t>(piece)) {
+            LOG_ERROR(Loader,
+                      "NCA table of {} bytes is not stored in full: {} of {} bytes read at {}",
+                      size, read, piece, done);
             out.clear();
+            out.shrink_to_fit();
             return false;
         }
         done += piece;
     }
+    out.shrink_to_fit();
     return true;
 }
 
@@ -579,10 +586,16 @@ Result NcaFileSystemDriver::CreateSparseStorageMetaStorage(VirtualFile* out,
                                     offset + meta_offset, sparse_info.MakeAesCtrUpperIv(upper_iv),
                                     AlignmentStorageRequirement::None));
 
-    // Create buffered storage.
+    // Create buffered storage. AES-CTR decrypts whole blocks and the encrypted storage ends at
+    // the table's size, so a last block the table fills only in part cannot be read: the table
+    // is read up to its last whole block. The bucket tree reads whole nodes only, so it never
+    // reads that tail, which is left zero.
     std::vector<u8> meta_data;
-    R_UNLESS(ReadWholeTable(decrypted_storage, meta_size, meta_data),
+    R_UNLESS(ReadWholeTable(decrypted_storage,
+                            Common::AlignDown(static_cast<s64>(meta_size), NcaHeader::CtrBlockSize),
+                            meta_data),
              ResultNcaBaseStorageOutOfRangeB);
+    meta_data.resize(static_cast<size_t>(meta_size));
 
     auto buffered_storage = std::make_shared<VectorVfsFile>(std::move(meta_data));
     R_UNLESS(buffered_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);

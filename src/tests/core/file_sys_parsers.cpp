@@ -882,6 +882,13 @@ TEST_CASE("NCA with a valid sparse table opens in a container that claims more t
     REQUIRE(nca.Open(size_t{1} << 41) == ResultSuccess);
 }
 
+TEST_CASE("NCA with a sparse table whose size ends inside a block opens", "[core][file_sys]") {
+    for (const s64 size : {s64{0x8001}, s64{0x8005}, s64{0x800F}, s64{0x8105}}) {
+        INFO("table size " << size);
+        REQUIRE(MakeSparseNca(size).Open() == ResultSuccess);
+    }
+}
+
 TEST_CASE("NCA rejects an indirect table over a sparse layer's zeros that the file does not "
           "hold, and so does a container that claims it",
           "[core][file_sys]") {

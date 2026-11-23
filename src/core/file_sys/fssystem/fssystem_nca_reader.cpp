@@ -87,7 +87,8 @@ Result NcaReader::Initialize(VirtualFile base_storage, const NcaCryptoConfigurat
     R_UNLESS(work_header_storage != nullptr, ResultAllocationMemoryFailedInNcaReaderA);
 
     // Read the header.
-    work_header_storage->ReadObject(std::addressof(m_header), 0);
+    R_UNLESS(work_header_storage->ReadObject(std::addressof(m_header), 0) == sizeof(m_header),
+             ResultInvalidNcaHeader);
 
     // Validate the magic.
     if (const Result magic_result = CheckNcaMagic(m_header.magic); R_FAILED(magic_result)) {
