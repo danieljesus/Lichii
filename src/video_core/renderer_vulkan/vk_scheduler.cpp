@@ -59,6 +59,70 @@ void CountRenderPassEnd(const char* file, u32 line) {
     ++g_profile_ends[fmt::format("{}:{}", name, line)];
 }
 
+// Pass-end probe (EDEN_NX2_GPU_PROFILE); only the recording thread touches it.
+struct ProbeRange {
+    VkBuffer buffer;
+    VkDeviceSize begin;
+    VkDeviceSize end;
+};
+struct PassEndProbe {
+    std::vector<ProbeRange> pending;    ///< bound since the last draw or dispatch
+    std::vector<ProbeRange> pass_reads; ///< read by draws recorded in pass `pass_serial`
+    u64 pass_serial{~0ULL};
+    std::array<ProbeRange, 32> vertex{};
+    ProbeRange index{};
+    std::array<VkImage, 9> pass_images{};
+    u32 pass_num_images{};
+    VkExtent2D pass_area{};
+    struct CopyCount {
+        u64 copies{};      ///< CopyBuffer calls that ended a pass
+        u64 dst_read{};    ///< a destination range an earlier draw of the pass reads
+        u64 src_read{};    ///< a source range an earlier draw of the pass reads
+        u64 no_draw_yet{}; ///< no draw recorded in the pass yet
+    };
+    std::map<std::string, CopyCount> copies;
+    std::map<std::string, u64> clears;
+};
+PassEndProbe g_probe;
+
+ProbeRange MakeProbeRange(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+    const VkDeviceSize end = size == VK_WHOLE_SIZE ? ~VkDeviceSize{} : offset + size;
+    return {buffer, offset, end};
+}
+
+bool ProbeOverlaps(const std::vector<ProbeRange>& ranges, VkBuffer buffer, VkDeviceSize begin,
+                   VkDeviceSize end) {
+    return std::ranges::any_of(ranges, [&](const ProbeRange& range) {
+        return range.buffer == buffer && range.begin < end && begin < range.end;
+    });
+}
+
+void ReportPassEndProbe(double seconds) {
+    std::vector<std::pair<PassEndProbe::CopyCount, std::string>> copies;
+    for (const auto& [site, count] : g_probe.copies) {
+        copies.emplace_back(count, site);
+    }
+    g_probe.copies.clear();
+    std::ranges::sort(copies, [](const auto& a, const auto& b) {
+        return a.first.copies > b.first.copies;
+    });
+    for (size_t i = 0; i < copies.size() && i < 12; ++i) {
+        const auto& count = copies[i].first;
+        LOG_INFO(Render_Vulkan,
+                 "Pass-ending copy {:.1f}/s at {}: destination read by an earlier draw of the pass "
+                 "{:.1f}/s, source read {:.1f}/s, no draw in the pass yet {:.1f}/s",
+                 static_cast<double>(count.copies) / seconds, copies[i].second,
+                 static_cast<double>(count.dst_read) / seconds,
+                 static_cast<double>(count.src_read) / seconds,
+                 static_cast<double>(count.no_draw_yet) / seconds);
+    }
+    for (const auto& [kind, count] : g_probe.clears) {
+        LOG_INFO(Render_Vulkan, "Pass-ending clear {:.1f}/s: {}",
+                 static_cast<double>(count) / seconds, kind);
+    }
+    g_probe.clears.clear();
+}
+
 void ReportSubmitCounts() {
     const u64 now = VideoCommon::Nx2Profile::Now();
     u64 start = g_profile_window_start.load(std::memory_order_relaxed);
@@ -92,6 +156,7 @@ void ReportSubmitCounts() {
         LOG_INFO(Render_Vulkan, "Render pass ends {:.0f}/s at {}",
                  static_cast<double>(ends[i].first) / seconds, ends[i].second);
     }
+    ReportPassEndProbe(seconds);
 }
 }
 
@@ -370,6 +435,105 @@ void Scheduler::Hoist(HoistedCommand&& command) {
     hoist_slot->push_back(std::move(command));
 }
 
+void Scheduler::ProbeBufferBind(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+    if (VideoCommon::Nx2Profile::Enabled() && buffer != VK_NULL_HANDLE) {
+        g_probe.pending.push_back(MakeProbeRange(buffer, offset, size));
+    }
+}
+
+void Scheduler::ProbeVertexBind(u32 index, VkBuffer buffer, VkDeviceSize offset,
+                                VkDeviceSize size) {
+    if (VideoCommon::Nx2Profile::Enabled() && index < g_probe.vertex.size()) {
+        g_probe.vertex[index] = MakeProbeRange(buffer, offset, size);
+    }
+}
+
+void Scheduler::ProbeIndexBind(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        g_probe.index = MakeProbeRange(buffer, offset, size);
+    }
+}
+
+void Scheduler::ProbeDrawRecorded() {
+    if (!VideoCommon::Nx2Profile::Enabled() || !state.renderpass) {
+        g_probe.pending.clear();
+        return;
+    }
+    if (g_probe.pass_serial != render_pass_serial) {
+        g_probe.pass_serial = render_pass_serial;
+        g_probe.pass_reads.clear();
+    }
+    auto& reads = g_probe.pass_reads;
+    reads.insert(reads.end(), g_probe.pending.begin(), g_probe.pending.end());
+    g_probe.pending.clear();
+    for (const ProbeRange& range : g_probe.vertex) {
+        if (range.buffer != VK_NULL_HANDLE) {
+            reads.push_back(range);
+        }
+    }
+    if (g_probe.index.buffer != VK_NULL_HANDLE) {
+        reads.push_back(g_probe.index);
+    }
+}
+
+void Scheduler::ProbeDispatchRecorded() {
+    g_probe.pending.clear();
+}
+
+void Scheduler::ProbePassEndingCopy(VkBuffer dst, VkBuffer src, bool src_stream,
+                                    std::span<const VkBufferCopy> copies,
+                                    std::source_location caller) {
+    if (!VideoCommon::Nx2Profile::Enabled() || !state.renderpass) {
+        return;
+    }
+    const bool has_draws = g_probe.pass_serial == render_pass_serial;
+    const auto& reads = g_probe.pass_reads;
+    bool dst_read = false;
+    bool src_read = false;
+    if (has_draws) {
+        for (const VkBufferCopy& copy : copies) {
+            dst_read |= ProbeOverlaps(reads, dst, copy.dstOffset, copy.dstOffset + copy.size);
+            src_read |= ProbeOverlaps(reads, src, copy.srcOffset, copy.srcOffset + copy.size);
+        }
+    }
+    std::string_view file{caller.file_name()};
+    if (const auto slash = file.find_last_of('/'); slash != std::string_view::npos) {
+        file.remove_prefix(slash + 1);
+    }
+    auto& count = g_probe.copies[fmt::format("{}:{} ({} source)", file, caller.line(),
+                                             src_stream ? "stream" : "other")];
+    ++count.copies;
+    count.dst_read += dst_read ? 1 : 0;
+    count.src_read += src_read ? 1 : 0;
+    count.no_draw_yet += has_draws ? 0 : 1;
+}
+
+void Scheduler::ProbePassEndingClear(const Framebuffer* framebuffer, bool deferrable) {
+    if (!VideoCommon::Nx2Profile::Enabled() || !state.renderpass ||
+        framebuffer->Handle() == state.framebuffer) {
+        return;
+    }
+    const auto& images = framebuffer->Images();
+    const u32 num_images = framebuffer->NumImages();
+    const auto pass_begin = g_probe.pass_images.begin();
+    const auto pass_end = pass_begin + g_probe.pass_num_images;
+    u32 shared = 0;
+    for (u32 i = 0; i < num_images; ++i) {
+        shared += std::find(pass_begin, pass_end, images[i]) != pass_end ? 1 : 0;
+    }
+    const char* const relation = shared == 0                 ? "other images"
+                                 : shared < num_images       ? "some of the pass's images"
+                                 : num_images < g_probe.pass_num_images
+                                     ? "a subset of the pass's images"
+                                     : "the pass's own images";
+    const VkExtent2D area = framebuffer->RenderArea();
+    const bool same_area =
+        area.width == g_probe.pass_area.width && area.height == g_probe.pass_area.height;
+    ++g_probe.clears[fmt::format("{}, {} render area, {}", relation, same_area ? "same" : "other",
+                                 deferrable ? "deferrable without the open pass"
+                                            : "not deferrable")];
+}
+
 void Scheduler::DispatchWork() {
     // The worker runs the slot's commands from here on.
     hoist_slot.reset();
@@ -426,6 +590,9 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
                                     const VkClearValue* clear_values, u32 clear_value_count) {
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_renderpasses.fetch_add(1, std::memory_order_relaxed);
+        g_probe.pass_images = framebuffer->Images();
+        g_probe.pass_num_images = framebuffer->NumImages();
+        g_probe.pass_area = framebuffer->RenderArea();
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
