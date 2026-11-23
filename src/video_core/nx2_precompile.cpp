@@ -39,6 +39,7 @@
 #include "common/cityhash.h"
 #include "common/logging.h"
 #include "common/fs/path_util.h"
+#include "common/scope_exit.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
@@ -398,10 +399,12 @@ public:
         return answer != 0;
     }
     u32 ReadCbufHandleWord(u32 bank, u32 offset) override {
+        // Cleared even when the read throws: later reads would be noted as handle reads.
         reading_handle = true;
-        const u32 value = ReadCbufValue(bank, offset);
-        reading_handle = false;
-        return value;
+        SCOPE_EXIT {
+            reading_handle = false;
+        };
+        return ReadCbufValue(bank, offset);
     }
     u32 ReadCbufValue(u32 bank, u32 offset) override {
         const u64 key = CbufKey(bank, offset);
