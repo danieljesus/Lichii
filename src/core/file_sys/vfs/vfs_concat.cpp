@@ -113,6 +113,16 @@ std::size_t ConcatenatedVfsFile::GetSize() const {
     return concatenation_map.back().offset + concatenation_map.back().file->GetSize();
 }
 
+// The parts lie end to end, so what they hold adds up; a part that holds less than its size, or a
+// filler that holds nothing, adds only what it holds.
+std::size_t ConcatenatedVfsFile::GetHeldSize() const {
+    std::size_t held = 0;
+    for (const auto& entry : concatenation_map) {
+        held += entry.file->GetHeldSize();
+    }
+    return held;
+}
+
 bool ConcatenatedVfsFile::Resize(std::size_t new_size) {
     return false;
 }
