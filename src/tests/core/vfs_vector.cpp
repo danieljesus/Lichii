@@ -22,4 +22,18 @@ TEST_CASE("VectorVfsFile reads stop at the end of the data", "[core][vfs]") {
     const FileSys::VectorVfsFile empty;
     REQUIRE(empty.Read(out.data(), out.size(), 0) == 0);
 }
+
+TEST_CASE("VectorVfsFile reads and writes nothing for zero bytes, also with a null buffer",
+          "[core][vfs]") {
+    // A zero-length read or write used to pass memcpy the null pointer it was given, which
+    // UBSan reports even for zero bytes.
+    const FileSys::VectorVfsFile file(std::vector<u8>{1, 2, 3, 4});
+    REQUIRE(file.Read(nullptr, 0, 0) == 0);
+    REQUIRE(file.Read(nullptr, 0, 2) == 0);
+
+    FileSys::VectorVfsFile empty;
+    REQUIRE(empty.Read(nullptr, 0, 0) == 0);
+    REQUIRE(empty.Write(nullptr, 0, 0) == 0);
+    REQUIRE(empty.GetSize() == 0);
+}
 } // namespace

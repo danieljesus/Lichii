@@ -43,7 +43,10 @@ std::size_t VectorVfsFile::Read(u8* data_, std::size_t length, std::size_t offse
         return 0;
     }
     const auto read = (std::min)(length, data.size() - offset);
-    std::memcpy(data_, data.data() + offset, read);
+    // memcpy takes no null pointers, not even for zero bytes: a zero-length read may pass one.
+    if (read != 0) {
+        std::memcpy(data_, data.data() + offset, read);
+    }
     return read;
 }
 
@@ -51,7 +54,9 @@ std::size_t VectorVfsFile::Write(const u8* data_, std::size_t length, std::size_
     if (offset + length > data.size())
         data.resize(offset + length);
     const auto write = (std::min)(length, data.size() - offset);
-    std::memcpy(data.data() + offset, data_, write);
+    if (write != 0) {
+        std::memcpy(data.data() + offset, data_, write);
+    }
     return write;
 }
 

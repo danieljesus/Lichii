@@ -138,3 +138,9 @@ TEST_CASE("NSO rejects segments that end past a 32-bit image", "[core][loader]")
                                      {0x2000, 0x10, 0x10}}}))
                     .has_value());
 }
+
+TEST_CASE("NSO whose segments are all empty loads without copying", "[core][loader]") {
+    // Each segment's copy used to pass memcpy the null data of an empty buffer and of an empty
+    // image, which UBSan reports even for zero bytes.
+    CHECK(Load(MakeStoredNso({{{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}})).has_value());
+}
