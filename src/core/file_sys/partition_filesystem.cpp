@@ -77,6 +77,24 @@ PartitionFilesystem::PartitionFilesystem(VirtualFile file) {
         const auto name_bytes = strtab.subspan(entry.strtab_offset);
         std::string name(name_bytes.data(), strnlen(name_bytes.data(), name_bytes.size()));
 
+        // An entry is opened as a file of the size it gives, and everything read from it later,
+        // an NCA's checks included, takes that size as what the file stores. So an entry must
+        // lie inside the file: one that runs past its end means a truncated or damaged
+        // container, and the whole container is refused rather than opened in part.
+        const u64 file_size = file->GetSize();
+        if (entry.offset > file_size - content_offset ||
+            entry.size > file_size - content_offset - entry.offset) {
+            LOG_ERROR(Loader,
+                      "{} entry {} runs past the end of its file: {} bytes at {} in a file of {}",
+                      is_hfs ? "HFS0" : "PFS0", name, entry.size, content_offset + entry.offset,
+                      file_size);
+            offsets.clear();
+            sizes.clear();
+            pfs_files.clear();
+            status = Loader::ResultStatus::ErrorIncorrectPFSFileSize;
+            return;
+        }
+
         offsets.insert_or_assign(name, content_offset + entry.offset);
         sizes.insert_or_assign(name, entry.size);
 

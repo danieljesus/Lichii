@@ -141,6 +141,18 @@ TEST_CASE("PFS0 rejects a table larger than the file without allocating it",
     REQUIRE(pfs.GetStatus() == Loader::ResultStatus::ErrorIncorrectPFSFileSize);
 }
 
+TEST_CASE("PFS0 rejects an entry that runs past the end of its file", "[core][file_sys]") {
+    auto bytes =
+        MakePfs0WithFiles({{"a", std::vector<u8>(0x100, 1)}, {"b", std::vector<u8>(0x100, 2)}});
+    REQUIRE(PartitionFilesystem{MakeFile(bytes)}.GetStatus() == Loader::ResultStatus::Success);
+    bytes.pop_back();
+    const PartitionFilesystem truncated{MakeFile(bytes)};
+    REQUIRE(truncated.GetStatus() == Loader::ResultStatus::ErrorIncorrectPFSFileSize);
+    REQUIRE(truncated.GetFiles().empty());
+    REQUIRE(NSP{MakeFile(std::move(bytes))}.GetStatus() ==
+            Loader::ResultStatus::ErrorIncorrectPFSFileSize);
+}
+
 TEST_CASE("PFS0 with more than 65535 entries reads every entry", "[core][file_sys]") {
     PartitionFilesystem pfs{MakeFile(MakePfs0(std::vector<std::string>(70000, "a")))};
     REQUIRE(pfs.GetStatus() == Loader::ResultStatus::Success);
@@ -828,11 +840,11 @@ TEST_CASE("NCA rejects an AES-CTR-EX table its container claims but does not hol
 
 // A section behind a sparse layer whose one entry reads [0, 0x8000) as zeros. The sparse table
 // lies 0x8000 into the section, encrypted with the NCA's AES-CTR key as the driver decrypts it.
-PlaintextNca MakeSparseNca(s64 table_size = 0x8000) {
+PlaintextNca MakeSparseNca(s64 table_size = 0x8000, s64 virtual_size = 0x8000) {
     auto nca = MakeSha256Nca();
-    nca.header.fs_info[0].end_sector = 6 + 0x10000 / 0x200;
-    nca.section.resize(0x10000);
-    const BucketTree::NodeHeader node{0, 1, 0x8000};
+    nca.header.fs_info[0].end_sector = 6 + 0x10200 / 0x200;
+    nca.section.resize(0x10200);
+    const BucketTree::NodeHeader node{0, 1, virtual_size};
     Put(nca.section, 0x8000, node);
     Put(nca.section, 0x8000 + sizeof(node), s64{0});
     Put(nca.section, 0xC000, node);
@@ -868,6 +880,25 @@ TEST_CASE("NCA with a valid sparse table opens in a container that claims more t
     const auto nca = MakeSparseNca();
     REQUIRE(nca.Open() == ResultSuccess);
     REQUIRE(nca.Open(size_t{1} << 41) == ResultSuccess);
+}
+
+TEST_CASE("NCA rejects an indirect table over a sparse layer's zeros that the file does not "
+          "hold, and so does a container that claims it",
+          "[core][file_sys]") {
+    // A small sparse table whose one entry reads a huge virtual range as zeros: a layer that
+    // never reads short, so only a truthful body size bounds the indirect table over it.
+    auto nca = MakeSparseNca(0x8000, s64{1} << 41);
+    nca.fs.patch_info.indirect_offset = 0;
+    nca.fs.patch_info.indirect_size = s64{1} << 40;
+    REQUIRE(nca.Open() == ResultNcaBaseStorageOutOfRangeE);
+
+    // Inside a PFS0 the NCA's size is its entry's: an entry claiming more than the file holds
+    // is refused before anything opens the NCA.
+    auto bytes = MakePfs0WithFiles({{"00000000000000000000000000000000.nca", nca.Bytes()}});
+    Put(bytes, 0x10 + 8, u64{1} << 41);
+    const PartitionFilesystem pfs{MakeFile(std::move(bytes))};
+    REQUIRE(pfs.GetStatus() == Loader::ResultStatus::ErrorIncorrectPFSFileSize);
+    REQUIRE(pfs.GetFiles().empty());
 }
 
 TEST_CASE("NCA rejects a sparse table its container claims but does not hold, without "
