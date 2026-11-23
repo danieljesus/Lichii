@@ -6,8 +6,11 @@
 // with the NSO's own segments. The first two bytes, little endian, are the arguments' length; the
 // rest is the NSO. The module is laid out but not mapped into a process, as when its size is first
 // worked out; one kernel serves every input.
-// Run: build-fuzz/bin/fuzz_nso_args -max_len=65536 -rss_limit_mb=2048 -malloc_limit_mb=2048 \
+// Run: build-fuzz/bin/fuzz_nso_args -max_len=65536 -rss_limit_mb=6144 -malloc_limit_mb=4096 \
 //          corpus/nso_args
+// The malloc limit sits above the largest pool an image may reserve; RSS is the ~1.9 GB base
+// plus a 3 GB image plus margin. libFuzzer's fork driver exits at the first child OOM despite
+// -ignore_ooms=1, so a run under lower limits ends in seconds.
 
 #include <memory>
 #include <optional>
