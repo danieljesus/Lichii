@@ -141,16 +141,22 @@ TEST_CASE("PFS0 rejects a table larger than the file without allocating it",
     REQUIRE(pfs.GetStatus() == Loader::ResultStatus::ErrorIncorrectPFSFileSize);
 }
 
-TEST_CASE("PFS0 rejects an entry that runs past the end of its file", "[core][file_sys]") {
+TEST_CASE("PFS0 keeps an entry that runs past the end of its file at the bytes it holds",
+          "[core][file_sys]") {
     auto bytes =
         MakePfs0WithFiles({{"a", std::vector<u8>(0x100, 1)}, {"b", std::vector<u8>(0x100, 2)}});
-    REQUIRE(PartitionFilesystem{MakeFile(bytes)}.GetStatus() == Loader::ResultStatus::Success);
     bytes.pop_back();
     const PartitionFilesystem truncated{MakeFile(bytes)};
-    REQUIRE(truncated.GetStatus() == Loader::ResultStatus::ErrorIncorrectPFSFileSize);
-    REQUIRE(truncated.GetFiles().empty());
-    REQUIRE(NSP{MakeFile(std::move(bytes))}.GetStatus() ==
-            Loader::ResultStatus::ErrorIncorrectPFSFileSize);
+    REQUIRE(truncated.GetStatus() == Loader::ResultStatus::Success);
+    REQUIRE(truncated.GetFile("a")->GetSize() == 0x100);
+    REQUIRE(truncated.GetFile("b")->GetSize() == 0xFF);
+    REQUIRE(truncated.GetFile("b")->ReadAllBytes() == std::vector<u8>(0xFF, 2));
+
+    // An entry that starts past the end keeps nothing.
+    Put(bytes, 0x10 + 0x18, u64{0x1000});
+    const PartitionFilesystem past{MakeFile(std::move(bytes))};
+    REQUIRE(past.GetStatus() == Loader::ResultStatus::Success);
+    REQUIRE(past.GetFile("b")->GetSize() == 0);
 }
 
 TEST_CASE("PFS0 with more than 65535 entries reads every entry", "[core][file_sys]") {
@@ -312,8 +318,6 @@ struct PlaintextNca {
         fs.encryption_type = NcaFsHeader::EncryptionType::None;
     }
 
-    // claimed_size, when larger than the bytes, is the size a container such as an NSP gives the
-    // NCA: the file is opened as a range of that size over the bytes it really holds.
     std::vector<u8> Bytes() const {
         std::vector<u8> bytes(std::max<size_t>(0x4C00, 0xC00 + section.size()));
         std::memcpy(bytes.data(), &header, sizeof(header));
@@ -322,11 +326,8 @@ struct PlaintextNca {
         return bytes;
     }
 
-    Result Open(size_t claimed_size = 0) const {
-        VirtualFile file = MakeFile(Bytes());
-        if (claimed_size > file->GetSize()) {
-            file = std::make_shared<OffsetVfsFile>(std::move(file), claimed_size, 0);
-        }
+    // Opens the first section of the NCA that file holds.
+    static Result OpenFile(VirtualFile file) {
         auto reader = std::make_shared<NcaReader>();
         R_TRY(reader->Initialize(std::move(file), GetCryptoConfiguration(),
                                  GetNcaCompressionConfiguration()));
@@ -336,6 +337,16 @@ struct PlaintextNca {
         R_TRY(driver.OpenStorage(&storage, &header_reader, 0));
         R_UNLESS(storage != nullptr, ResultInvalidNcaFsHeader);
         R_SUCCEED();
+    }
+
+    // claimed_size, when larger than the bytes, is a size a container claims for the NCA: the
+    // file is opened as a range of that size over the bytes it really holds.
+    Result Open(size_t claimed_size = 0) const {
+        VirtualFile file = MakeFile(Bytes());
+        if (claimed_size > file->GetSize()) {
+            file = std::make_shared<OffsetVfsFile>(std::move(file), claimed_size, 0);
+        }
+        return OpenFile(std::move(file));
     }
 };
 
@@ -890,7 +901,7 @@ TEST_CASE("NCA with a sparse table whose size ends inside a block opens", "[core
 }
 
 TEST_CASE("NCA rejects an indirect table over a sparse layer's zeros that the file does not "
-          "hold, and so does a container that claims it",
+          "hold, also inside a PFS0 entry that claims it",
           "[core][file_sys]") {
     // A small sparse table whose one entry reads a huge virtual range as zeros: a layer that
     // never reads short, so only a truthful body size bounds the indirect table over it.
@@ -900,12 +911,15 @@ TEST_CASE("NCA rejects an indirect table over a sparse layer's zeros that the fi
     REQUIRE(nca.Open() == ResultNcaBaseStorageOutOfRangeE);
 
     // Inside a PFS0 the NCA's size is its entry's: an entry claiming more than the file holds
-    // is refused before anything opens the NCA.
-    auto bytes = MakePfs0WithFiles({{"00000000000000000000000000000000.nca", nca.Bytes()}});
+    // keeps the bytes the file has, so the NCA's own check rejects the table as it does above.
+    const auto name = "00000000000000000000000000000000.nca";
+    auto bytes = MakePfs0WithFiles({{name, nca.Bytes()}});
     Put(bytes, 0x10 + 8, u64{1} << 41);
     const PartitionFilesystem pfs{MakeFile(std::move(bytes))};
-    REQUIRE(pfs.GetStatus() == Loader::ResultStatus::ErrorIncorrectPFSFileSize);
-    REQUIRE(pfs.GetFiles().empty());
+    REQUIRE(pfs.GetStatus() == Loader::ResultStatus::Success);
+    const auto entry = pfs.GetFile(name);
+    REQUIRE(entry->GetSize() == nca.Bytes().size());
+    REQUIRE(PlaintextNca::OpenFile(entry) == ResultNcaBaseStorageOutOfRangeE);
 }
 
 TEST_CASE("NCA rejects a sparse table its container claims but does not hold, without "

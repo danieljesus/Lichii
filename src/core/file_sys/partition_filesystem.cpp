@@ -63,6 +63,7 @@ PartitionFilesystem::PartitionFilesystem(VirtualFile file) {
     const std::span<const char> strtab{
         reinterpret_cast<const char*>(file_data.data()) + strtab_offset, pfs_header.strtab_size};
     content_offset = strtab_offset + pfs_header.strtab_size;
+    const u64 file_size = file->GetSize();
     for (u32 i = 0; i < pfs_header.num_entries; i++) {
         FSEntry entry;
 
@@ -78,28 +79,24 @@ PartitionFilesystem::PartitionFilesystem(VirtualFile file) {
         std::string name(name_bytes.data(), strnlen(name_bytes.data(), name_bytes.size()));
 
         // An entry is opened as a file of the size it gives, and everything read from it later,
-        // an NCA's checks included, takes that size as what the file stores. So an entry must
-        // lie inside the file: one that runs past its end means a truncated or damaged
-        // container, and the whole container is refused rather than opened in part.
-        const u64 file_size = file->GetSize();
-        if (entry.offset > file_size - content_offset ||
-            entry.size > file_size - content_offset - entry.offset) {
-            LOG_ERROR(Loader,
-                      "{} entry {} runs past the end of its file: {} bytes at {} in a file of {}",
-                      is_hfs ? "HFS0" : "PFS0", name, entry.size, content_offset + entry.offset,
-                      file_size);
-            offsets.clear();
-            sizes.clear();
-            pfs_files.clear();
-            status = Loader::ResultStatus::ErrorIncorrectPFSFileSize;
-            return;
+        // an NCA's checks included, takes that size as what the file stores. An entry that runs
+        // past the end of the file, as in a truncated dump, is kept with the bytes the file
+        // holds from its offset, so the size is a true one; whether those are enough is for
+        // whatever reads the entry to judge.
+        const u64 held = entry.offset < file_size - content_offset
+                             ? file_size - content_offset - entry.offset
+                             : 0;
+        const u64 kept = std::min<u64>(entry.size, held);
+        if (kept != entry.size) {
+            LOG_WARNING(Loader, "{} entry of {} bytes at {} runs past the end of its file: kept {}",
+                        is_hfs ? "HFS0" : "PFS0", entry.size, content_offset + entry.offset, kept);
         }
 
         offsets.insert_or_assign(name, content_offset + entry.offset);
-        sizes.insert_or_assign(name, entry.size);
+        sizes.insert_or_assign(name, kept);
 
         pfs_files.emplace_back(std::make_shared<OffsetVfsFile>(
-            file, entry.size, content_offset + entry.offset, std::move(name)));
+            file, kept, content_offset + entry.offset, std::move(name)));
     }
 
     status = Loader::ResultStatus::Success;
