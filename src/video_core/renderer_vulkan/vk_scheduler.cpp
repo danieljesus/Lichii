@@ -349,8 +349,38 @@ std::optional<double> Scheduler::GpuBusyMs() const {
     return gpu_busy->ms;
 }
 
+void Scheduler::OpenHoistSlot() {
+    JoinRecorders();
+    hoist_slot.reset();
+    if (state.renderpass) {
+        return;
+    }
+    auto slot = std::make_shared<std::vector<HoistedCommand>>();
+    Record([slot](vk::CommandBuffer cmdbuf) {
+        for (const HoistedCommand& command : *slot) {
+            command(cmdbuf);
+        }
+    });
+    // Assigned after Record: a full chunk makes Record dispatch, which drops the previous slot.
+    hoist_slot = std::move(slot);
+    hoist_record_serial = record_serial;
+    hoist_awaits_pass = true;
+}
+
+bool Scheduler::TryHoist(HoistedCommand& command) {
+    JoinRecorders();
+    if (!hoist_slot || hoist_awaits_pass || !state.renderpass ||
+        render_pass_serial != hoist_pass_serial || uploads_pending) {
+        return false;
+    }
+    hoist_slot->push_back(std::move(command));
+    return true;
+}
+
 void Scheduler::DispatchWork() {
     JoinRecorders();
+    // The worker runs the slot's commands from here on.
+    hoist_slot.reset();
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
@@ -410,6 +440,15 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
     ++render_pass_serial;
+    if (hoist_awaits_pass) {
+        hoist_awaits_pass = false;
+        if (record_serial == hoist_record_serial) {
+            hoist_pass_serial = render_pass_serial;
+        } else {
+            // Something else was recorded between the slot and this pass.
+            hoist_slot.reset();
+        }
+    }
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
@@ -1293,6 +1332,7 @@ void Scheduler::EndRenderPass()
         if (!state.renderpass) {
             return;
         }
+        hoist_slot.reset();
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;

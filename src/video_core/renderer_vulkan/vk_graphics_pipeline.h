@@ -476,7 +476,8 @@ private:
                        const RenderAreaPushConstant& render_area,
                        std::optional<PreparedBinding>* deferred);
 
-    void RecordBinding(const PreparedBinding& binding, const DescriptorUpdateEntry* descriptor_data);
+    void RecordBinding(const PreparedBinding& binding, const DescriptorUpdateEntry* descriptor_data,
+                       std::shared_ptr<VkDescriptorSet> mesh_set = {});
 
     void MakePipeline(VkRenderPass render_pass);
 
@@ -585,7 +586,9 @@ private:
     std::optional<MeshEmulationSetup> mesh_emulation;
     vk::ShaderModule mesh_vertex_module;
     vk::Pipeline mesh_compute_pipeline;
-    VkDescriptorSet mesh_descriptor_set{}; ///< shared by the dispatch and the draw it feeds
+    /// Whether the draw being configured samples one of its own render targets: its dispatch
+    /// then stays in its place rather than run before the pass (Scheduler::TryHoist).
+    bool mesh_reads_target{};
     VkBuffer mesh_output_buffer{};
     VkDeviceSize mesh_output_offset{};
     VkDeviceSize mesh_output_size{};
