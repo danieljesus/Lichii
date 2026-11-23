@@ -314,6 +314,7 @@ add_executable(tests
     video_core/descriptor_payload_growth.cpp
     video_core/global_address_tracking.cpp
     video_core/global_atomic_routing.cpp
+    video_core/spirv_emit_twice.cpp
     video_core/global_memory_routes.cpp
     video_core/nvn_storage_descriptor.cpp
     video_core/ampere_f2i.cpp
