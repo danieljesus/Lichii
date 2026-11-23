@@ -701,7 +701,9 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     // of ending the pass; draws recorded later see it as they would have.
     if (src_buffer == staging_pool.StreamBuf() && device.IsMoltenVK() &&
         scheduler.IsRenderPassActive()) {
-        const bool overlap = scheduler.ReadInActivePass(dst_buffer, vk_copies);
+        // TEST ONLY: EDEN_NX2_TEST_UPLOADS_DEPENDENT=1 treats every upload as read by the pass.
+        static const bool test_dependent = std::getenv("EDEN_NX2_TEST_UPLOADS_DEPENDENT") != nullptr;
+        const bool overlap = test_dependent || scheduler.ReadInActivePass(dst_buffer, vk_copies);
         const bool movable = !overlap && scheduler.HasUsableSlot();
         Scheduler::CountSlotUpload(movable, overlap);
         if (movable) {
