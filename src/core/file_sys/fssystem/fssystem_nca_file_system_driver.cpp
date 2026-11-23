@@ -48,34 +48,6 @@ s64 GetBodySize(const std::shared_ptr<NcaReader>& reader) {
     return reader != nullptr ? static_cast<s64>(reader->GetSharedBodyStorage()->GetSize()) : 0;
 }
 
-// The body storage's size is not always the file's: an NCA inside an NSP or XCI is a range of
-// the container whose size the container's header gives. A table read into memory whole is
-// therefore read a piece at a time, so the buffer only grows as far as the storage returns
-// bytes, and a table the file does not hold in full is rejected.
-// table names the table and declared_size is the size its header gives, for the log.
-bool ReadWholeTable(const VirtualFile& storage, s64 size, std::vector<u8>& out,
-                    std::string_view table, s64 declared_size) {
-    constexpr s64 PieceSize = s64{1} << 20;
-    out.clear();
-    for (s64 done = 0; done < size;) {
-        const s64 piece = std::min(PieceSize, size - done);
-        out.resize(static_cast<size_t>(done + piece));
-        const size_t read =
-            storage->Read(out.data() + done, static_cast<size_t>(piece), static_cast<size_t>(done));
-        if (read != static_cast<size_t>(piece)) {
-            LOG_ERROR(Loader,
-                      "NCA {} table of {} bytes is not stored in full: {} of {} bytes read at {}",
-                      table, declared_size, read, piece, done);
-            out.clear();
-            out.shrink_to_fit();
-            return false;
-        }
-        done += piece;
-    }
-    out.shrink_to_fit();
-    return true;
-}
-
 class SharedNcaBodyStorage : public IReadOnlyStorage {
     LICHII_NON_COPYABLE(SharedNcaBodyStorage);
     LICHII_NON_MOVEABLE(SharedNcaBodyStorage);
@@ -117,6 +89,34 @@ using IntegrityLevelInfo = NcaFsHeader::HashData::IntegrityMetaInfo::LevelHashIn
 using IntegrityDataInfo = IntegrityLevelInfo::HierarchicalIntegrityVerificationLevelInformation;
 
 } // namespace
+
+// The body storage's size is not always the file's: a range of a container is opened at the size
+// the container gives, and some layers never read short. A table read into memory whole is
+// therefore read a piece at a time, so the buffer only grows as far as the storage returns bytes,
+// and a table the file does not hold in full is rejected.
+bool ReadWholeTable(const VirtualFile& storage, s64 size, std::vector<u8>& out,
+                    std::string_view table, s64 declared_size) {
+    constexpr s64 PieceSize = s64{1} << 20;
+    out.clear();
+    for (s64 done = 0; done < size;) {
+        const s64 piece = std::min(PieceSize, size - done);
+        out.resize(static_cast<size_t>(done + piece));
+        const size_t read =
+            storage->Read(out.data() + done, static_cast<size_t>(piece), static_cast<size_t>(done));
+        if (read != static_cast<size_t>(piece)) {
+            LOG_ERROR(Loader,
+                      "NCA {} table is not stored in full: {} bytes declared, {} to read, the "
+                      "read stopped at {}",
+                      table, declared_size, size, done + static_cast<s64>(read));
+            out.clear();
+            out.shrink_to_fit();
+            return false;
+        }
+        done += piece;
+    }
+    out.shrink_to_fit();
+    return true;
+}
 
 Result NcaFileSystemDriver::OpenStorageWithContext(VirtualFile* out,
                                                    NcaFsHeaderReader* out_header_reader,
@@ -1368,7 +1368,9 @@ Result NcaFileSystemDriver::CreateIntegrityVerificationStorageForMeta(
                            base_storage->GetSize()),
              ResultNcaBaseStorageOutOfRangeB);
     NcaMetaDataHashData meta_data_hash_data;
-    base_storage->ReadObject(std::addressof(meta_data_hash_data), meta_data_hash_data_offset);
+    R_UNLESS(base_storage->ReadObject(std::addressof(meta_data_hash_data),
+                                      meta_data_hash_data_offset) == sizeof(meta_data_hash_data),
+             ResultNcaBaseStorageOutOfRangeB);
     R_UNLESS(meta_data_hash_data.layer_info_offset >= offset &&
                  meta_data_hash_data.layer_info_offset - offset <= meta_data_hash_data_offset,
              ResultRomNcaInvalidIntegrityLayerInfoOffset);
