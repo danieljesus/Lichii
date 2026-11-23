@@ -1760,6 +1760,7 @@ void QueryCacheRuntime::Barriers(bool is_prebarrier) {
     if (is_prebarrier) {
         impl->scheduler.ProbeQuerySyncBegin();
     }
+    impl->scheduler.ProbeGapTag("query sync");
     impl->scheduler.RequestOutsideRenderPassOperationContext();
     if (is_prebarrier) {
         impl->scheduler.Record([](vk::CommandBuffer cmdbuf) {
@@ -1873,6 +1874,7 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
                                                copy.dstOffset, copy.size);
         }
     }
+    impl->scheduler.ProbeGapTag("query sync");
     impl->scheduler.RequestOutsideRenderPassOperationContext();
     impl->scheduler.Record([src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to), vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
         size_t size = dst_buffers.size();

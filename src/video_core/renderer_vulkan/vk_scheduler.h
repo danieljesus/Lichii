@@ -165,6 +165,10 @@ public:
     /// A clear of `framebuffer` about to end the open pass; `deferrable` when it would have been
     /// deferred into the next pass's load operation had no pass been open.
     void ProbePassEndingClear(const Framebuffer* framebuffer, bool deferrable);
+    /// Names what the next request to be outside a render pass is for (the reopen probe: the
+    /// work between a pass's last draw and the first draw of the next pass on the same
+    /// framebuffer). Without a name, the request's source line stands for it.
+    void ProbeGapTag(const char* tag);
     /// A query sync at a wait for idle: QueryCacheRuntime::Barriers(true) and (false) around the
     /// copies SyncValues records (ProbeQuerySyncCopy, each with its destination range).
     void ProbeQuerySyncBegin();

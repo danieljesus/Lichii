@@ -1730,6 +1730,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                       ? static_cast<size_t>(scheduler.test_hoist_drop)
                                       : 9;
             ++test_reasons[reason];
+            scheduler.ProbeGapTag(reason == 5 || reason == 0 ? "mesh dispatch, first of its pass"
+                                  : reason == 3          ? "mesh dispatch, slot gone to the worker"
+                                  : reason == 6          ? "mesh dispatch, writes storage"
+                                                         : "mesh dispatch, other");
             if (++test_refused % 2000 == 0) {
                 LOG_INFO(Render_Vulkan,
                          "Mesh dispatches not hoisted: {} - no slot since: never {}, storage "

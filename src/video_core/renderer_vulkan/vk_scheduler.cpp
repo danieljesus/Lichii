@@ -11,6 +11,7 @@
 #include <string_view>
 #include <string>
 #include <map>
+#include <set>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -82,6 +83,20 @@ struct PassEndProbe {
     };
     std::map<std::string, CopyCount> copies;
     std::map<std::string, u64> clears;
+    // Reopen probe: what needed to be outside a pass between the last drawn pass and the first
+    // draw of the next drawn pass, per reopen of the same framebuffer.
+    const char* gap_tag{};
+    std::set<std::string> gap;
+    bool pass_drawn{};
+    VkFramebuffer pass_framebuffer{};
+    VkFramebuffer last_drawn_framebuffer{};
+    VkExtent2D last_drawn_area{};
+    bool has_last_drawn{};
+    u64 passes{};
+    u64 drawn_passes{};
+    u64 reopens{};
+    u64 framebuffer_changes{};
+    std::map<std::string, u64> reopen_causes;
     // Query syncs: each one's destinations stay watched until the pass that begins after it has
     // ended (two pass begins later), which is as far as a deferral to a pass end would move them.
     struct QueryWindow {
@@ -125,7 +140,47 @@ bool ProbeOverlaps(const std::vector<ProbeRange>& ranges, VkBuffer buffer, VkDev
     });
 }
 
+void ProbeGapNote(const std::source_location& location) {
+    if (!VideoCommon::Nx2Profile::Enabled() || !g_probe.has_last_drawn) {
+        g_probe.gap_tag = nullptr;
+        return;
+    }
+    if (g_probe.gap_tag) {
+        g_probe.gap.insert(g_probe.gap_tag);
+        g_probe.gap_tag = nullptr;
+        return;
+    }
+    std::string_view file{location.file_name()};
+    if (const auto slash = file.find_last_of('/'); slash != std::string_view::npos) {
+        file.remove_prefix(slash + 1);
+    }
+    g_probe.gap.insert(fmt::format("{}:{}", file, location.line()));
+}
+
 void ReportPassEndProbe(double seconds) {
+    if (g_probe.passes != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Reopen probe per second: {:.1f} passes, {:.1f} with draws, {:.1f} reopens of "
+                 "the last drawn framebuffer, {:.1f} changes of framebuffer",
+                 static_cast<double>(g_probe.passes) / seconds,
+                 static_cast<double>(g_probe.drawn_passes) / seconds,
+                 static_cast<double>(g_probe.reopens) / seconds,
+                 static_cast<double>(g_probe.framebuffer_changes) / seconds);
+        std::vector<std::pair<u64, std::string>> causes;
+        for (const auto& [key, count] : g_probe.reopen_causes) {
+            causes.emplace_back(count, key);
+        }
+        std::sort(causes.rbegin(), causes.rend());
+        for (size_t i = 0; i < causes.size() && i < 40; ++i) {
+            LOG_INFO(Render_Vulkan, "Reopen cause {:.2f}/s: {}",
+                     static_cast<double>(causes[i].first) / seconds, causes[i].second);
+        }
+    }
+    g_probe.passes = 0;
+    g_probe.drawn_passes = 0;
+    g_probe.reopens = 0;
+    g_probe.framebuffer_changes = 0;
+    g_probe.reopen_causes.clear();
     std::vector<std::pair<PassEndProbe::CopyCount, std::string>> copies;
     for (const auto& [site, count] : g_probe.copies) {
         copies.emplace_back(count, site);
@@ -333,6 +388,9 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
     }
+    if (VideoCommon::Nx2Profile::Enabled() && g_probe.has_last_drawn) {
+        g_probe.gap.insert("submission");
+    }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Flush");
     }
@@ -412,6 +470,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                        std::source_location location) {
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
+    }
+    if (VideoCommon::Nx2Profile::Enabled() && g_probe.has_last_drawn) {
+        g_probe.gap.insert("submission");
     }
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
@@ -538,10 +599,38 @@ void Scheduler::ProbeIndexBind(VkBuffer buffer, VkDeviceSize offset, VkDeviceSiz
     }
 }
 
+void Scheduler::ProbeGapTag(const char* tag) {
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        g_probe.gap_tag = tag;
+    }
+}
+
 void Scheduler::ProbeDrawRecorded() {
     if (!VideoCommon::Nx2Profile::Enabled() || !state.renderpass) {
         g_probe.pending.clear();
         return;
+    }
+    if (!g_probe.pass_drawn) {
+        g_probe.pass_drawn = true;
+        ++g_probe.drawn_passes;
+        if (g_probe.has_last_drawn) {
+            if (g_probe.last_drawn_framebuffer == state.framebuffer &&
+                g_probe.last_drawn_area.width == state.render_area.width &&
+                g_probe.last_drawn_area.height == state.render_area.height) {
+                ++g_probe.reopens;
+                std::string key;
+                for (const std::string& cause : g_probe.gap) {
+                    key += key.empty() ? cause : " + " + cause;
+                }
+                ++g_probe.reopen_causes[key.empty() ? "(nothing recorded)" : key];
+            } else {
+                ++g_probe.framebuffer_changes;
+            }
+        }
+        g_probe.gap.clear();
+        g_probe.has_last_drawn = true;
+        g_probe.last_drawn_framebuffer = state.framebuffer;
+        g_probe.last_drawn_area = state.render_area;
     }
     if (g_probe.pass_serial != render_pass_serial) {
         g_probe.pass_serial = render_pass_serial;
@@ -628,7 +717,20 @@ void Scheduler::ProbeCopySource(VkBuffer src, std::span<const VkBufferCopy> copi
 void Scheduler::ProbePassEndingCopy(VkBuffer dst, VkBuffer src, bool src_stream,
                                     std::span<const VkBufferCopy> copies,
                                     std::source_location caller) {
-    if (!VideoCommon::Nx2Profile::Enabled() || !state.renderpass) {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        return;
+    }
+    {
+        bool read = false;
+        for (const VkBufferCopy& copy : copies) {
+            read |= ProbeOverlaps(g_probe.pass_reads, dst, copy.dstOffset,
+                                  copy.dstOffset + copy.size);
+        }
+        g_probe.gap_tag = !src_stream ? "buffer copy (not an upload)"
+                          : read      ? "upload, dependent"
+                                      : "upload, movable";
+    }
+    if (!state.renderpass) {
         return;
     }
     const bool has_draws = g_probe.pass_serial == render_pass_serial;
@@ -674,6 +776,7 @@ void Scheduler::ProbePassEndingClear(const Framebuffer* framebuffer, bool deferr
     const VkExtent2D area = framebuffer->RenderArea();
     const bool same_area =
         area.width == g_probe.pass_area.width && area.height == g_probe.pass_area.height;
+    g_probe.gap_tag = shared == 0 ? "clear of another framebuffer" : "clear overlapping the pass";
     ++g_probe.clears[fmt::format("{}, {} render area, {}", relation, same_area ? "same" : "other",
                                  deferrable ? "deferrable without the open pass"
                                             : "not deferrable")];
@@ -738,6 +841,8 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
         g_probe.pass_images = framebuffer->Images();
         g_probe.pass_num_images = framebuffer->NumImages();
         g_probe.pass_area = framebuffer->RenderArea();
+        g_probe.pass_drawn = false;
+        ++g_probe.passes;
         ProbeCloseWindows(render_pass_serial + 1, false);
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
@@ -880,7 +985,15 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
     }
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
+        if (VideoCommon::Nx2Profile::Enabled() && !g_probe.pass_drawn) {
+            g_probe.gap.insert("a pass without draws ended");
+        }
+        if (!g_probe.gap_tag) {
+            g_probe.gap_tag = "another framebuffer's pass";
+        }
+        ProbeGapNote(location);
     }
+    g_probe.gap_tag = nullptr;
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
@@ -889,7 +1002,11 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, std::source_lo
 void Scheduler::RequestOutsideRenderPassOperationContext(std::source_location location) {
     if (state.renderpass) {
         CountRenderPassEnd(location.file_name(), location.line());
+        if (VideoCommon::Nx2Profile::Enabled() && !g_probe.pass_drawn) {
+            g_probe.gap.insert("a pass without draws ended");
+        }
     }
+    ProbeGapNote(location);
     EndRenderPass();
 }
 
