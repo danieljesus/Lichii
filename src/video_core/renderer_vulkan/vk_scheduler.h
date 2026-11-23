@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -146,6 +147,61 @@ public:
     bool HasFragmentBarrier() const {
         return fragment_barrier.Pending();
     }
+
+    /// Why work left for the end of a render pass ran before the pass would otherwise have ended.
+    enum class PassEndEarly : u32 {
+        Descriptor,           ///< a draw binds a written buffer as a descriptor
+        TexelBuffer,          ///< ... as a texel buffer
+        VertexBuffer,         ///< ... as a vertex buffer
+        IndexBuffer,          ///< ... as an index buffer
+        IndirectDraw,         ///< an indirect draw (its argument buffers are not checked)
+        ConditionalRendering, ///< host conditional rendering reads guest memory
+        Count,
+    };
+
+    /// Work a caller leaves for the end of the active render pass (the query cache's syncs on
+    /// MoltenVK). EndRenderPass calls the hook right after it ends a pass whenever work was queued
+    /// during it, so nothing ends a pass without running it.
+    void SetPassEndHook(std::function<void()> hook) {
+        pass_end_hook = std::move(hook);
+    }
+
+    /// Queues work for the end of the active pass that writes `buffers`; a draw of the pass that
+    /// binds one of them ends the pass first (NotePassEndRead).
+    void QueuePassEndWork(std::span<const VkBuffer> buffers);
+
+    /// A draw of the active pass binds `buffer`: ends the pass, and so runs the queued work, when
+    /// that work writes it.
+    void NotePassEndRead(VkBuffer buffer, PassEndEarly reason) {
+        if (pass_end_queued &&
+            std::find(pass_end_buffers.begin(), pass_end_buffers.end(), buffer) !=
+                pass_end_buffers.end()) {
+            RealizePassEndWork(reason);
+        }
+    }
+
+    /// Ends the active pass now when work is queued for its end.
+    void RealizePassEndWork(PassEndEarly reason);
+
+    /// The vertex and index buffers bound for draws: work for the pass end must not write them,
+    /// since a later draw can read them without binding them again.
+    void NoteVertexBufferBound(u32 index, VkBuffer buffer) {
+        if (index < bound_vertex_buffers.size()) {
+            bound_vertex_buffers[index] = buffer;
+        }
+    }
+    void NoteIndexBufferBound(VkBuffer buffer) {
+        bound_index_buffer = buffer;
+    }
+    [[nodiscard]] bool IsBoundForDraws(VkBuffer buffer) const {
+        return buffer == bound_index_buffer ||
+               std::find(bound_vertex_buffers.begin(), bound_vertex_buffers.end(), buffer) !=
+                   bound_vertex_buffers.end();
+    }
+
+    /// EDEN_NX2_GPU_PROFILE: a query sync recorded in place although its pass-end deferral was
+    /// on (no pass open, the pass ended during the sync, or a vertex or index buffer it writes).
+    static void CountPassEndDirect(bool bound_for_draws);
 
     void NoteRenderPassStores() {
         render_pass_has_stores = true;
@@ -357,6 +413,12 @@ public:
     std::mutex submit_mutex;
 
 private:
+    std::function<void()> pass_end_hook;
+    std::vector<VkBuffer> pass_end_buffers; ///< written by the work queued for the pass end
+    bool pass_end_queued{};
+    std::optional<PassEndEarly> pass_end_early; ///< why the pass is being ended early, if so
+    std::array<VkBuffer, 32> bound_vertex_buffers{};
+    VkBuffer bound_index_buffer{};
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
     u64 record_serial{};    ///< Commands recorded

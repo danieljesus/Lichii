@@ -1850,6 +1850,9 @@ void RasterizerVulkan::DrawIndirect() {
         ++trace_indirect;
     }
     buffer_cache.SetDrawIndirect(&params);
+    // Its argument buffers are bound only once the pass is requested: run work left for the pass
+    // end first, as it could write them.
+    scheduler.RealizePassEndWork(Scheduler::PassEndEarly::IndirectDraw);
     PrepareDraw(params.is_indexed, [this, &params] {
         if (VideoCommon::RenderTrace::SampleFrame(render_trace_frame) && render_trace_draws <= 2048) {
             LOG_DEBUG(Render_Vulkan,

@@ -1469,6 +1469,55 @@ struct QueryCacheRuntimeImpl {
             .pQueueFamilyIndices = nullptr,
         };
         hcr_resolve_buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
+
+        defer_syncs = device.IsMoltenVK();
+        if (defer_syncs) {
+            scheduler.SetPassEndHook([this] { RealizeDeferredSyncs(); });
+        }
+    }
+
+    ~QueryCacheRuntimeImpl() {
+        if (defer_syncs) {
+            scheduler.SetPassEndHook({});
+        }
+    }
+
+    static void RecordSyncBarrier(vk::CommandBuffer cmdbuf, bool is_prebarrier) {
+        static constexpr VkMemoryBarrier READ_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        static constexpr VkMemoryBarrier WRITE_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        if (is_prebarrier) {
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+        } else {
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER_HOST, 0,
+                                   WRITE_BARRIER);
+        }
+    }
+
+    /// The pass end hook: records the syncs left for it, outside the pass that just ended.
+    void RealizeDeferredSyncs() {
+        if (deferred_copies.empty()) {
+            return;
+        }
+        scheduler.Record([copies = std::move(deferred_copies)](vk::CommandBuffer cmdbuf) {
+            RecordSyncBarrier(cmdbuf, true);
+            for (const auto& copy : copies) {
+                copy(cmdbuf);
+            }
+            RecordSyncBarrier(cmdbuf, false);
+        });
+        deferred_copies = {};
     }
 
     VideoCore::RasterizerInterface* rasterizer;
@@ -1503,6 +1552,13 @@ struct QueryCacheRuntimeImpl {
 
     // maxwell3d
     Maxwell3D* maxwell3d;
+
+    // Syncs at a wait for idle while a render pass is open are left for the pass end on tile
+    // based GPUs (Scheduler::QueuePassEndWork), where their barriers would otherwise end the
+    // pass: one pre-barrier, the copies and one post-barrier run when the pass ends.
+    bool defer_syncs{};
+    bool sync_deferred{}; ///< Between Barriers(true) and Barriers(false) of a deferred sync
+    std::vector<std::function<void(vk::CommandBuffer)>> deferred_copies;
 };
 
 QueryCacheRuntime::QueryCacheRuntime(VideoCore::RasterizerInterface* rasterizer, Tegra::MaxwellDeviceMemoryManager& device_memory_, Vulkan::BufferCache& buffer_cache_, const Device& device_, const MemoryAllocator& memory_allocator_, Scheduler& scheduler_, StagingBufferPool& staging_pool_, ComputePassDescriptorQueue& compute_pass_descriptor_queue, DescriptorPool& descriptor_pool, TextureCache& texture_cache_) {
@@ -1555,6 +1611,7 @@ void QueryCacheRuntime::ResumeHostConditionalRendering() {
 
 void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::LookupData object,
                                                                  bool is_equal) {
+    impl->scheduler.RealizePassEndWork(Scheduler::PassEndEarly::ConditionalRendering);
     {
         std::scoped_lock lk(impl->buffer_cache.mutex);
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
@@ -1586,6 +1643,7 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
 
 void QueryCacheRuntime::HostConditionalRenderingCompareBCImpl(DAddr address, bool is_equal,
                                                               bool compare_to_zero) {
+    impl->scheduler.RealizePassEndWork(Scheduler::PassEndEarly::ConditionalRendering);
     VkBuffer to_resolve;
     u32 to_resolve_offset;
     const u32 resolve_size = compare_to_zero ? 8 : 24;
@@ -1748,6 +1806,15 @@ VideoCommon::StreamerInterface* QueryCacheRuntime::GetStreamerInterface(QueryTyp
 }
 
 void QueryCacheRuntime::Barriers(bool is_prebarrier) {
+    if (is_prebarrier) {
+        // Left for the pass end while a pass is open (SyncValues decides per copy).
+        impl->sync_deferred = impl->defer_syncs && impl->scheduler.IsRenderPassActive();
+        if (impl->sync_deferred) {
+            return;
+        }
+    } else if (std::exchange(impl->sync_deferred, false)) {
+        return;
+    }
     static constexpr VkMemoryBarrier READ_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .pNext = nullptr,
@@ -1866,13 +1933,42 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
         src_buffer = base_src_buffer;
     }
 
-    impl->scheduler.RequestOutsideRenderPassOperationContext();
-    impl->scheduler.Record([src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to), vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
+    // A vertex or index buffer stays bound for later draws without a bind to check, so a sync
+    // writing one keeps its place.
+    boost::container::small_vector<VkBuffer, 4> destinations;
+    bool bound_for_draws = false;
+    if (impl->sync_deferred) {
+        for (const auto& destination : impl->buffers_to_upload_to) {
+            destinations.push_back(destination.first);
+            bound_for_draws |= impl->scheduler.IsBoundForDraws(destination.first);
+        }
+    }
+    auto copy = [src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to),
+                 vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
         size_t size = dst_buffers.size();
         for (size_t i = 0; i < size; i++) {
             cmdbuf.CopyBuffer(src_buffer, dst_buffers[i].first, vk_copies[i]);
         }
-    });
+    };
+    if (impl->sync_deferred) {
+        if (impl->scheduler.IsRenderPassActive() && !bound_for_draws) {
+            impl->deferred_copies.emplace_back(std::move(copy));
+            impl->scheduler.QueuePassEndWork(destinations);
+            return;
+        }
+        // In place, with barriers of its own: the pass ended during this sync (an upload of its
+        // destination), or it writes a vertex or index buffer.
+        Scheduler::CountPassEndDirect(bound_for_draws);
+        impl->scheduler.RequestOutsideRenderPassOperationContext();
+        impl->scheduler.Record([copy = std::move(copy)](vk::CommandBuffer cmdbuf) {
+            QueryCacheRuntimeImpl::RecordSyncBarrier(cmdbuf, true);
+            copy(cmdbuf);
+            QueryCacheRuntimeImpl::RecordSyncBarrier(cmdbuf, false);
+        });
+        return;
+    }
+    impl->scheduler.RequestOutsideRenderPassOperationContext();
+    impl->scheduler.Record(std::move(copy));
 }
 
 } // namespace Vulkan

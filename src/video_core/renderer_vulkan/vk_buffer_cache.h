@@ -361,8 +361,12 @@ private:
             // A descriptor range of 0 is invalid; an unmapped binding covers the null buffer.
             const VkDeviceSize range = buffer.IsNull() && size == 0 ? NullBufferSize() : size;
             guest_descriptor_queue.AddBuffer(handle, buffer.DeviceAddress(), offset, range);
+            NoteDescriptorRead(handle);
         }
     }
+
+    /// Scheduler::NotePassEndRead for a descriptor, out of line (the scheduler is incomplete here).
+    void NoteDescriptorRead(VkBuffer buffer);
 
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();

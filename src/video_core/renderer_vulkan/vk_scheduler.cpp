@@ -44,6 +44,14 @@ std::atomic<u64> g_profile_finishes{};
 std::atomic<u64> g_profile_skipped_flushes{};
 std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
+// Work left for the end of a render pass (the query cache's syncs): queued, run at the pass end,
+// run early by reason, recorded in place.
+std::atomic<u64> g_profile_pass_end_queued{};
+std::atomic<u64> g_profile_pass_end_at_end{};
+std::array<std::atomic<u64>, static_cast<size_t>(Scheduler::PassEndEarly::Count)>
+    g_profile_pass_end_early{};
+std::atomic<u64> g_profile_pass_end_direct{};
+std::atomic<u64> g_profile_pass_end_direct_bound{};
 std::mutex g_profile_end_mutex;
 std::map<std::string, u64> g_profile_ends;
 
@@ -79,6 +87,26 @@ void ReportSubmitCounts() {
              static_cast<double>(g_profile_renderpasses.exchange(0)) / seconds,
              static_cast<double>(g_profile_finishes.exchange(0)) / seconds,
              static_cast<double>(g_profile_finish_ns.exchange(0)) / 1e6 / seconds);
+    const u64 queued = g_profile_pass_end_queued.exchange(0);
+    const u64 direct = g_profile_pass_end_direct.exchange(0);
+    if (queued != 0 || direct != 0) {
+        std::array<double, static_cast<size_t>(Scheduler::PassEndEarly::Count)> early{};
+        for (size_t i = 0; i < early.size(); ++i) {
+            early[i] = static_cast<double>(g_profile_pass_end_early[i].exchange(0)) / seconds;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Query syncs left for the pass end per second: {:.1f} queued, {:.1f} passes ran "
+                 "them at their end, {:.1f} ended early for them (descriptor {:.1f}, texel buffer "
+                 "{:.1f}, vertex buffer {:.1f}, index buffer {:.1f}, indirect draw {:.1f}, "
+                 "conditional rendering {:.1f}); {:.1f} recorded in place ({:.1f} for a bound "
+                 "vertex or index buffer)",
+                 static_cast<double>(queued) / seconds,
+                 static_cast<double>(g_profile_pass_end_at_end.exchange(0)) / seconds,
+                 early[0] + early[1] + early[2] + early[3] + early[4] + early[5], early[0],
+                 early[1], early[2], early[3], early[4], early[5],
+                 static_cast<double>(direct) / seconds,
+                 static_cast<double>(g_profile_pass_end_direct_bound.exchange(0)) / seconds);
+    }
     std::vector<std::pair<u64, std::string>> ends;
     {
         std::scoped_lock lock{g_profile_end_mutex};
@@ -204,6 +232,31 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     return signal_value;
+}
+
+void Scheduler::QueuePassEndWork(std::span<const VkBuffer> buffers) {
+    ASSERT(state.renderpass);
+    pass_end_queued = true;
+    pass_end_buffers.insert(pass_end_buffers.end(), buffers.begin(), buffers.end());
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        g_profile_pass_end_queued.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void Scheduler::RealizePassEndWork(PassEndEarly reason) {
+    if (!pass_end_queued) {
+        return;
+    }
+    pass_end_early = reason;
+    RequestOutsideRenderPassOperationContext();
+}
+
+void Scheduler::CountPassEndDirect(bool bound_for_draws) {
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        g_profile_pass_end_direct.fetch_add(1, std::memory_order_relaxed);
+        g_profile_pass_end_direct_bound.fetch_add(bound_for_draws ? 1 : 0,
+                                                  std::memory_order_relaxed);
+    }
 }
 
 void Scheduler::CountSkippedFlush() {
@@ -1341,6 +1394,22 @@ void Scheduler::EndRenderPass()
 
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
+        if (pass_end_queued) {
+            // Outside the pass now: the work left for its end goes here, before anything that
+            // follows the pass end.
+            if (VideoCommon::Nx2Profile::Enabled()) {
+                if (pass_end_early) {
+                    g_profile_pass_end_early[static_cast<size_t>(*pass_end_early)].fetch_add(
+                        1, std::memory_order_relaxed);
+                } else {
+                    g_profile_pass_end_at_end.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            pass_end_queued = false;
+            pass_end_buffers.clear();
+            pass_end_hook();
+        }
+        pass_end_early.reset();
     }
 
 

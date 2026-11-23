@@ -474,8 +474,13 @@ StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool def
     return staging_pool.Request(size, MemoryUsage::Download, deferred);
 }
 
+void BufferCacheRuntime::NoteDescriptorRead(VkBuffer buffer) {
+    scheduler.NotePassEndRead(buffer, Scheduler::PassEndEarly::Descriptor);
+}
+
 void BufferCacheRuntime::BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
                                            VideoCore::Surface::PixelFormat format) {
+    scheduler.NotePassEndRead(buffer.Handle(), Scheduler::PassEndEarly::TexelBuffer);
     const bool is_null = buffer.IsNull();
     if (is_null && device.HasNullDescriptor()) {
         guest_descriptor_queue.AddTexelBuffer(VK_NULL_HANDLE, 0, 0, 0, VK_FORMAT_R8_UNORM);
@@ -803,6 +808,8 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
 void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,
                                          u32 base_vertex, u32 num_indices, VkBuffer buffer,
                                          u32 offset, [[maybe_unused]] u32 size) {
+    scheduler.NotePassEndRead(buffer, Scheduler::PassEndEarly::IndexBuffer);
+    scheduler.NoteIndexBufferBound(buffer);
     VkIndexType vk_index_type = MaxwellToVK::IndexFormat(index_format);
     VkDeviceSize vk_offset = offset;
     VkBuffer vk_buffer = buffer;
@@ -878,6 +885,8 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
     if (index >= device.GetMaxVertexInputBindings()) {
         return;
     }
+    scheduler.NotePassEndRead(buffer, Scheduler::PassEndEarly::VertexBuffer);
+    scheduler.NoteVertexBufferBound(index, buffer);
     if (buffer != VK_NULL_HANDLE && size != 0 && IsVertexRepacked(index)) {
         const auto repacked =
             vertex_repack_pass->Assemble(buffer, offset, size, u64{offset} + size);
@@ -912,6 +921,8 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     boost::container::static_vector<VkBuffer, VideoCommon::NUM_VERTEX_BUFFERS> buffer_handles(bindings.buffers.size());
     for (u32 i = 0; i < bindings.buffers.size(); ++i) {
         auto handle = bindings.buffers[i]->Handle();
+        scheduler.NotePassEndRead(handle, Scheduler::PassEndEarly::VertexBuffer);
+        scheduler.NoteVertexBufferBound(bindings.min_index + i, handle);
         if (handle == VK_NULL_HANDLE) {
             bindings.offsets[i] = 0;
             bindings.sizes[i] = VK_WHOLE_SIZE;
