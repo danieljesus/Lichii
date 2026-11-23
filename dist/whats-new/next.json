@@ -1,35 +1,30 @@
 {
-  "summary": "Sound that survives a headset switch, a faster Apple Silicon path, and safer file loading.",
+  "summary": "A shader cache that survives on a Mac, a safer cache file, and upstream's Mod Store.",
   "changes": [
     {
-      "icon": "audio",
-      "title": "Sound comes back by itself",
-      "body": "When the output device is removed and returns (a USB headset moved to another computer, for example), the sound resumes after a few seconds, and closing the game no longer stalls."
-    },
-    {
       "icon": "cpu",
-      "title": "Faster on Apple Silicon",
-      "body": "Tensor operations run on the GPU's cooperative matrices, with a MoltenVK built for it. Kokiri Forest on an M6 goes from about 30 to about 34 FPS."
-    },
-    {
-      "icon": "clock",
-      "title": "Ocarina of Time above 60 FPS",
-      "body": "FPS Unlock fixes Epona's fence jump, the day/night clock and the Deku Tree webs. The game no longer freezes after closing the R1 menu."
+      "title": "Shader cache kept on a Mac",
+      "body": "On macOS the graphics driver's shader cache is no longer thrown away the second time you start a game. It loads, and the game is on screen a few seconds sooner. The first start after updating prepares the shaders once more."
     },
     {
       "icon": "download",
-      "title": "Shaders",
-      "body": "Precompile All Shaders can be turned on for a game from its right-click menu. A shader cache from an earlier build keeps working; a few shaders are built again the first time the game draws them."
+      "title": "A safer shader cache file",
+      "body": "Saving the driver's shader cache while a shader is being built no longer replaces a good file with an empty one, and a shader precache is marked as done only once its work is on disk."
+    },
+    {
+      "icon": "layers",
+      "title": "Precompiled shaders from another device",
+      "body": "A precompiled shader store made on a different kind of device (a PC's on a Mac, for example) now says so in the log, instead of counting those shaders as ready."
     },
     {
       "icon": "apps",
-      "title": "Switch 2 games in HOME and better Edition support",
-      "body": "Launch games from HOME without installing them. Lichii better detects and launches Switch 2 Editions, applies matching upgrade packs, and keeps update information in NUPs."
+      "title": "Mod Store",
+      "body": "From Lichii nx2: browse and install mods from the desktop app."
     },
     {
-      "icon": "bug",
-      "title": "Damaged files",
-      "body": "KIP, NRO and NSO files are checked before they are loaded, and verifying a damaged NCA or NUP no longer hangs or runs out of memory."
+      "icon": "clock",
+      "title": "Also from nx2",
+      "body": "Large ASTC texture arrays are decoded in batches, FlyHigh frame generation is available as a Windows opt-in, and a hung GPU driver can be reported instead of freezing the app (opt-in)."
     },
     {
       "icon": "sparkles",
