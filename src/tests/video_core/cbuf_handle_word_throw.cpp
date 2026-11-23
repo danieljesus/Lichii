@@ -13,8 +13,9 @@
 
 namespace {
 
-/// A compute program's environment whose constant buffer word (2, 0x10) cannot be read, as a read
-/// from an unbound bank throws (GraphicsEnvironment, ComputeEnvironment).
+/// A compute program's environment whose constant buffer word (2, 0x10) cannot be read. An override
+/// of ReadCbufValue may throw, as upstream nx2's do for a root table offset that resolves a
+/// resource and for a compute read of a constant buffer the launch does not enable.
 class ThrowingEnvironment final : public VideoCommon::GenericEnvironment {
 public:
     ThrowingEnvironment() {
