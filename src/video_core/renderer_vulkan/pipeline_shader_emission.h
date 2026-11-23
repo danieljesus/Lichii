@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <span>
 #include <vector>
 
@@ -28,6 +29,19 @@ inline std::vector<u32> EmitPipelineShader(const Shader::Profile& profile,
     }
     std::vector<u32> code{
         Shader::Backend::SPIRV::EmitSPIRV(*used, runtime_info, program, binding)};
+    // LOCAL ONLY: FNV-1a of this emission and of the reference, for a comparison across builds.
+    if (std::getenv("LICHII_EMIT_PROBE")) {
+        const auto fnv = [](std::span<const u32> words) {
+            u64 h = 0xcbf29ce484222325ULL;
+            for (const u32 w : words) {
+                h = (h ^ w) * 0x100000001b3ULL;
+            }
+            return h;
+        };
+        LOG_INFO(Render_Vulkan, "EMITPROBE shader={:016x} stage={} words={} code={:016x} reference={:016x}",
+                 shader_hash, static_cast<u32>(program.stage), code.size(), fnv(code),
+                 reference.empty() ? u64{0} : fnv(reference));
+    }
     if (!reference.empty() && !std::ranges::equal(code, reference)) {
         LOG_ERROR(Render_Vulkan,
                   "Nx2Perf async_pipelines: shader {:016x} worker SPIR-V differs; "
