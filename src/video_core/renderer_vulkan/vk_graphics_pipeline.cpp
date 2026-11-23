@@ -1914,7 +1914,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             const char* const value{std::getenv("EDEN_NX2_MESH_HOIST")};
             return value == nullptr || value[0] != '0';
         }()};
-        const bool hoisted{hoist_enabled && IsBuilt() && !mesh_reads_target &&
+        // A program that writes buffers or images itself stays in its place too: an earlier draw
+        // of the pass could read them.
+        const bool hoisted{hoist_enabled && IsBuilt() && !writes_storage && !mesh_reads_target &&
                            scheduler.TryHoist(dispatch)};
         if (!hoisted) {
             scheduler.RequestOutsideRenderPassOperationContext();
@@ -1932,12 +1934,15 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 scheduler.OpenHoistSlot();
             }
         }
-        static u64 dispatches{}, hoisted_dispatches{};
+        static u64 dispatches{}, hoisted_dispatches{}, writing_dispatches{};
         ++dispatches;
         hoisted_dispatches += hoisted ? 1 : 0;
+        writing_dispatches += writes_storage ? 1 : 0;
         if (dispatches % 2000 == 0) {
-            LOG_INFO(Render_Vulkan, "Mesh emulation dispatches: {} ({} hoisted before their pass)",
-                     dispatches, hoisted_dispatches);
+            LOG_INFO(Render_Vulkan,
+                     "Mesh emulation dispatches: {} ({} hoisted before their pass, {} of programs "
+                     "that write storage)",
+                     dispatches, hoisted_dispatches, writing_dispatches);
         }
     }
     const u64 render_pass = deferred != nullptr ? scheduler.RenderPassSerial() : 0;
