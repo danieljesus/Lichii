@@ -714,7 +714,11 @@ TEST_CASE("An input or sysmix stream opens on the configured device or, when it 
         CHECK(StandbySinkStream::ChooseDevice(type, 0, true, false, true) == Choice::Configured);
         // Not listed: the default one, as the sink chose before.
         CHECK(StandbySinkStream::ChooseDevice(type, 0, false, false, false) == Choice::Default);
-        // They are not reopened; were they, the same holds.
+        // Input and sysmix streams are never reopened (they do not stand in: see "A lost input or
+        // sysmix stream is not ready and is not reopened, as before"), so their only open is
+        // attempt 0. These rows only pin that ChooseDevice ignores the attempt and the published
+        // device for them: were a later change to reopen them, they would still never take the
+        // default one in place of a listed configured device.
         for (const u32 attempt : {1U, waits + 1}) {
             INFO("attempt " << attempt);
             CHECK(StandbySinkStream::ChooseDevice(type, attempt, true, true, false) ==
