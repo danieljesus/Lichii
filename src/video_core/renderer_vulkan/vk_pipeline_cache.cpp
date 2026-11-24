@@ -4547,8 +4547,16 @@ void PipelineCache::TestNoteTranslation(u64 key_hash, size_t stage, u64 shader_h
     for (const std::string& entry : reads) {
         digest = Common::CityHash64WithSeed(entry.data(), entry.size(), digest);
     }
-    LOG_INFO(Render_Vulkan, "TEST xlate key={:016x} stage={} shader={:016x} reads={:016x} n={}",
-             key_hash, stage, shader_hash, digest, reads.size());
+    std::string all;
+    for (const std::string& entry : reads) {
+        if (all.size() + entry.size() > 6000) {
+            all += " ...";
+            break;
+        }
+        all += ' ' + entry;
+    }
+    LOG_INFO(Render_Vulkan, "TEST xlate key={:016x} stage={} shader={:016x} reads={:016x} n={}:{}",
+             key_hash, stage, shader_hash, digest, reads.size(), all);
     std::scoped_lock lock{test_xlate_mutex};
     const auto [it, first] = test_xlate_first.try_emplace(shader_hash, key_hash, reads);
     if (first || it->second.second == reads) {
