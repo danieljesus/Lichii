@@ -677,7 +677,15 @@ TEST_CASE("A stream with a configured device chooses it, waits for it, or takes 
     using AudioCore::Sink::StandbySinkStream;
     using Choice = StandbySinkStream::DeviceChoice;
     constexpr u32 waits = StandbySinkStream::ConfiguredDeviceAttempts;
-    const auto choose = &StandbySinkStream::ChooseDevice;
+    // Renderer and audio out streams, which stand in.
+    const auto choose = [](u32 attempt, bool listed, bool published_on_configured,
+                           bool start_failed) {
+        const Choice render = StandbySinkStream::ChooseDevice(
+            StreamType::Render, attempt, listed, published_on_configured, start_failed);
+        CHECK(StandbySinkStream::ChooseDevice(StreamType::Out, attempt, listed,
+                                              published_on_configured, start_failed) == render);
+        return render;
+    };
 
     // The first open: the configured device, or the default one.
     CHECK(choose(0, true, false, false) == Choice::ConfiguredThenDefault);
@@ -702,6 +710,33 @@ TEST_CASE("A stream with a configured device chooses it, waits for it, or takes 
         CHECK(choose(attempt, false, false, false) == Choice::Default);
         CHECK(choose(attempt, true, false, false) == Choice::ConfiguredThenDefault);
         CHECK(choose(attempt, true, false, true) == Choice::Default);
+    }
+}
+
+TEST_CASE("An input or sysmix stream opens on the configured device or, when it is not listed, the "
+          "default one, and never on another one in its place",
+          "[audio_core][stream_standby]") {
+    using AudioCore::Sink::StandbySinkStream;
+    using Choice = StandbySinkStream::DeviceChoice;
+    constexpr u32 waits = StandbySinkStream::ConfiguredDeviceAttempts;
+    for (const StreamType type : {StreamType::In, StreamType::Sysmix}) {
+        INFO("type " << static_cast<int>(type));
+        // Listed: only that device, so one that does not open leaves the stream not ready, as
+        // before the stand-in, instead of opening the default microphone or output.
+        CHECK(StandbySinkStream::ChooseDevice(type, 0, true, false, false) == Choice::Configured);
+        CHECK(StandbySinkStream::ChooseDevice(type, 0, true, false, true) == Choice::Configured);
+        // Not listed: the default one, as the sink chose before.
+        CHECK(StandbySinkStream::ChooseDevice(type, 0, false, false, false) == Choice::Default);
+        // They are not reopened; were they, the same holds.
+        for (const u32 attempt : {1U, waits + 1}) {
+            INFO("attempt " << attempt);
+            CHECK(StandbySinkStream::ChooseDevice(type, attempt, true, true, false) ==
+                  Choice::Configured);
+            CHECK(StandbySinkStream::ChooseDevice(type, attempt, true, true, true) ==
+                  Choice::Configured);
+            CHECK(StandbySinkStream::ChooseDevice(type, attempt, false, true, false) ==
+                  Choice::Default);
+        }
     }
 }
 

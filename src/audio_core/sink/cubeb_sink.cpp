@@ -146,7 +146,7 @@ private:
         }
         // Not listed also when the enumeration failed while devices come and go.
         const DeviceChoice choice =
-            configured ? ChooseDevice(attempt, device != nullptr, published_on_configured,
+            configured ? ChooseDevice(type, attempt, device != nullptr, published_on_configured,
                                       configured_start_failed)
                        : DeviceChoice::Default;
         if (choice == DeviceChoice::Wait) {

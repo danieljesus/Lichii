@@ -55,9 +55,15 @@ struct ComScope {
 };
 } // Anonymous namespace
 
-StandbySinkStream::DeviceChoice StandbySinkStream::ChooseDevice(u32 attempt, bool listed,
+StandbySinkStream::DeviceChoice StandbySinkStream::ChooseDevice(StreamType type, u32 attempt,
+                                                                bool listed,
                                                                 bool published_on_configured,
                                                                 bool start_failed) {
+    if (!StandsIn(type)) {
+        // A microphone the user chose that does not open is not replaced by another one, nor a
+        // sysmix output by another output: their owners capture silence or fail the guest's open.
+        return listed ? DeviceChoice::Configured : DeviceChoice::Default;
+    }
     const bool may_take_default =
         attempt == 0 || attempt > ConfiguredDeviceAttempts || !published_on_configured;
     if (!listed) {
