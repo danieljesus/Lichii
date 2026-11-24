@@ -11,7 +11,6 @@
 #include <cstring>
 #include <string>
 #include <thread>
-#include <utility>
 #include <vector>
 
 #include "common/adpf.h"
@@ -642,8 +641,10 @@ bool MacThreadQosEnabled() {
 
 void SetCurrentThreadToPipelineBuilds() {
 #ifdef __APPLE__
-    // TEST ONLY: with LICHII_MACOS_THREAD_QOS=1 the pipeline build workers ask for user-initiated
-    // QoS, which their requests to MTLCompilerService carry.
+    // TEST ONLY (LICHII_MACOS_THREAD_QOS=1): the pipeline build workers ask for user-initiated QoS,
+    // which their requests to MTLCompilerService carry (an XPC service takes the requester's QoS).
+    // Every other thread keeps pthread_setschedparam, which opts a thread out of QoS for good: a
+    // later pthread_set_qos_class_self_np fails with EPERM, so this must be the thread's first call.
     if (MacThreadQosEnabled() && pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) == 0) {
         return;
     }
@@ -693,27 +694,6 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
                   GetLastErrorMsg());
     }
 #else
-#ifdef __APPLE__
-    // TEST ONLY (LICHII_MACOS_THREAD_QOS=1): a QoS class instead of pthread_setschedparam, which
-    // opts the thread out of QoS for good (a later QoS request fails with EPERM). XPC services
-    // such as MTLCompilerService take the requester's QoS; a thread without one is served at the
-    // default. The classes keep today's order: 47 and 39 above the default 31, 20 below it.
-    if (MacThreadQosEnabled()) {
-        const auto [qos, relative] = [new_priority]() -> std::pair<qos_class_t, int> {
-            switch (new_priority) {
-            case ThreadPriority::Low: return {QOS_CLASS_UTILITY, 0};
-            case ThreadPriority::Normal: return {QOS_CLASS_DEFAULT, -8};
-            case ThreadPriority::High: return {QOS_CLASS_DEFAULT, 0};
-            case ThreadPriority::VeryHigh: return {QOS_CLASS_USER_INTERACTIVE, -8};
-            case ThreadPriority::Critical: return {QOS_CLASS_USER_INTERACTIVE, 0};
-            default: return {QOS_CLASS_DEFAULT, 0};
-            }
-        }();
-        if (pthread_set_qos_class_self_np(qos, relative) == 0) {
-            return;
-        }
-    }
-#endif
     const s32 max_prio = sched_get_priority_max(SCHED_OTHER);
     const s32 min_prio = sched_get_priority_min(SCHED_OTHER);
     if (max_prio > min_prio) {
