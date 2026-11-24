@@ -6046,7 +6046,10 @@ void RasterizerVulkan::FlushWork(bool ends_pass) {
         legacy_budget = forced_draws != 0 ? forced_draws : (device.IsMoltenVK() ? 128U : 4096U);
     }
     bool pass_boundary = false;
-    if (native && !android && draw_counter + 1 >= budget / 2 && draw_counter + 1 < budget) {
+    // #2481's early submit at a render-pass boundary stays on MoltenVK, where it was measured to
+    // gain. On NVIDIA (Windows) it adds submissions with no measured fps difference either way.
+    if (native && !android && device.IsMoltenVK() && draw_counter + 1 >= budget / 2 &&
+        draw_counter + 1 < budget) {
         pass_boundary = ends_pass || scheduler.IsBetweenRenderPasses() ||
                         (texture_cache.RenderTargetsDirty() && scheduler.IsRenderPassActive());
     }
