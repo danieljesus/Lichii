@@ -1049,6 +1049,13 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_user_clip_distances = device.GetMaxUserClipDistances()
     };
+    // TEST ONLY: see Profile::test_drop_no_contraction_fragment_compute.
+    if (driver_id == VK_DRIVER_ID_MOLTENVK) {
+        const char* const drop = std::getenv("EDEN_NX2_TEST_MVK_DROP_NO_CONTRACTION");
+        profile.test_drop_no_contraction_fragment_compute = drop != nullptr && drop[0] == '1';
+        LOG_INFO(Render_Vulkan, "TEST MoltenVK NoContraction in fragment and compute: {}",
+                 profile.test_drop_no_contraction_fragment_compute ? "dropped" : "kept");
+    }
     profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
     if (profile.compute_subgroups_are_guest_warps && profile.support_compute_full_subgroups &&

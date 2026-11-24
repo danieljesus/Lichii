@@ -10,6 +10,10 @@ namespace Shader::Backend::SPIRV {
 namespace {
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     const auto flags{inst->Flags<IR::FpControl>()};
+    if (ctx.profile.test_drop_no_contraction_fragment_compute && // TEST ONLY
+        (ctx.stage == Stage::Fragment || ctx.stage == Stage::Compute)) {
+        return op;
+    }
     if (flags.no_contraction) {
         ctx.Decorate(op, spv::Decoration::NoContraction);
     }

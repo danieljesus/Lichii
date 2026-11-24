@@ -165,6 +165,10 @@ struct Profile {
 
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};
+    /// TEST ONLY (EDEN_NX2_TEST_MVK_DROP_NO_CONTRACTION=1 on MoltenVK): fragment and compute stages
+    /// leave guest FP32/FP16/FP64 add, multiply and fma undecorated, so SPIRV-Cross writes plain
+    /// operators instead of calls to its [[clang::optnone]] precise helpers. Other stages keep it.
+    bool test_drop_no_contraction_fragment_compute{};
 
     bool SupportsSubgroupStage(Stage stage) const {
         return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;
