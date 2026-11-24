@@ -244,7 +244,7 @@ TEST_CASE("A pointer selected among the buffers declares the VariablePointers ca
     // the same structure") in OoT's modules.
     Fixture fixture;
     Profile profile{};
-    profile.supported_spirv = 0x00010300;
+    profile.supported_spirv = 0x00010600;
     profile.support_int64 = true;
     profile.support_descriptor_aliasing = true;
     profile.unified_descriptor_binding = true;
