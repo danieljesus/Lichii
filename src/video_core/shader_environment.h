@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <vector>
@@ -109,6 +110,11 @@ public:
     }
 
     [[nodiscard]] u64 CalculateHash() const;
+
+    /// TEST ONLY: what the translation read from the guest, sorted, one "kind:key=value" per
+    /// entry (texture types and formats, constant buffer words and how they were read, storage
+    /// pointer answers, replaced constants, sizes and state), for the translation log.
+    [[nodiscard]] std::vector<std::string> TestDescribeReads() const;
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 

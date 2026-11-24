@@ -223,6 +223,14 @@ private:
     void TestNoteGuardKept(const void* pipeline, u64 hash, bool compute);
     void TestNoteRan(const void* pipeline);
     void TestReportSkips();
+    /// TEST ONLY (EDEN_NX2_TEST_XLATE_LOG=1): per translation, the pipeline key, stage, shader
+    /// hash and a digest of what it read from the guest; a shader translated again with other
+    /// reads in the same boot is logged with the entries that differ.
+    bool test_xlate_log{};
+    std::mutex test_xlate_mutex;
+    std::unordered_map<u64, std::pair<u64, std::vector<std::string>>> test_xlate_first;
+    void TestNoteTranslation(u64 key_hash, size_t stage, u64 shader_hash,
+                             const Shader::Environment& env);
 
     /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
     /// pointers whatever they hold now. `evicted`: a pipeline of this key was evicted.

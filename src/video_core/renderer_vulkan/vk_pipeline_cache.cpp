@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <iterator>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -901,6 +902,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         test_skip.draws = only != "compute";
         test_skip.compute = only != "draw";
         test_skip.log = test_skip.log || test_skip.force_first > 0;
+    }
+    if (const char* const value = std::getenv("EDEN_NX2_TEST_XLATE_LOG")) {
+        test_xlate_log = value[0] == '1';
+        LOG_INFO(Render_Vulkan, "TEST translation log: {}", test_xlate_log ? "on" : "off");
     }
     if (test_skip.log) {
         LOG_INFO(Render_Vulkan, "TEST skip probe: logging on, forced skips {} per pipeline ({}{})",
@@ -4528,6 +4533,45 @@ void PipelineCache::TestReportSkips() {
              pipelines);
 }
 
+// TEST ONLY: translation log. Translations run on several threads.
+void PipelineCache::TestNoteTranslation(u64 key_hash, size_t stage, u64 shader_hash,
+                                        const Shader::Environment& env) {
+    const auto* const generic = dynamic_cast<const VideoCommon::GenericEnvironment*>(&env);
+    if (!generic) {
+        LOG_INFO(Render_Vulkan, "TEST xlate key={:016x} stage={} shader={:016x} reads=file", key_hash,
+                 stage, shader_hash);
+        return;
+    }
+    std::vector<std::string> reads = generic->TestDescribeReads();
+    u64 digest = 0;
+    for (const std::string& entry : reads) {
+        digest = Common::CityHash64WithSeed(entry.data(), entry.size(), digest);
+    }
+    LOG_INFO(Render_Vulkan, "TEST xlate key={:016x} stage={} shader={:016x} reads={:016x} n={}",
+             key_hash, stage, shader_hash, digest, reads.size());
+    std::scoped_lock lock{test_xlate_mutex};
+    const auto [it, first] = test_xlate_first.try_emplace(shader_hash, key_hash, reads);
+    if (first || it->second.second == reads) {
+        return;
+    }
+    // Entries only one of the two translations has, as "-" (first) and "+" (this one).
+    std::vector<std::string> only_first, only_now;
+    std::ranges::set_difference(it->second.second, reads, std::back_inserter(only_first));
+    std::ranges::set_difference(reads, it->second.second, std::back_inserter(only_now));
+    std::string diff;
+    for (size_t i = 0; i < only_first.size() && i < 12; ++i) {
+        diff += " -" + only_first[i];
+    }
+    for (size_t i = 0; i < only_now.size() && i < 12; ++i) {
+        diff += " +" + only_now[i];
+    }
+    LOG_INFO(Render_Vulkan,
+             "TEST xlate DIFFERS shader={:016x} stage={} key={:016x} first key={:016x}: {} only "
+             "first, {} only now:{}",
+             shader_hash, stage, key_hash, it->second.first, only_first.size(), only_now.size(),
+             diff);
+}
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::RebuildGraphicsPipeline(KeptGraphicsStages kept) {
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     for (size_t stage = 0; stage < infos.size(); ++stage) {
@@ -4654,10 +4698,16 @@ bool PipelineCache::TranslateGraphicsStages(ShaderPools& pools, const GraphicsPi
         if (!uses_vertex_a || index != 1) {
             // Normal path
             programs[index] = translate();
+            if (test_xlate_log) { // TEST ONLY
+                TestNoteTranslation(hash, index, key.unique_hashes[index], env);
+            }
         } else {
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
             auto program_vb{translate()};
+            if (test_xlate_log) { // TEST ONLY
+                TestNoteTranslation(hash, index, key.unique_hashes[index], env);
+            }
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
             // Each half fit its texture arrays to the stage limits on its own; joined, they are
             // one stage.
@@ -5594,6 +5644,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
 
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    if (test_xlate_log) { // TEST ONLY
+        TestNoteTranslation(hash, 6, key.unique_hash, env); // 6: compute
+    }
     // Compute has eight constant buffers. The Ampere lowering reads NVN2's root tables (banks
     // 24-31) from bank 17, which only the 3D engine provides.
     if (program.info.constant_buffer_mask >> Tegra::Engines::KeplerCompute::NumConstBuffers) {

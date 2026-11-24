@@ -400,6 +400,34 @@ u64 GenericEnvironment::CalculateHash() const {
     return Common::CityHash64(data.get(), size);
 }
 
+std::vector<std::string> GenericEnvironment::TestDescribeReads() const { // TEST ONLY
+    std::vector<std::string> out;
+    for (const auto& [handle, type] : texture_types) {
+        out.push_back(fmt::format("tex:{:#x}={}", handle, static_cast<int>(type)));
+    }
+    for (const auto& [handle, format] : texture_pixel_formats) {
+        out.push_back(fmt::format("fmt:{:#x}={}", handle, static_cast<int>(format)));
+    }
+    for (const auto& [key, value] : cbuf_values) {
+        const auto read = cbuf_reads.find(key);
+        out.push_back(fmt::format("cbuf:{}:{:#x}={:#x}/{}", key >> 32, static_cast<u32>(key), value,
+                                  read == cbuf_reads.end() ? 0 : read->second));
+    }
+    for (const auto& [key, type] : storage_pointer_types) {
+        out.push_back(fmt::format("ssbo:{}:{:#x}={}", key >> 32, static_cast<u32>(key), type));
+    }
+    for (const auto& [key, constant] : cbuf_replacements) {
+        out.push_back(fmt::format("repl:{}:{:#x}={}", key >> 32, static_cast<u32>(key),
+                                  static_cast<int>(constant)));
+    }
+    out.push_back(fmt::format("size:local={} shared={} bound={} wg={}x{}x{} vp={} hle={}",
+                              local_memory_size, shared_memory_size, texture_bound,
+                              workgroup_size[0], workgroup_size[1], workgroup_size[2],
+                              viewport_transform_state, has_hle_engine_state));
+    std::ranges::sort(out);
+    return out;
+}
+
 void GenericEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
     DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
 }
