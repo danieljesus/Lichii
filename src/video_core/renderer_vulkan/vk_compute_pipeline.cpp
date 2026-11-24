@@ -690,15 +690,40 @@ ComputePipeline::ConfigureResult ComputePipeline::Configure(
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
 
     // Decided before the bindings below mark the outputs GPU-written.
-    if (!is_built.load(std::memory_order::relaxed) && kepler_compute.IsNativeMode()) {
+    // TEST ONLY: the output addresses of this dispatch, for the async-skip probe's log.
+    const auto test_outputs = [&] {
+        boost::container::small_vector<u64, 8> addrs;
+        buffer_cache.ForEachBoundBuffer(true, [&](u32, bool storage, u32, bool written,
+                                                  const auto& binding, u32, const auto*, u32) {
+            if (storage && written) {
+                addrs.push_back(binding.device_addr);
+            }
+        });
+        for (const VideoCommon::ImageViewId id : written_images) {
+            addrs.push_back(texture_cache.GetImageView(id).GpuAddr());
+        }
+        return addrs;
+    };
+    const bool test_forced = pipelines.TestForceDispatch(*this); // TEST ONLY
+    if ((test_forced || !is_built.load(std::memory_order::relaxed)) &&
+        kepler_compute.IsNativeMode()) {
         const bool images_hold_shader_writes =
             std::ranges::all_of(written_images, [&](VideoCommon::ImageViewId id) {
                 return texture_cache.StorageViewHoldsShaderWrites(id);
             });
-        if (pipelines.SkipUnbuiltDispatch(
-                *this, images_hold_shader_writes && buffer_cache.ComputeWritesHoldGpuData())) {
+        const bool holds = images_hold_shader_writes && buffer_cache.ComputeWritesHoldGpuData();
+        std::string outputs;
+        if (pipelines.TestSkipLogging()) {
+            const auto addrs = test_outputs();
+            outputs = pipelines.TestDescribeOutputs(addrs);
+        }
+        if (pipelines.SkipUnbuiltDispatch(*this, holds, test_forced, outputs)) {
             return ConfigureResult::Skipped;
         }
+    }
+    if (pipelines.TestSkipLogging() && kepler_compute.IsNativeMode()) {
+        const auto addrs = test_outputs();
+        pipelines.TestNoteDispatchRan(*this, addrs);
     }
 
     part.emplace(Zone::ComputeBuffers);

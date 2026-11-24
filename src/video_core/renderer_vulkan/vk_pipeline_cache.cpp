@@ -888,6 +888,25 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background) {
     canonical_native_keys =
         Settings::values.precompiled_prepare.GetValue() != Settings::PrecompiledPrepare::Never;
+    // TEST ONLY: async-skip probe (see PipelineCache::TestSkipLogging).
+    if (const char* const value = std::getenv("EDEN_NX2_TEST_SKIP_LOG")) {
+        test_skip.log = value[0] == '1';
+    }
+    if (const char* const value = std::getenv("EDEN_NX2_TEST_FORCE_SKIP_FIRST")) {
+        const std::string_view text{value};
+        const auto colon = text.find(':');
+        const std::string_view count = text.substr(0, colon);
+        std::from_chars(count.data(), count.data() + count.size(), test_skip.force_first);
+        const std::string_view only = colon == std::string_view::npos ? "" : text.substr(colon + 1);
+        test_skip.draws = only != "compute";
+        test_skip.compute = only != "draw";
+        test_skip.log = test_skip.log || test_skip.force_first > 0;
+    }
+    if (test_skip.log) {
+        LOG_INFO(Render_Vulkan, "TEST skip probe: logging on, forced skips {} per pipeline ({}{})",
+                 test_skip.force_first, test_skip.draws ? "draws " : "",
+                 test_skip.compute ? "compute" : "");
+    }
     // A sixty-fourth of the RAM (16 GB: 256 MB), about 25 KB per evicted pipeline
     const u64 ram = Common::GetMemInfo().TotalPhysicalMemory;
     kept_stages = decltype(kept_stages){ram != 0 ? ram / 64 : u64{256} << 20};
@@ -4097,6 +4116,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
 
 void PipelineCache::TickFrame() {
     ++frame_count;
+    if (test_skip.log && frame_count >= test_skip_report_frame + 1200) { // TEST ONLY
+        TestReportSkips();
+        test_skip_report_frame = frame_count;
+    }
     // What the background preparation kept since the last frame serves the next draws.
     TakePrecompiledPublished();
     native_wait_budget_us =
@@ -4266,10 +4289,14 @@ bool PipelineCache::SkipPendingMeshDraw() const {
 /// draw may be skipped while it builds. Each nullptr returned for an unbuilt pipeline is counted
 /// for the log.
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexcept {
-    if (pipeline->IsBuilt()) {
+    // TEST ONLY: a built pipeline counts as unbuilt for its first forced skips.
+    const bool test_forced = test_skip.draws && TestForce(pipeline, false);
+    if (pipeline->IsBuilt() && !test_forced) {
+        TestNoteRan(pipeline);
         return pipeline;
     }
     if (!use_asynchronous_shaders) {
+        TestNoteRan(pipeline);
         return pipeline;
     }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
@@ -4300,6 +4327,20 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
     const bool can_discard = CanDiscardPendingDraw(
         native, depth_tested, draw_state.draw_element_count, draw_state.draw_element_count,
         native && mode != NativePendingMode::Wait);
+    std::string test_what;
+    if (test_skip.log) { // TEST ONLY
+        test_what = fmt::format("rt0={:#x} {}x{} depth_tested={}", regs.rt[0].Address(),
+                                regs.rt[0].width, regs.rt[0].height, depth_tested);
+    }
+    if (test_forced) { // TEST ONLY: skip where the policy may, without waiting for the build.
+        if (can_discard) {
+            TestNoteSkip(pipeline, pipeline->Key().Hash(), false, true, test_what);
+            return nullptr;
+        }
+        TestNoteGuardKept(pipeline, pipeline->Key().Hash(), false);
+        TestNoteRan(pipeline);
+        return pipeline;
+    }
     bool discard = can_discard;
     if (native) {
         switch (DecideNativePending(mode, can_discard, native_wait_budget_us)) {
@@ -4317,6 +4358,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
                                  });
             LogBoundedWaits();
             if (built) {
+                TestNoteRan(pipeline);
                 return pipeline;
             }
             discard = true;
@@ -4326,15 +4368,31 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
     }
     const bool skip_mesh = SkipPendingMeshDraw();
     if (discard || skip_mesh) {
+        if (test_skip.log) {
+            TestNoteSkip(pipeline, pipeline->Key().Hash(), false, false,
+                         skip_mesh ? test_what + " mesh" : test_what);
+        }
         LogSkippedPipelineLookup(skip_mesh);
         return nullptr;
     }
+    TestNoteRan(pipeline);
     return pipeline;
 }
 
-bool PipelineCache::SkipUnbuiltDispatch(ComputePipeline& pipeline, bool outputs_hold_gpu_data) {
+bool PipelineCache::SkipUnbuiltDispatch(ComputePipeline& pipeline, bool outputs_hold_gpu_data,
+                                        bool test_forced, std::string_view test_outputs) {
     if (!use_asynchronous_shaders) {
         return false;
+    }
+    if (test_forced) { // TEST ONLY: skip where the guard lets it, without waiting for the build.
+        if (outputs_hold_gpu_data) {
+            TestNoteSkip(&pipeline, pipeline.ShaderHash(), true, true, test_outputs);
+            return true;
+        }
+        TestNoteGuardKept(&pipeline, pipeline.ShaderHash(), true);
+        if (pipeline.IsBuilt()) {
+            return false;
+        }
     }
     const NativePendingMode mode = NativeMode();
     switch (DecideNativePending(mode, outputs_hold_gpu_data, native_wait_budget_us)) {
@@ -4360,12 +4418,114 @@ bool PipelineCache::SkipUnbuiltDispatch(ComputePipeline& pipeline, bool outputs_
     case NativeDrawAction::Skip:
         break;
     }
+    if (test_skip.log) { // TEST ONLY
+        TestNoteSkip(&pipeline, pipeline.ShaderHash(), true, false, test_outputs);
+    }
     static std::atomic<u64> skipped{};
     if ((skipped.fetch_add(1, std::memory_order_relaxed) & 255) == 0) {
         LOG_INFO(Render_Vulkan, "Async shaders: {} compute dispatches skipped for unbuilt pipelines",
                  skipped.load(std::memory_order_relaxed));
     }
     return true;
+}
+
+// TEST ONLY: async-skip probe. GPU thread only, like the rest of the draw and dispatch path.
+bool PipelineCache::TestForce(const void* pipeline, bool compute) const {
+    if (test_skip.force_first == 0 || (compute ? !test_skip.compute : !test_skip.draws)) {
+        return false;
+    }
+    const auto it = test_forced_counts.find(pipeline);
+    return it == test_forced_counts.end() || it->second < test_skip.force_first;
+}
+
+bool PipelineCache::TestForceDispatch(const ComputePipeline& pipeline) const {
+    return TestForce(&pipeline, true);
+}
+
+void PipelineCache::TestNoteSkip(const void* pipeline, u64 hash, bool compute, bool forced,
+                                 std::string_view what) {
+    auto& entry = test_skip_entries[pipeline];
+    if (entry.skipped == 0) {
+        entry.hash = hash;
+        entry.compute = compute;
+        entry.first_skip_frame = frame_count;
+    }
+    ++entry.skipped;
+    entry.last_skip_frame = frame_count;
+    if (forced) {
+        ++entry.forced;
+        ++test_forced_counts[pipeline];
+    }
+    if (entry.skipped <= 3) {
+        LOG_INFO(Render_Vulkan, "TEST skip {} {:016x} frame={} n={} {} {}",
+                 compute ? "dispatch" : "draw", hash, frame_count, entry.skipped,
+                 forced ? "forced" : "unbuilt", what);
+    }
+}
+
+void PipelineCache::TestNoteGuardKept(const void* pipeline, u64 hash, bool compute) {
+    auto& entry = test_skip_entries[pipeline];
+    entry.hash = hash;
+    entry.compute = compute;
+    if (entry.kept_by_guard++ == 0) {
+        LOG_INFO(Render_Vulkan, "TEST skip {} {:016x} frame={}: guard keeps it (no history)",
+                 compute ? "dispatch" : "draw", hash, frame_count);
+    }
+    // A forced candidate the guard kept counts toward its forced budget, so it ends.
+    ++test_forced_counts[pipeline];
+}
+
+void PipelineCache::TestNoteRan(const void* pipeline) {
+    if (!test_skip.log) {
+        return;
+    }
+    const auto it = test_skip_entries.find(pipeline);
+    if (it == test_skip_entries.end() || it->second.skipped == 0) {
+        return;
+    }
+    if (it->second.ran_after++ == 0) {
+        it->second.first_ran_frame = frame_count;
+    }
+}
+
+void PipelineCache::TestNoteDispatchRan(const ComputePipeline& pipeline,
+                                        std::span<const u64> outputs) {
+    TestNoteRan(&pipeline);
+    for (const u64 addr : outputs) {
+        test_last_writer[addr] = {pipeline.ShaderHash(), frame_count};
+    }
+}
+
+std::string PipelineCache::TestDescribeOutputs(std::span<const u64> outputs) const {
+    std::string text = "outputs:";
+    for (const u64 addr : outputs) {
+        const auto it = test_last_writer.find(addr);
+        if (it == test_last_writer.end()) {
+            text += fmt::format(" {:#x}(no compute writer)", addr);
+        } else {
+            text += fmt::format(" {:#x}(last {:016x}@{})", addr, it->second.first,
+                                it->second.second);
+        }
+    }
+    return text;
+}
+
+void PipelineCache::TestReportSkips() {
+    u64 pipelines = 0;
+    for (const auto& [pointer, entry] : test_skip_entries) {
+        if (entry.skipped == 0) {
+            continue;
+        }
+        ++pipelines;
+        LOG_INFO(Render_Vulkan,
+                 "TEST skip summary {} {:016x}: skipped {} (forced {}) frames {}-{}, guard kept "
+                 "{}, ran after {} (first at frame {})",
+                 entry.compute ? "dispatch" : "draw", entry.hash, entry.skipped, entry.forced,
+                 entry.first_skip_frame, entry.last_skip_frame, entry.kept_by_guard,
+                 entry.ran_after, entry.first_ran_frame);
+    }
+    LOG_INFO(Render_Vulkan, "TEST skip summary at frame {}: {} pipelines with skips", frame_count,
+             pipelines);
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::RebuildGraphicsPipeline(KeptGraphicsStages kept) {

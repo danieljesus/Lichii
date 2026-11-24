@@ -19,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <span>
 #include <string_view>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -158,7 +159,22 @@ public:
     /// draws' budget.
     /// @param outputs_hold_gpu_data Every buffer byte the dispatch writes holds GPU writes, and
     ///                              every image level it writes holds storage writes.
-    [[nodiscard]] bool SkipUnbuiltDispatch(ComputePipeline& pipeline, bool outputs_hold_gpu_data);
+    [[nodiscard]] bool SkipUnbuiltDispatch(ComputePipeline& pipeline, bool outputs_hold_gpu_data,
+                                           bool test_forced = false,
+                                           std::string_view test_outputs = {});
+
+    /// TEST ONLY: EDEN_NX2_TEST_SKIP_LOG=1 logs every skipped draw and dispatch with its pipeline
+    /// and a per-pipeline summary; EDEN_NX2_TEST_FORCE_SKIP_FIRST=N[:draw|:compute] treats a built
+    /// pipeline as unbuilt for its first N skips the policy allows (on a warm boot too).
+    [[nodiscard]] bool TestSkipLogging() const noexcept {
+        return test_skip.log;
+    }
+    /// TEST ONLY: whether this dispatch's pipeline is forced to count as unbuilt.
+    [[nodiscard]] bool TestForceDispatch(const ComputePipeline& pipeline) const;
+    /// TEST ONLY: notes a dispatch that ran and the output addresses it writes (last writer).
+    void TestNoteDispatchRan(const ComputePipeline& pipeline, std::span<const u64> outputs);
+    /// TEST ONLY: "addr(last compute writer hash@frame)" for each output address.
+    [[nodiscard]] std::string TestDescribeOutputs(std::span<const u64> outputs) const;
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
@@ -178,6 +194,35 @@ private:
 
     /// Logs the bounded waits' time every 10 s.
     void LogBoundedWaits();
+
+    /// TEST ONLY: async-skip probe (see TestSkipLogging).
+    struct TestSkipConfig {
+        bool log{};
+        u32 force_first{};
+        bool draws{};
+        bool compute{};
+    } test_skip{};
+    struct TestSkipEntry {
+        u64 hash{};
+        bool compute{};
+        u64 skipped{};          ///< skips, natural and forced
+        u64 forced{};           ///< of which forced by the test switch
+        u64 kept_by_guard{};    ///< forced candidates the guard made run
+        u64 first_skip_frame{};
+        u64 last_skip_frame{};
+        u64 ran_after{};        ///< draws or dispatches that ran after its first skip
+        u64 first_ran_frame{};  ///< frame of the first of those
+    };
+    std::unordered_map<const void*, TestSkipEntry> test_skip_entries;
+    std::unordered_map<const void*, u32> test_forced_counts;
+    std::unordered_map<u64, std::pair<u64, u64>> test_last_writer; ///< addr -> (hash, frame)
+    u64 test_skip_report_frame{};
+    [[nodiscard]] bool TestForce(const void* pipeline, bool compute) const;
+    void TestNoteSkip(const void* pipeline, u64 hash, bool compute, bool forced,
+                      std::string_view what);
+    void TestNoteGuardKept(const void* pipeline, u64 hash, bool compute);
+    void TestNoteRan(const void* pipeline);
+    void TestReportSkips();
 
     /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
     /// pointers whatever they hold now. `evicted`: a pipeline of this key was evicted.
