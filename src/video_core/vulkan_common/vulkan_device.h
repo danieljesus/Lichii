@@ -1462,6 +1462,16 @@ FN_MAX_LIMIT_LIST
         return properties.driver.driverID == VK_DRIVER_ID_MOLTENVK;
     }
 
+    /// TEST ONLY (wip/mac/local/kk-hoist-test): the mesh-dispatch hoist and the slot before every
+    /// pass run on MoltenVK, and on any driver with LICHII_TEST_HOIST_ANY_DRIVER=1 (for KosmicKrisp).
+    bool HoistsMeshDispatchesOnDriver() const noexcept {
+        static const bool forced = [] {
+            const char* value = std::getenv("LICHII_TEST_HOIST_ANY_DRIVER");
+            return value != nullptr && value[0] == '1';
+        }();
+        return IsMoltenVK() || forced;
+    }
+
     /// Samplers may use a nonzero mipLodBias (false on portability subset devices without it).
     bool SupportsSamplerMipLodBias() const {
         return !loaded_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME) ||

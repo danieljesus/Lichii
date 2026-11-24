@@ -498,7 +498,7 @@ private:
     /// reopened pass (Apple M6: 35.2 to 36.0 fps in Ocarina of Time); a desktop GPU reopens a pass
     /// for free and gains nothing (RADV), so the dispatches stay in place there.
     [[nodiscard]] bool HoistsMeshDispatches() const noexcept {
-        return mesh_emulation.has_value() && device.IsMoltenVK();
+        return mesh_emulation.has_value() && device.HoistsMeshDispatchesOnDriver();
     }
 
     void RecordBinding(const PreparedBinding& binding, const DescriptorUpdateEntry* descriptor_data,

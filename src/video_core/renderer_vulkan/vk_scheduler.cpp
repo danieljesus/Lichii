@@ -459,7 +459,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     // began then runs its dispatch there too.
     const bool slot_ready =
         hoist_awaits_pass && record_serial == hoist_record_serial && !uploads_pending;
-    if (device.IsMoltenVK() && !slot_ready) {
+    if (device.HoistsMeshDispatchesOnDriver() && !slot_ready) {
         OpenHoistSlot();
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
