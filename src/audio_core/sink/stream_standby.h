@@ -107,14 +107,18 @@ public:
      * device waits ConfiguredDeviceAttempts reopens for it; any other takes the default one when
      * the configured one is not listed or does not open. One that takes the default one also does
      * when the configured one opened but failed to start the last time.
+     * Input and sysmix streams, which do not stand in, open only once: on the configured device
+     * when it is listed, never another one in its place, and on the default one when it is not,
+     * as before the stand-in.
      *
+     * @param type                    - The stream's type.
      * @param attempt                 - As given to OpenBackend.
      * @param listed                  - The configured device is listed and enabled.
      * @param published_on_configured - The stream's last published backend was on it.
      * @param start_failed            - A backend on it failed to start since that one.
      */
-    static DeviceChoice ChooseDevice(u32 attempt, bool listed, bool published_on_configured,
-                                     bool start_failed);
+    static DeviceChoice ChooseDevice(StreamType type, u32 attempt, bool listed,
+                                     bool published_on_configured, bool start_failed);
 
     ~StandbySinkStream() override;
 
@@ -178,8 +182,11 @@ private:
     };
     enum class Reopen { Opened, Failed, Stopped };
 
+    static constexpr bool StandsIn(StreamType stream_type) {
+        return stream_type == StreamType::Render || stream_type == StreamType::Out;
+    }
     bool StandsIn() const {
-        return type == StreamType::Render || type == StreamType::Out;
+        return StandsIn(type);
     }
     void Run(std::stop_token stop_token);
     /// Play blocks into nothing until `until`, a fault, or `done` when given. Returns false when
