@@ -132,8 +132,11 @@ enum class ThreadPlacement : u32 {
 };
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
-/// For a shader build worker: user-initiated QoS on Apple, so the Metal compiles it asks for are
-/// served at that QoS, and Low priority elsewhere or when QoS can't be set.
+/// For a shader worker that runs driver pipeline builds: user-initiated QoS on Apple, so the Metal
+/// compiles it asks for are served at that QoS, and Low priority elsewhere or when QoS can't be set.
+/// Threads that never ask the driver for a pipeline keep Low priority: the CPU-stage shader workers
+/// and ShaderWarmBuild (they translate and lower programs), and the placed ThreadWorkers
+/// (VkPipelineSerialization writes the caches, TextureDecoder decodes textures).
 void SetCurrentThreadToShaderBuilds();
 void SetCurrentThreadName(const char* name);
 void SetCurrentThreadToPerformanceCores();

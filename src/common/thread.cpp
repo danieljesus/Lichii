@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -686,8 +687,14 @@ void SetCurrentThreadToShaderBuilds() {
     // pthread_setschedparam opts a thread out of QoS for good, and MTLCompilerService serves a
     // compile at the QoS of the thread that asked: with it, these compiles ran at the default
     // priority. This must be the thread's first priority call, since QoS can't be set after it.
-    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) == 0) {
+    const int error = pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    if (error == 0) {
         return;
+    }
+    static std::atomic_bool logged{};
+    if (!logged.exchange(true)) {
+        LOG_WARNING(Common, "Shader build workers take Low priority: no user-initiated QoS: {}",
+                    std::strerror(error));
     }
 #endif
     SetCurrentThreadPriority(ThreadPriority::Low);

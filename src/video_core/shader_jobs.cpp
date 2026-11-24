@@ -51,13 +51,23 @@ void* RunLargeStackCall(void* argument) {
 
 /// Runs body on a thread with LargeStackSize of stack where the platform's default is too small
 /// for the driver's shader compiler, and on this thread otherwise or when that thread can't be made.
+/// `for_caller`: the calling thread waits on the stage, so on Apple the new thread takes
+/// user-interactive QoS. Without it, the thread has none when the caller opted out of QoS (the GPU
+/// thread does), and Metal serves its compiles below the workers'.
 template <typename Body>
-void RunOnLargeStack(Body&& body) {
+void RunOnLargeStack(bool for_caller, Body&& body) {
 #ifdef __APPLE__
     if (!t_large_stack) {
         LargeStackCall<std::remove_reference_t<Body>> call{body};
         pthread_attr_t attr;
         if (pthread_attr_init(&attr) == 0) {
+            if (for_caller &&
+                pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0) != 0) {
+                static std::atomic_bool logged_qos{};
+                if (!logged_qos.exchange(true)) {
+                    LOG_WARNING(HW_GPU, "Shader stages run for a waiting caller have no QoS");
+                }
+            }
             pthread_t thread;
             const bool created =
                 pthread_attr_setstacksize(&attr, LargeStackSize) == 0 &&
@@ -227,9 +237,13 @@ ShaderJobScheduler::ShaderJobScheduler(const ShaderJobConfig& config)
     stats.budget_bytes = budget;
     const auto start{[this](std::string name, bool driver) {
         threads.emplace_back([this, name = std::move(name), driver] {
-            RunOnLargeStack([&] {
+            RunOnLargeStack(false, [&] {
                 Common::SetCurrentThreadName(name.c_str());
-                Common::SetCurrentThreadToShaderBuilds();
+                if (driver) {
+                    Common::SetCurrentThreadToShaderBuilds();
+                } else {
+                    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+                }
                 Common::SetCurrentThreadToBackgroundWork();
                 Worker(driver);
             });
@@ -361,12 +375,12 @@ void ShaderJobScheduler::RunOrWait(const ShaderJobHandle& handle) {
     case ShaderJobStatus::Queued:
         StartStage(job, false, Clock::now());
         lock.unlock();
-        RunOnLargeStack([&] { RunCpu(handle.state, true); });
+        RunOnLargeStack(true, [&] { RunCpu(handle.state, true); });
         return;
     case ShaderJobStatus::DriverQueued:
         StartStage(job, true, Clock::now());
         lock.unlock();
-        RunOnLargeStack([&] { RunDriver(handle.state); });
+        RunOnLargeStack(true, [&] { RunDriver(handle.state); });
         return;
     default:
         break;

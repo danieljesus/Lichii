@@ -23,6 +23,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/thread.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 #include "video_core/shader_jobs.h"
@@ -694,16 +695,56 @@ TEST_CASE("Shader job workers are named by stage", "[video_core][shader_jobs]") 
 #endif
 
 #ifdef __APPLE__
-TEST_CASE("Shader job workers run at user-initiated QoS", "[video_core][shader_jobs]") {
+TEST_CASE("Shader job driver workers run at user-initiated QoS", "[video_core][shader_jobs]") {
     ShaderJobScheduler scheduler{Config(1, 1)};
-    qos_class_t cpu_qos{QOS_CLASS_UNSPECIFIED};
+    qos_class_t cpu_qos{QOS_CLASS_USER_INITIATED};
     qos_class_t driver_qos{QOS_CLASS_UNSPECIFIED};
     const auto job = scheduler.Submit(TwoStageJob(
         Soon, [&](ShaderJobContext&) { cpu_qos = qos_class_self(); },
         [&] { driver_qos = qos_class_self(); }));
     job.Wait();
-    REQUIRE(cpu_qos == QOS_CLASS_USER_INITIATED);
+    // The CPU workers keep Low priority, which takes them out of QoS.
+    REQUIRE(cpu_qos == QOS_CLASS_UNSPECIFIED);
     REQUIRE(driver_qos == QOS_CLASS_USER_INITIATED);
+}
+
+TEST_CASE("Shader job stages run for a waiting caller run at user-interactive QoS",
+          "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    Gate gate;
+    std::atomic<int> blocked{};
+    const auto cpu_block = scheduler.Submit(CpuJob(Soon, [&] {
+        ++blocked;
+        gate.Wait();
+    }));
+    ShaderJob driver_job;
+    driver_job.priority = Soon;
+    driver_job.driver = [&] {
+        ++blocked;
+        gate.Wait();
+    };
+    const auto driver_block = scheduler.Submit(std::move(driver_job));
+    while (blocked < 2) {
+        std::this_thread::sleep_for(1ms);
+    }
+    qos_class_t cpu_qos{QOS_CLASS_UNSPECIFIED};
+    qos_class_t driver_qos{QOS_CLASS_UNSPECIFIED};
+    const auto job = scheduler.Submit(TwoStageJob(
+        Background, [&](ShaderJobContext&) { cpu_qos = qos_class_self(); },
+        [&] { driver_qos = qos_class_self(); }));
+    // Like the GPU thread, the caller set its priority with pthread_setschedparam, which takes it
+    // out of QoS. Both workers are busy, so the stages run for it.
+    std::thread caller{[&] {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+        scheduler.RunOrWait(job);
+    }};
+    caller.join();
+    gate.Open();
+    cpu_block.Wait();
+    driver_block.Wait();
+    REQUIRE(job.Status() == ShaderJobStatus::Done);
+    REQUIRE(cpu_qos == QOS_CLASS_USER_INTERACTIVE);
+    REQUIRE(driver_qos == QOS_CLASS_USER_INTERACTIVE);
 }
 #endif
 
