@@ -229,7 +229,7 @@ ShaderJobScheduler::ShaderJobScheduler(const ShaderJobConfig& config)
         threads.emplace_back([this, name = std::move(name), driver] {
             RunOnLargeStack([&] {
                 Common::SetCurrentThreadName(name.c_str());
-                Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+                Common::SetCurrentThreadToPipelineBuilds();
                 Common::SetCurrentThreadToBackgroundWork();
                 Worker(driver);
             });

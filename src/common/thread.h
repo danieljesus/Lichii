@@ -132,6 +132,12 @@ enum class ThreadPlacement : u32 {
 };
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
+
+/// TEST ONLY: LICHII_MACOS_THREAD_QOS=1 on macOS (QoS classes instead of pthread_setschedparam).
+[[nodiscard]] bool MacThreadQosEnabled();
+
+/// A pipeline build worker: Low priority, or user-initiated QoS under LICHII_MACOS_THREAD_QOS=1.
+void SetCurrentThreadToPipelineBuilds();
 void SetCurrentThreadName(const char* name);
 void SetCurrentThreadToPerformanceCores();
 void SetCurrentThreadToEfficiencyCores();
