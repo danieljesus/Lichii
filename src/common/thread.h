@@ -132,6 +132,9 @@ enum class ThreadPlacement : u32 {
 };
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
+/// For a shader build worker: user-initiated QoS on Apple, so the Metal compiles it asks for are
+/// served at that QoS, and Low priority elsewhere or when QoS can't be set.
+void SetCurrentThreadToShaderBuilds();
 void SetCurrentThreadName(const char* name);
 void SetCurrentThreadToPerformanceCores();
 void SetCurrentThreadToEfficiencyCores();

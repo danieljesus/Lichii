@@ -17,6 +17,8 @@
 
 #ifdef __linux__
 #include <pthread.h>
+#elif defined(__APPLE__)
+#include <pthread/qos.h>
 #endif
 
 #include <catch2/catch_test_macros.hpp>
@@ -688,6 +690,20 @@ TEST_CASE("Shader job workers are named by stage", "[video_core][shader_jobs]") 
     job.Wait();
     REQUIRE(cpu_name == "TestJobsCpu");
     REQUIRE(driver_name == "TestJobsDriver");
+}
+#endif
+
+#ifdef __APPLE__
+TEST_CASE("Shader job workers run at user-initiated QoS", "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    qos_class_t cpu_qos{QOS_CLASS_UNSPECIFIED};
+    qos_class_t driver_qos{QOS_CLASS_UNSPECIFIED};
+    const auto job = scheduler.Submit(TwoStageJob(
+        Soon, [&](ShaderJobContext&) { cpu_qos = qos_class_self(); },
+        [&] { driver_qos = qos_class_self(); }));
+    job.Wait();
+    REQUIRE(cpu_qos == QOS_CLASS_USER_INITIATED);
+    REQUIRE(driver_qos == QOS_CLASS_USER_INITIATED);
 }
 #endif
 

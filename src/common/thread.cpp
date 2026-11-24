@@ -22,6 +22,7 @@
 #include "common/thread.h"
 #ifdef __APPLE__
 #include <mach/mach.h>
+#include <pthread/qos.h>
 #elif defined(__HAIKU__)
 #include <kernel/OS.h>
 #elif defined(_WIN32)
@@ -678,6 +679,18 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
         pthread_setschedparam(pthread_self(), SCHED_OTHER, &params);
     }
 #endif
+}
+
+void SetCurrentThreadToShaderBuilds() {
+#ifdef __APPLE__
+    // pthread_setschedparam opts a thread out of QoS for good, and MTLCompilerService serves a
+    // compile at the QoS of the thread that asked: with it, these compiles ran at the default
+    // priority. This must be the thread's first priority call, since QoS can't be set after it.
+    if (pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) == 0) {
+        return;
+    }
+#endif
+    SetCurrentThreadPriority(ThreadPriority::Low);
 }
 
 void SetCurrentThreadName(const char* name) {
