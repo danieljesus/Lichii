@@ -949,6 +949,16 @@ private:
             LOG_DEBUG(Shader, "Combining demotes with more than one return is not implemented.");
             return;
         }
+        // Every demote must be the body of a selection before any is moved: stopping halfway
+        // would lose the demotes already taken out
+        const auto is_if_body{[&](const IR::Block* demote_block) {
+            return std::ranges::any_of(syntax_list, [&](const IR::AbstractSyntaxNode& asn) {
+                return asn.type == Type::If && asn.data.if_node.body == demote_block;
+            });
+        }};
+        if (!std::ranges::all_of(demote_blocks, is_if_body)) {
+            return;
+        }
         s64 last_iterator_offset{};
         auto& asl{syntax_list};
         for (const IR::Block* demote_block : demote_blocks) {
