@@ -814,8 +814,11 @@ std::vector<DmntCheatVm::MainStore> DmntCheatVm::MainStaticStores(
         }
         if (const auto* store = std::get_if<StoreStaticOpcode>(&opcode.opcode)) {
             const auto offset = values[store->offset_register & 0xF];
-            if (store->mem_type == MemoryAccessType::MainNso && loop_depth == 0 && offset &&
-                position < ends.size()) {
+            // GetCheatProcessAddress takes main for every memory type it does not know.
+            const bool to_main = store->mem_type != MemoryAccessType::Heap &&
+                              store->mem_type != MemoryAccessType::Alias &&
+                              store->mem_type != MemoryAccessType::Aslr;
+            if (to_main && loop_depth == 0 && offset && position < ends.size()) {
                 const u64 begin = store->rel_address + *offset;
                 stores.push_back({ends[position].second, begin, begin + store->bit_width});
             }

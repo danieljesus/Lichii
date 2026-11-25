@@ -281,3 +281,23 @@ TEST_CASE("Cheat VM runs a store after an else that an if left open in a loop en
     // and leaves the store out. No well-formed cheat leaves an if open inside a loop.
     CHECK(DmntCheatVm::MainStaticStores({Cheat(words)}).empty());
 }
+
+TEST_CASE("Cheat VM's static stores list a store of an unknown memory type, which goes to main",
+          "[core][cheats]") {
+    // 04M00000 00001000 V: memory types 4 to 15 are not known, and Execute writes them to main.
+    for (const u32 type : {0u, 4u, 9u, 15u}) {
+        CAPTURE(type);
+        const std::vector<u32> words{0x04000000 | type << 20, 0x1000, 1};
+        const auto writes = Run(words);
+        REQUIRE(writes.size() == 1);
+        CHECK(writes[0].address == MainBase + 0x1000);
+        const auto stores = DmntCheatVm::MainStaticStores({Cheat(words)});
+        REQUIRE(stores.size() == 1);
+        CHECK(stores[0].begin == 0x1000);
+    }
+    // Heap, alias and ASLR stores are not main's.
+    for (const u32 type : {1u, 2u, 3u}) {
+        CAPTURE(type);
+        CHECK(DmntCheatVm::MainStaticStores({Cheat({0x04000000 | type << 20, 0x1000, 1})}).empty());
+    }
+}
