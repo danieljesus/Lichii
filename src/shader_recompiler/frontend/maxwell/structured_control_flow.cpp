@@ -145,6 +145,9 @@ struct Statement : ListBaseHook {
     };
     Statement* up{};
     StatementType type;
+    /// Break out of a breakable block: emitted as its own selection, so the code after it is
+    /// not nested under it.
+    bool selection_break{};
 };
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -319,6 +322,23 @@ bool AreOrdered(Node left_sibling, Node right_sibling) noexcept {
     }
 }
 
+/// From this many conditional gotos to one label on, the forward ones leave one breakable block instead of
+/// each wrapping the rest in a selection: N nested selections are N brackets deep in the shading
+/// language (Metal rejects more than 256), and a breakable block is two.
+constexpr u32 BREAKABLE_BLOCK_GOTOS = 64;
+
+/// A break in `stmt` that leaves the loop enclosing `stmt` (not one inside a loop of its own).
+bool HasEnclosingLoopBreak(const Statement& stmt) {
+    switch (stmt.type) {
+    case StatementType::Break:
+        return true;
+    case StatementType::If:
+        return std::ranges::any_of(stmt.children, HasEnclosingLoopBreak);
+    default:
+        return false;
+    }
+}
+
 bool NeedsLift(Node goto_stmt, Node label_stmt) noexcept {
     const Node sibling{SiblingFromNephew(goto_stmt, label_stmt)};
     return AreOrdered(sibling, goto_stmt);
@@ -329,6 +349,12 @@ public:
     explicit GotoPass(Flow::CFG& cfg, ObjectPool<Statement>& stmt_pool, bool converge_exits_)
         : pool{stmt_pool}, converge_exits{converge_exits_} {
         std::vector gotos{BuildTree(cfg)};
+        for (const Node& goto_stmt : gotos) {
+            const Statement& cond{*goto_stmt->cond};
+            if (cond.type != StatementType::Identity || cond.guest_cond != IR::Condition{true}) {
+                ++gotos_per_label[&*goto_stmt->label];
+            }
+        }
         const auto end{gotos.rend()};
         for (auto goto_stmt = gotos.rbegin(); goto_stmt != end; ++goto_stmt) {
             RemoveGoto(*goto_stmt);
@@ -382,8 +408,10 @@ private:
             // Simply eliminate the goto if the label is next to it
             goto_stmt->up->children.erase(goto_stmt);
         } else if (AreOrdered(goto_stmt, label_stmt)) {
-            // Eliminate goto_stmt with a conditional
-            EliminateAsConditional(goto_stmt, label_stmt);
+            // Eliminate goto_stmt with a break out of the label's block, or a conditional
+            if (!EliminateAsBreak(goto_stmt, label_stmt)) {
+                EliminateAsConditional(goto_stmt, label_stmt);
+            }
         } else {
             // Eliminate goto_stmt with a loop
             EliminateAsLoop(goto_stmt, label_stmt);
@@ -514,6 +542,44 @@ private:
         UpdateTreeUp(if_stmt);
         body.insert(goto_stmt, *if_stmt);
         body.erase(goto_stmt);
+    }
+
+    /// For a label with many gotos: the code between goto_stmt and the label moves into a
+    /// single-pass loop right before the label, and goto_stmt becomes a break at its start.
+    /// The next goto to that label (they are removed last to first) extends the same loop, so a
+    /// chain of forward gotos becomes `do { if (c1) break; s1; ... if (cN) break; sN }
+    /// while (false); label:` instead of N nested selections. Returns false, leaving it to
+    /// EliminateAsConditional, when the label has few gotos or when the code to move holds a
+    /// break of an enclosing loop, which would then leave the new loop instead.
+    bool EliminateAsBreak(Node goto_stmt, Node label_stmt) {
+        if (gotos_per_label[&*label_stmt] < BREAKABLE_BLOCK_GOTOS) {
+            return false;
+        }
+        Tree& body{goto_stmt->up->children};
+        Statement* block{};
+        if (const auto it{breakable_blocks.find(&*label_stmt)};
+            it != breakable_blocks.end() && &*std::prev(label_stmt) == it->second) {
+            block = it->second;
+        }
+        const Node moved_end{block ? std::prev(label_stmt) : label_stmt};
+        if (std::any_of(std::next(goto_stmt), moved_end, HasEnclosingLoopBreak)) {
+            return false;
+        }
+        if (!block) {
+            Statement* const never{pool.Create(Identity{}, IR::Condition{false}, &root_stmt)};
+            block = pool.Create(Loop{}, never, Tree{}, goto_stmt->up);
+            body.insert(label_stmt, *block);
+            breakable_blocks[&*label_stmt] = block;
+        }
+        Tree moved;
+        moved.splice(moved.begin(), body, std::next(goto_stmt), Tree::s_iterator_to(*block));
+        block->children.splice(block->children.begin(), moved);
+        Statement* const exit{pool.Create(Break{}, goto_stmt->cond, block)};
+        exit->selection_break = true;
+        block->children.push_front(*exit);
+        UpdateTreeUp(block);
+        body.erase(goto_stmt);
+        return true;
     }
 
     void EliminateAsLoop(Node goto_stmt, Node label_stmt) {
@@ -650,6 +716,8 @@ private:
     Statement root_stmt{FunctionTag{}};
     bool converge_exits{};
     std::optional<Node> exit_label;
+    ::Common::unordered_map<const Statement*, u32> gotos_per_label;
+    ::Common::unordered_map<const Statement*, Statement*> breakable_blocks;
 };
 
 [[nodiscard]] Statement* TryFindForwardBlock(Statement& stmt) {
@@ -838,6 +906,7 @@ private:
                 break_node.data.break_node.cond = cond;
                 break_node.data.break_node.merge = break_block;
                 break_node.data.break_node.skip = skip_block;
+                break_node.data.break_node.selection = stmt.selection_break;
 
                 auto& merge{syntax_list.emplace_back()};
                 merge.type = IR::AbstractSyntaxNode::Type::Block;

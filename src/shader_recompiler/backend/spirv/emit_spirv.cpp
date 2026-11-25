@@ -195,6 +195,9 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
         case IR::AbstractSyntaxNode::Type::Break: {
             const Id break_label{node.data.break_node.merge->Definition<Id>()};
             const Id skip_label{node.data.break_node.skip->Definition<Id>()};
+            if (node.data.break_node.selection) {
+                ctx.OpSelectionMerge(skip_label, spv::SelectionControlMask::MaskNone);
+            }
             ctx.OpBranchConditional(ctx.Def(node.data.break_node.cond), break_label, skip_label);
             break;
         }
@@ -205,7 +208,13 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
-            if (!Settings::values.disable_shader_loop_safety_checks) {
+            // A loop that never repeats (a breakable block) needs no iteration limit.
+            IR::Value repeat{node.data.repeat.cond.Resolve()};
+            if (!repeat.IsImmediate() && repeat.Inst()->GetOpcode() == IR::Opcode::ConditionRef) {
+                repeat = repeat.Inst()->Arg(0).Resolve();
+            }
+            const bool repeats{!repeat.IsImmediate() || repeat.U1()};
+            if (repeats && !Settings::values.disable_shader_loop_safety_checks) {
                 const Id pointer_type{ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1])};
                 const Id safety_counter{ctx.AddGlobalVariable(
                     pointer_type, spv::StorageClass::Private, ctx.Const(0x2000u))};

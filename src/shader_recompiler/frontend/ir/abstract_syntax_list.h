@@ -45,6 +45,7 @@ struct AbstractSyntaxNode {
             U1 cond;
             Block* merge;
             Block* skip;
+            bool selection; ///< Emit the break as a selection that merges at skip
         } break_node;
     };
 
