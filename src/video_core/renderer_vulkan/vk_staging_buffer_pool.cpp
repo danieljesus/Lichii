@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <initializer_list>
 #include <utility>
@@ -178,6 +179,17 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 }
 
 void StagingBufferPool::TickFrame() {
+    if (TestStreamLog() && test_fallbacks_ahead + test_fallbacks_wrap != test_fallbacks_logged) {
+        const u64 now_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count());
+        if (now_ns - test_fallbacks_log_ns >= 1'000'000'000ULL) {
+            test_fallbacks_log_ns = now_ns;
+            test_fallbacks_logged = test_fallbacks_ahead + test_fallbacks_wrap;
+            LOG_INFO(Render_Vulkan, "TEST stream fallbacks: ahead={} wrap={}", test_fallbacks_ahead,
+                     test_fallbacks_wrap);
+        }
+    }
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 
     ReleaseCache(MemoryUsage::DeviceLocal);
@@ -188,6 +200,7 @@ void StagingBufferPool::TickFrame() {
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
     if (AreRegionsActive(Region(free_iterator) + 1,
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
+        ++test_fallbacks_ahead;
         // Avoid waiting for the previous usages to be free
         return GetStagingBuffer(size, MemoryUsage::Upload);
     }
@@ -220,6 +233,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
             }
         }
         if (start_busy) {
+            ++test_fallbacks_wrap;
             // Avoid waiting for the previous usages to be free
             return GetStagingBuffer(size, MemoryUsage::Upload);
         }

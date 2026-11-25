@@ -151,6 +151,10 @@ private:
     u32 test_stream_after_fallback = 0;
     std::thread::id test_owner_thread{};
     u32 test_other_thread_calls = 0;
+    u64 test_fallbacks_ahead = 0;   ///< stream requests that fell back: regions ahead busy
+    u64 test_fallbacks_wrap = 0;    ///< stream requests that fell back: start busy at the wrap
+    u64 test_fallbacks_logged = 0;
+    u64 test_fallbacks_log_ns = 0;
 
     StagingBuffersCache device_local_cache;
     StagingBuffersCache upload_cache;
