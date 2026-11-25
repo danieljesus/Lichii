@@ -6,6 +6,8 @@
 #pragma once
 
 #include <climits>
+#include <map>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -98,6 +100,10 @@ private:
 
     bool AreRegionsActive(size_t region_begin, size_t region_end) const;
 
+    /// TEST ONLY (EDEN_NX2_TEST_STREAM_LOG): records a stream range handed out in `tick` and logs
+    /// any overlap with a range whose tick the GPU has not completed yet.
+    void TestNoteStream(size_t offset, size_t size, u64 tick);
+
     StagingBufferRef GetStagingBuffer(size_t size, MemoryUsage usage, bool deferred = false);
 
     std::optional<StagingBufferRef> TryGetReservedBuffer(size_t size, MemoryUsage usage,
@@ -131,6 +137,20 @@ private:
     size_t used_iterator = 0;
     size_t free_iterator = 0;
     std::array<u64, NUM_SYNCS> sync_ticks{};
+
+    // TEST ONLY: stream ranges whose tick the GPU has not completed, by offset.
+    struct TestStreamRange {
+        size_t size;
+        u64 tick;
+        u64 serial;
+    };
+    std::multimap<size_t, TestStreamRange> test_stream_live;
+    u64 test_stream_serial = 0;
+    u64 test_stream_pruned_tick = 0;
+    u32 test_stream_overlaps_logged = 0;
+    u32 test_stream_after_fallback = 0;
+    std::thread::id test_owner_thread{};
+    u32 test_other_thread_calls = 0;
 
     StagingBuffersCache device_local_cache;
     StagingBuffersCache upload_cache;

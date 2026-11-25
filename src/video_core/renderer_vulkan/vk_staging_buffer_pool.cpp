@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <initializer_list>
 #include <utility>
 #include <vector>
@@ -86,12 +87,34 @@ size_t GetStreamBufferSize(const Device& device) {
     }
     return (std::min)(Common::AlignUp(size, MAX_ALIGNMENT), MAX_STREAM_BUFFER_SIZE);
 }
+// TEST ONLY: EDEN_NX2_TEST_STREAM_LOG=1 logs every wrap of the stream buffer, a wrap that finds
+// the start still in use (with the next 64 requests), and any stream range handed out over one
+// whose tick the GPU has not completed. EDEN_NX2_TEST_STREAM_DIVISOR=<n> (1 to 64) shrinks the
+// stream buffer n times, so that it wraps more often.
+bool TestStreamLog() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEST_STREAM_LOG");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+VkDeviceSize TestStreamDivisor() {
+    static const VkDeviceSize divisor = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEST_STREAM_DIVISOR");
+        const unsigned long long parsed = value ? std::strtoull(value, nullptr, 10) : 1;
+        return static_cast<VkDeviceSize>(parsed >= 1 && parsed <= 64 ? parsed : 1);
+    }();
+    return divisor;
+}
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
                                      Scheduler& scheduler_)
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
-      stream_buffer_size{GetStreamBufferSize(device)}, region_size{stream_buffer_size /
+      stream_buffer_size{Common::AlignDown(GetStreamBufferSize(device) / TestStreamDivisor(),
+                                           MAX_ALIGNMENT * StagingBufferPool::NUM_SYNCS)},
+      region_size{stream_buffer_size /
                                                                    StagingBufferPool::NUM_SYNCS} {
     VkBufferCreateInfo stream_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -122,11 +145,24 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     }
     stream_pointer = stream_buffer.Mapped();
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
+    if (TestStreamLog() || TestStreamDivisor() != 1) {
+        LOG_INFO(Render_Vulkan, "TEST stream buffer probe: size={:#x} region={:#x} divisor={} log={}",
+                 stream_buffer_size, region_size, TestStreamDivisor(), TestStreamLog());
+    }
 }
 
 StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
+    if (TestStreamLog()) {
+        const std::thread::id caller = std::this_thread::get_id();
+        if (test_owner_thread == std::thread::id{}) {
+            test_owner_thread = caller;
+        } else if (caller != test_owner_thread && test_other_thread_calls++ < 16) {
+            LOG_ERROR(Render_Vulkan, "TEST staging request from a second thread: size={:#x} usage={}",
+                      size, static_cast<u32>(usage));
+        }
+    }
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
         return GetStreamBuffer(size);
     }
@@ -168,13 +204,31 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
         iterator = 0;
         free_iterator = size;
 
-        if (AreRegionsActive(0, Region(size) + 1)) {
+        const bool start_busy = AreRegionsActive(0, Region(size) + 1);
+        if (TestStreamLog()) {
+            const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+            if (start_busy) {
+                LOG_WARNING(Render_Vulkan,
+                            "TEST stream wrap: start busy, cursor reset to 0 and request size={:#x} "
+                            "falls back; current_tick={} gpu_tick={} start region ticks={}",
+                            size, current_tick, gpu_tick,
+                            fmt::join(sync_ticks.begin(), sync_ticks.begin() + Region(size) + 1, ","));
+                test_stream_after_fallback = 64;
+            } else {
+                LOG_INFO(Render_Vulkan, "TEST stream wrap: current_tick={} gpu_tick={}", current_tick,
+                         gpu_tick);
+            }
+        }
+        if (start_busy) {
             // Avoid waiting for the previous usages to be free
             return GetStagingBuffer(size, MemoryUsage::Upload);
         }
     }
     const size_t offset = iterator;
     iterator = Common::AlignUp(iterator + size, MAX_ALIGNMENT);
+    if (TestStreamLog()) {
+        TestNoteStream(offset, size, current_tick);
+    }
     return StagingBufferRef{
         .buffer = *stream_buffer,
         .device_address = stream_buffer_address,
@@ -184,6 +238,37 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
         .log2_level{},
         .index{},
     };
+}
+
+void StagingBufferPool::TestNoteStream(size_t offset, size_t size, u64 tick) {
+    const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    if (gpu_tick != test_stream_pruned_tick) {
+        test_stream_pruned_tick = gpu_tick;
+        std::erase_if(test_stream_live, [gpu_tick](const auto& entry) {
+            return entry.second.tick <= gpu_tick;
+        });
+    }
+    const u64 serial = test_stream_serial++;
+    // Stream requests are at most one region, so an overlapping range starts at most one region
+    // below this one.
+    const size_t window_begin = offset > region_size ? offset - region_size : 0;
+    for (auto it = test_stream_live.lower_bound(window_begin);
+         it != test_stream_live.end() && it->first < offset + size; ++it) {
+        if (it->first + it->second.size > offset && test_stream_overlaps_logged < 400) {
+            ++test_stream_overlaps_logged;
+            LOG_ERROR(Render_Vulkan,
+                      "TEST stream overlap: #{} [{:#x}, +{:#x}) tick={} over live #{} [{:#x}, +{:#x}) "
+                      "tick={} gpu_tick={}",
+                      serial, offset, size, tick, it->second.serial, it->first, it->second.size,
+                      it->second.tick, gpu_tick);
+        }
+    }
+    if (test_stream_after_fallback > 0) {
+        --test_stream_after_fallback;
+        LOG_WARNING(Render_Vulkan, "TEST stream request #{} after a busy wrap: [{:#x}, +{:#x}) tick={} gpu_tick={}",
+                    serial, offset, size, tick, gpu_tick);
+    }
+    test_stream_live.emplace(offset, TestStreamRange{.size = size, .tick = tick, .serial = serial});
 }
 
 bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end) const {
