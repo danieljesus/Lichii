@@ -289,6 +289,8 @@ public:
     };
 
     static constexpr std::size_t MaximumProgramOpcodeCount = 0x400;
+    /// The opcodes one Execute runs at most (see Execute).
+    static constexpr std::size_t ExecuteBudget = 1 << 19;
     static constexpr std::size_t NumRegisters = 0x10;
     static constexpr std::size_t NumReadableStaticRegisters = 0x80;
     static constexpr std::size_t NumWritableStaticRegisters = 0x80;
@@ -326,6 +328,7 @@ private:
     bool decode_success = false;
     /// Per loaded cheat, in cheat_ends' order: whether its stray else was logged.
     std::vector<bool> warned_stray_skip;
+    bool warned_budget = false; ///< Logged once per program
     /// Where each loaded cheat's words end in the program, with its name, in program order.
     std::vector<std::pair<std::size_t, std::string>> cheat_ends;
     std::array<u32, MaximumProgramOpcodeCount> program{};

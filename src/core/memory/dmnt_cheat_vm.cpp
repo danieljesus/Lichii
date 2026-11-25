@@ -741,6 +741,7 @@ bool DmntCheatVm::LoadProgram(const std::vector<CheatEntry>& entries) {
     // Reset opcode count.
     num_opcodes = 0;
     warned_stray_skip.clear();
+    warned_budget = false;
     cheat_ends.clear();
 
     for (std::size_t i = 0; i < entries.size(); i++) {
@@ -914,7 +915,24 @@ void DmntCheatVm::Execute(const CheatProcessMetadata& metadata) {
 
     // Loop until program finishes.
     const bool log_commands = callbacks->LogsCommands();
+    std::size_t executed = 0;
     while (DecodeNextOpcode(cur_opcode)) {
+        // The cheats run on the emulation thread, where the console runs them on a thread of their
+        // own: a loop whose counter wraps, or never reaches zero, runs for ever here and freezes
+        // the emulation. A run ends after ExecuteBudget opcodes, which no sound cheat comes near;
+        // the cheats before the one it is in have run in full, as on the console, where they ran
+        // before it began to spin.
+        if (++executed > ExecuteBudget) {
+            if (!warned_budget) {
+                warned_budget = true;
+                const auto cheat = CheatAt(instruction_ptr == 0 ? 0 : instruction_ptr - 1);
+                LOG_WARNING(CheatEngine,
+                            "Cheat \"{}\" ran past {} opcodes in one run; each run ends there",
+                            cheat == cheat_ends.end() ? std::string_view{} : cheat->second,
+                            ExecuteBudget);
+            }
+            break;
+        }
         // About 35 lines an opcode, which cost more than running it: only when someone reads them.
         if (log_commands) {
             callbacks->CommandLog(

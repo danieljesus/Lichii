@@ -26,7 +26,10 @@ struct Write {
     u64 value;
 };
 
-/// Memory that reads as zero and records each write.
+/// Writes recorded at most.
+constexpr std::size_t MaxWrites = 4096;
+
+/// Memory that reads as zero and records the first MaxWrites writes.
 class Callbacks final : public DmntCheatVm::Callbacks {
 public:
     explicit Callbacks(std::vector<Write>& writes_, bool logs_ = false)
@@ -35,6 +38,10 @@ public:
         std::memset(data, 0, static_cast<std::size_t>(size));
     }
     void MemoryWriteUnsafe(VAddr address, const void* data, u64 size) override {
+        // Kept to a bound, so a program that runs on for ever cannot take the test's memory.
+        if (writes.size() >= MaxWrites) {
+            return;
+        }
         u64 value{};
         std::memcpy(&value, data, static_cast<std::size_t>(size));
         writes.push_back({address, value});
@@ -305,4 +312,33 @@ TEST_CASE("Cheat VM opcode cost", "[.][cheats_bench]") {
                                 << " ms: " << ns / (iterations * 2.0) << " ns per opcode");
     }
     }
+}
+
+TEST_CASE("Cheat VM ends a run that would not finish and keeps the cheats before it",
+          "[core][cheats]") {
+    // Each runaway program (its loops on registers 1, 3 and 4) runs after a cheat that stores 1 and
+    // before one that stores 2: the run ends inside the runaway cheat, the cheat before it has
+    // stored (a loop end with no start goes back to the program's first word, so it stores again
+    // each time round), and the one after it never runs.
+    const std::vector<std::vector<u32>> runaways{
+        {0x31100000},                         // a loop end with no start: the counter wraps
+        {0x30300000, 0, 0x31300000},          // a loop of 0 iterations: the counter wraps
+        {0x30300000, 2, 0x40030000, 0, 5, 0x31300000}, // the body sets its own counter back
+        // A loop of 2^16 around a loop of 2^16.
+        {0x30300000, 0x10000, 0x30400000, 0x10000, 0x78020000, 1, 0x31400000, 0x31300000},
+    };
+    for (size_t i = 0; i < runaways.size(); ++i) {
+        CAPTURE(i);
+        const auto writes = Run(std::vector<std::vector<u32>>{
+            Join({Load(0, 1), Store(0)}), runaways[i], Join({Load(0, 2), Store(0)})});
+        REQUIRE_FALSE(writes.empty());
+        CHECK(std::ranges::all_of(writes, [](const Write& write) { return write.value == 1; }));
+    }
+}
+
+TEST_CASE("Cheat VM runs a long loop that stays under the budget to its end", "[core][cheats]") {
+    // 100,000 iterations of register 1 += 1, about 200,000 opcodes, then a store of register 1.
+    const auto words = Join({{0x30000000, 100'000, 0x78010000, 1, 0x31000000},
+                             {0xA8100400, 0x00001000}});
+    CHECK(Stored(words) == 100'000);
 }
