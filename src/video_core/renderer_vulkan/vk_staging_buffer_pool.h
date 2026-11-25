@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/renderer_vulkan/vk_stream_ring.h"
 
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -98,7 +99,6 @@ private:
 
     StagingBufferRef GetStreamBuffer(size_t size);
 
-    bool AreRegionsActive(size_t region_begin, size_t region_end) const;
 
     /// TEST ONLY (EDEN_NX2_TEST_STREAM_LOG): records a stream range handed out in `tick` and logs
     /// any overlap with a range whose tick the GPU has not completed yet.
@@ -119,9 +119,6 @@ private:
     void ReleaseIdleBuffers();
 
     void ReleaseLevel(StagingBuffersCache& cache, size_t log2);
-    size_t Region(size_t iter) const noexcept {
-        return iter / region_size;
-    }
 
     const Device& device;
     MemoryAllocator& memory_allocator;
@@ -131,12 +128,8 @@ private:
     VkDeviceAddress stream_buffer_address{};
     std::span<u8> stream_pointer;
     VkDeviceSize stream_buffer_size;
-    VkDeviceSize region_size;
 
-    size_t iterator = 0;
-    size_t used_iterator = 0;
-    size_t free_iterator = 0;
-    std::array<u64, NUM_SYNCS> sync_ticks{};
+    StreamRing<NUM_SYNCS> stream_ring;
 
     // TEST ONLY: stream ranges whose tick the GPU has not completed, by offset.
     struct TestStreamRange {
@@ -148,13 +141,14 @@ private:
     u64 test_stream_serial = 0;
     u64 test_stream_pruned_tick = 0;
     u32 test_stream_overlaps_logged = 0;
-    u32 test_stream_after_fallback = 0;
     std::thread::id test_owner_thread{};
     u32 test_other_thread_calls = 0;
     u64 test_fallbacks_ahead = 0;   ///< stream requests that fell back: regions ahead busy
     u64 test_fallbacks_wrap = 0;    ///< stream requests that fell back: start busy at the wrap
     u64 test_fallbacks_logged = 0;
     u64 test_fallbacks_log_ns = 0;
+    size_t test_cursor = 0;         ///< follows the ring's cursor, to tell a wrap
+    bool test_busy_stretch = false; ///< the last stream request fell back at the wrap
 
     StagingBuffersCache device_local_cache;
     StagingBuffersCache upload_cache;

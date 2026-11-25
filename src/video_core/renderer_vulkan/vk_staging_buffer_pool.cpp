@@ -89,9 +89,9 @@ size_t GetStreamBufferSize(const Device& device) {
     return (std::min)(Common::AlignUp(size, MAX_ALIGNMENT), MAX_STREAM_BUFFER_SIZE);
 }
 // TEST ONLY: EDEN_NX2_TEST_STREAM_LOG=1 logs every wrap of the stream buffer, a wrap that finds
-// the start still in use (with the next 64 requests), and any stream range handed out over one
-// whose tick the GPU has not completed. EDEN_NX2_TEST_STREAM_DIVISOR=<n> (1 to 64) shrinks the
-// stream buffer n times, so that it wraps more often.
+// the start still in use (with the next 64 requests), any stream range handed out over one whose
+// tick the GPU has not completed, and once a second the requests that fell back to a separate
+// buffer. EDEN_NX2_TEST_STREAM_DIVISOR=<n> (1 to 64) shrinks the stream buffer n times.
 bool TestStreamLog() {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_TEST_STREAM_LOG");
@@ -115,8 +115,7 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
       stream_buffer_size{Common::AlignDown(GetStreamBufferSize(device) / TestStreamDivisor(),
                                            MAX_ALIGNMENT * StagingBufferPool::NUM_SYNCS)},
-      region_size{stream_buffer_size /
-                                                                   StagingBufferPool::NUM_SYNCS} {
+      stream_ring{stream_buffer_size, MAX_ALIGNMENT} {
     VkBufferCreateInfo stream_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
@@ -148,7 +147,7 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
     if (TestStreamLog() || TestStreamDivisor() != 1) {
         LOG_INFO(Render_Vulkan, "TEST stream buffer probe: size={:#x} region={:#x} divisor={} log={}",
-                 stream_buffer_size, region_size, TestStreamDivisor(), TestStreamLog());
+                 stream_buffer_size, stream_ring.RegionSize(), TestStreamDivisor(), TestStreamLog());
     }
 }
 
@@ -164,7 +163,7 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
                       size, static_cast<u32>(usage));
         }
     }
-    if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
+    if (!deferred && usage == MemoryUsage::Upload && size <= stream_ring.RegionSize()) {
         return GetStreamBuffer(size);
     }
     return GetStagingBuffer(size, usage, deferred);
@@ -198,56 +197,43 @@ void StagingBufferPool::TickFrame() {
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
-    if (AreRegionsActive(Region(free_iterator) + 1,
-                         (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
-        ++test_fallbacks_ahead;
+    // The GPU's tick is read once for the whole scan.
+    const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    // TEST ONLY: the probe follows the ring's cursor (the same arithmetic) to tell a wrap.
+    const u64 current_tick = scheduler.CurrentTick();
+    const bool test_wraps = test_cursor + size >= stream_buffer_size;
+    const std::optional<size_t> offset = stream_ring.Allocate(
+        size, current_tick, [gpu_tick](u64 tick) { return gpu_tick >= tick; });
+    if (!offset) {
+        if (test_wraps) {
+            ++test_fallbacks_wrap;
+            // Logged once per stretch: until the start is free every wrapping request falls back.
+            if (TestStreamLog() && !std::exchange(test_busy_stretch, true)) {
+                LOG_WARNING(Render_Vulkan,
+                            "TEST stream wrap: start busy, cursor stays at the end and request "
+                            "size={:#x} falls back; current_tick={} gpu_tick={}",
+                            size, current_tick, gpu_tick);
+            }
+        } else {
+            ++test_fallbacks_ahead;
+        }
         // Avoid waiting for the previous usages to be free
         return GetStagingBuffer(size, MemoryUsage::Upload);
     }
-    const u64 current_tick = scheduler.CurrentTick();
-    std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
-              current_tick);
-    used_iterator = iterator;
-    free_iterator = (std::max)(free_iterator, iterator + size);
-
-    if (iterator + size >= stream_buffer_size) {
-        std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + NUM_SYNCS,
-                  current_tick);
-        used_iterator = 0;
-        iterator = 0;
-        free_iterator = size;
-
-        const bool start_busy = AreRegionsActive(0, Region(size) + 1);
-        if (TestStreamLog()) {
-            const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
-            if (start_busy) {
-                LOG_WARNING(Render_Vulkan,
-                            "TEST stream wrap: start busy, cursor reset to 0 and request size={:#x} "
-                            "falls back; current_tick={} gpu_tick={} start region ticks={}",
-                            size, current_tick, gpu_tick,
-                            fmt::join(sync_ticks.begin(), sync_ticks.begin() + Region(size) + 1, ","));
-                test_stream_after_fallback = 64;
-            } else {
-                LOG_INFO(Render_Vulkan, "TEST stream wrap: current_tick={} gpu_tick={}", current_tick,
-                         gpu_tick);
-            }
-        }
-        if (start_busy) {
-            ++test_fallbacks_wrap;
-            // Avoid waiting for the previous usages to be free
-            return GetStagingBuffer(size, MemoryUsage::Upload);
-        }
-    }
-    const size_t offset = iterator;
-    iterator = Common::AlignUp(iterator + size, MAX_ALIGNMENT);
+    test_cursor = Common::AlignUp(*offset + size, MAX_ALIGNMENT);
+    test_busy_stretch = false;
     if (TestStreamLog()) {
-        TestNoteStream(offset, size, current_tick);
+        if (test_wraps) {
+            LOG_INFO(Render_Vulkan, "TEST stream wrap: current_tick={} gpu_tick={}", current_tick,
+                     gpu_tick);
+        }
+        TestNoteStream(*offset, size, current_tick);
     }
     return StagingBufferRef{
         .buffer = *stream_buffer,
         .device_address = stream_buffer_address,
-        .offset = static_cast<VkDeviceSize>(offset),
-        .mapped_span = stream_pointer.subspan(offset, size),
+        .offset = static_cast<VkDeviceSize>(*offset),
+        .mapped_span = stream_pointer.subspan(*offset, size),
         .usage{},
         .log2_level{},
         .index{},
@@ -265,6 +251,7 @@ void StagingBufferPool::TestNoteStream(size_t offset, size_t size, u64 tick) {
     const u64 serial = test_stream_serial++;
     // Stream requests are at most one region, so an overlapping range starts at most one region
     // below this one.
+    const size_t region_size = stream_ring.RegionSize();
     const size_t window_begin = offset > region_size ? offset - region_size : 0;
     for (auto it = test_stream_live.lower_bound(window_begin);
          it != test_stream_live.end() && it->first < offset + size; ++it) {
@@ -277,19 +264,8 @@ void StagingBufferPool::TestNoteStream(size_t offset, size_t size, u64 tick) {
                       it->second.tick, gpu_tick);
         }
     }
-    if (test_stream_after_fallback > 0) {
-        --test_stream_after_fallback;
-        LOG_WARNING(Render_Vulkan, "TEST stream request #{} after a busy wrap: [{:#x}, +{:#x}) tick={} gpu_tick={}",
-                    serial, offset, size, tick, gpu_tick);
-    }
     test_stream_live.emplace(offset, TestStreamRange{.size = size, .tick = tick, .serial = serial});
 }
-
-bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end) const {
-    const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
-    return std::any_of(sync_ticks.begin() + region_begin, sync_ticks.begin() + region_end,
-                       [gpu_tick](u64 sync_tick) { return gpu_tick < sync_tick; });
-};
 
 StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage usage,
                                                      bool deferred) {
@@ -371,11 +347,17 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         if (logged++ == 0) {
             LogMemoryTrace(device);
         }
-        // The submitted ticks are done, so the stream buffer after its last range is free unless
-        // the open tick wrapped into it. The ranges before it may hold data for commands not
-        // recorded yet, so it does not wrap.
-        if (usage != MemoryUsage::Upload || deferred || iterator + size >= stream_buffer_size ||
-            AreRegionsActive(Region(iterator), Region(iterator + size) + 1)) {
+        // The stream buffer at its cursor, without wrapping (StreamRing::TakeAtCursor).
+        const std::optional<size_t> offset =
+            usage != MemoryUsage::Upload || deferred
+                ? std::nullopt
+                : stream_ring.TakeAtCursor(
+                      size, [gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick()](
+                                u64 tick) { return gpu_tick >= tick; });
+        if (offset) {
+            test_cursor = Common::AlignUp(*offset + size, MAX_ALIGNMENT);
+        }
+        if (!offset) {
             LOG_CRITICAL(Render_Vulkan, "No memory for a {} byte staging buffer (usage {})", size,
                          static_cast<u32>(usage));
             throw vk::Exception(VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -384,14 +366,11 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
             LOG_ERROR(Render_Vulkan,
                       "No memory for a {} byte upload buffer; using the stream buffer", size);
         }
-        const size_t offset = iterator;
-        free_iterator = (std::max)(free_iterator, offset + size);
-        iterator = Common::AlignUp(offset + size, MAX_ALIGNMENT);
         return StagingBufferRef{
             .buffer = *stream_buffer,
             .device_address = stream_buffer_address,
-            .offset = static_cast<VkDeviceSize>(offset),
-            .mapped_span = stream_pointer.subspan(offset, size),
+            .offset = static_cast<VkDeviceSize>(*offset),
+            .mapped_span = stream_pointer.subspan(*offset, size),
             .usage{},
             .log2_level{},
             .index{},
