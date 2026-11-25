@@ -71,6 +71,10 @@ struct Assembler {
     void Exit() {
         Emit(0xe30000000007000fULL);
     }
+    /// @P[pred] KIL
+    void Kill(u32 pred) {
+        Emit(0xe33000000000000fULL | (u64{pred} << 16));
+    }
     std::vector<u64> Code() const {
         std::vector<u64> code;
         for (u32 i = 0; i < insns.size(); ++i) {
@@ -155,10 +159,29 @@ std::vector<u64> ChainWithEntry(u32 steps, u32 entry) {
     return a.Code();
 }
 
+/// The chain in a fragment program, with an invocation discarded (KIL) halfway through it.
+std::vector<u64> ChainWithKill(u32 steps, u32 kill_after) {
+    Assembler a;
+    a.LoadConst(0, 0, false);
+    a.LoadConst(2, 0x310, true);
+    for (u32 step = 0; step < steps; ++step) {
+        Step(a, step, "done");
+        if (step == kill_after) {
+            a.SetPred(1, 0, 2, 77);
+            a.Kill(1);
+        }
+    }
+    a.Label("done");
+    a.Store(0, 0xff0);
+    a.Exit();
+    return a.Code();
+}
+
 class ChainEnvironment final : public Environment {
 public:
-    explicit ChainEnvironment(std::span<const u64> code_) : code{code_} {
-        stage = Stage::Compute;
+    explicit ChainEnvironment(std::span<const u64> code_, Stage stage_ = Stage::Compute)
+        : code{code_} {
+        stage = stage_;
     }
     u64 ReadInstruction(u32 address) override {
         for (u32 index = 0; index < code.size(); ++index) {
@@ -211,8 +234,9 @@ private:
     std::span<const u64> code;
 };
 
-std::vector<u32> Emit(std::span<const u64> code, const std::string& name) {
-    ChainEnvironment env{code};
+std::vector<u32> Emit(std::span<const u64> code, const std::string& name,
+                      Stage stage = Stage::Compute) {
+    ChainEnvironment env{code, stage};
     ObjectPool<Maxwell::Flow::Block> flow_pool;
     Maxwell::Flow::CFG cfg{env, flow_pool, Maxwell::Location{0x50}};
     ObjectPool<IR::Inst> inst_pool;
@@ -220,10 +244,12 @@ std::vector<u32> Emit(std::span<const u64> code, const std::string& name) {
     HostTranslateInfo host{};
     host.min_ssbo_alignment = 16;
     host.support_int64 = true;
+    host.needs_demote_reorder = true;
     auto program = Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
     Profile profile{};
     profile.supported_spirv = 0x00010300;
     profile.min_ssbo_alignment = 16;
+    profile.support_demote_to_helper_invocation = true;
     std::vector<u32> spirv = Backend::SPIRV::EmitSPIRV(profile, program);
     if (const char* const dir = std::getenv("LICHII_TEST_GOTO_CHAIN_DUMP")) {
         std::ofstream file{std::string{dir} + "/" + name + ".spv", std::ios::binary};
@@ -251,6 +277,28 @@ size_t MaxOpenConstructs(std::span<const u32> spirv) {
         at += count;
     }
     return most;
+}
+/// Whether every demote (OpDemoteToHelperInvocation) is emitted inside a loop construct.
+bool DemotesInsideLoops(std::span<const u32> spirv) {
+    constexpr u32 OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpDemote = 5380;
+    std::vector<std::pair<u32, bool>> open; // merge label, is a loop
+    size_t demotes = 0;
+    for (size_t at = 5; at < spirv.size();) {
+        const u32 count = spirv[at] >> 16, opcode = spirv[at] & 0xffff;
+        REQUIRE(count > 0);
+        if (opcode == OpLabel) {
+            std::erase_if(open, [&](const auto& entry) { return entry.first == spirv[at + 1]; });
+        } else if (opcode == OpSelectionMerge || opcode == OpLoopMerge) {
+            open.emplace_back(spirv[at + 1], opcode == OpLoopMerge);
+        } else if (opcode == OpDemote) {
+            ++demotes;
+            if (std::ranges::none_of(open, [](const auto& entry) { return entry.second; })) {
+                return false;
+            }
+        }
+        at += count;
+    }
+    return demotes > 0;
 }
 } // namespace
 
@@ -283,4 +331,14 @@ TEST_CASE("A loop exit between chain branches still leaves the loop",
 TEST_CASE("A branch into the middle of a long chain", "[shader][structured_control_flow]") {
     const auto code = ChainWithEntry(70, 40);
     CHECK(MaxOpenConstructs(Emit(code, "entry")) <= 8);
+}
+
+TEST_CASE("A discard inside a long chain stays inside its breakable block",
+          "[shader][structured_control_flow]") {
+    // Reordering demotes to the end of the program (needs_demote_reorder) must not take one out
+    // of a breakable block: its condition is computed on a path the block may have left.
+    const auto code = ChainWithKill(70, 40);
+    const auto spirv = Emit(code, "kill", Stage::Fragment);
+    CHECK(MaxOpenConstructs(spirv) <= 4);
+    CHECK(DemotesInsideLoops(spirv));
 }
