@@ -108,6 +108,18 @@ VkDeviceSize TestStreamDivisor() {
     }();
     return divisor;
 }
+
+// TEST ONLY: EDEN_NX2_TEST_STREAM_LAG=<n> (0 to 1000): the stream buffer's region checks and the
+// probe's overlap detector see the GPU n ticks behind the known tick, a pessimistic GPU. It can
+// only add fallbacks; correct code never hands out a range the lagged GPU has not passed.
+u64 TestLagged(u64 gpu_tick) {
+    static const u64 lag = [] {
+        const char* const value = std::getenv("EDEN_NX2_TEST_STREAM_LAG");
+        const unsigned long long parsed = value ? std::strtoull(value, nullptr, 10) : 0;
+        return static_cast<u64>(parsed <= 1000 ? parsed : 0);
+    }();
+    return gpu_tick > lag ? gpu_tick - lag : 0;
+}
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
@@ -145,9 +157,11 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     }
     stream_pointer = stream_buffer.Mapped();
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
-    if (TestStreamLog() || TestStreamDivisor() != 1) {
-        LOG_INFO(Render_Vulkan, "TEST stream buffer probe: size={:#x} region={:#x} divisor={} log={}",
-                 stream_buffer_size, stream_ring.RegionSize(), TestStreamDivisor(), TestStreamLog());
+    if (TestStreamLog() || TestStreamDivisor() != 1 || TestLagged(1000) != 1000) {
+        LOG_INFO(Render_Vulkan,
+                 "TEST stream buffer probe: size={:#x} region={:#x} divisor={} log={} lag={}",
+                 stream_buffer_size, stream_ring.RegionSize(), TestStreamDivisor(), TestStreamLog(),
+                 1000 - TestLagged(1000));
     }
 }
 
@@ -198,7 +212,7 @@ void StagingBufferPool::TickFrame() {
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
     // The GPU's tick is read once for the whole scan.
-    const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    const u64 gpu_tick = TestLagged(scheduler.GetMasterSemaphore().KnownGpuTick());
     // TEST ONLY: the probe follows the ring's cursor (the same arithmetic) to tell a wrap.
     const u64 current_tick = scheduler.CurrentTick();
     const bool test_wraps = test_cursor + size >= stream_buffer_size;
@@ -241,7 +255,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
 }
 
 void StagingBufferPool::TestNoteStream(size_t offset, size_t size, u64 tick) {
-    const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    const u64 gpu_tick = TestLagged(scheduler.GetMasterSemaphore().KnownGpuTick());
     if (gpu_tick != test_stream_pruned_tick) {
         test_stream_pruned_tick = gpu_tick;
         std::erase_if(test_stream_live, [gpu_tick](const auto& entry) {
@@ -352,7 +366,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
             usage != MemoryUsage::Upload || deferred
                 ? std::nullopt
                 : stream_ring.TakeAtCursor(
-                      size, [gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick()](
+                      size, [gpu_tick = TestLagged(scheduler.GetMasterSemaphore().KnownGpuTick())](
                                 u64 tick) { return gpu_tick >= tick; });
         if (offset) {
             test_cursor = Common::AlignUp(*offset + size, MAX_ALIGNMENT);
