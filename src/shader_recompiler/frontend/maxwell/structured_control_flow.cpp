@@ -322,9 +322,9 @@ bool AreOrdered(Node left_sibling, Node right_sibling) noexcept {
     }
 }
 
-/// From this many conditional gotos to one label on, the forward ones leave one breakable block instead of
-/// each wrapping the rest in a selection: N nested selections are N brackets deep in the shading
-/// language (Metal rejects more than 256), and a breakable block is two.
+/// From this many conditional gotos to one label on, the forward ones leave one breakable block
+/// instead of each wrapping the rest in a selection: N nested selections are N brackets deep in
+/// the shading language (Metal rejects more than 256), and a breakable block is two.
 constexpr u32 BREAKABLE_BLOCK_GOTOS = 64;
 
 /// A break in `stmt` that leaves the loop enclosing `stmt` (not one inside a loop of its own).
@@ -573,11 +573,14 @@ private:
         }
         Tree moved;
         moved.splice(moved.begin(), body, std::next(goto_stmt), Tree::s_iterator_to(*block));
+        // Only the moved statements change parent: a long chain extends the block once per goto
+        for (Statement& stmt : moved) {
+            stmt.up = block;
+        }
         block->children.splice(block->children.begin(), moved);
         Statement* const exit{pool.Create(Break{}, goto_stmt->cond, block)};
         exit->selection_break = true;
         block->children.push_front(*exit);
-        UpdateTreeUp(block);
         body.erase(goto_stmt);
         return true;
     }
@@ -850,8 +853,10 @@ private:
 
                 IR::Block* const continue_block{block_pool.Create(inst_pool)};
                 IR::Block* const merge_block{MergeBlock(parent, stmt)};
-                if (stmt.cond->type == StatementType::Identity &&
-                    stmt.cond->guest_cond == IR::Condition{false}) {
+                // A breakable block (GotoPass::EliminateAsBreak) never repeats
+                const bool never_repeats{stmt.cond->type == StatementType::Identity &&
+                                         stmt.cond->guest_cond == IR::Condition{false}};
+                if (never_repeats) {
                     never_repeating_merges.push_back(merge_block);
                 }
 
@@ -869,7 +874,14 @@ private:
                 IR::Block* const body_block{syntax_list.at(body_block_index).data.block};
                 loop_header_block->AddBranch(body_block);
 
-                continue_block->AddBranch(loop_header_block);
+                // No back edge in the IR for a loop that never repeats: its header then has one
+                // predecessor, so the values read in it are the ones from before it instead of
+                // phis with the end of the block, which would hide constants and the handles
+                // and pointers the texture and storage buffer passes track. The Repeat node
+                // still emits the back edge SPIR-V's structured loops need.
+                if (!never_repeats) {
+                    continue_block->AddBranch(loop_header_block);
+                }
                 continue_block->AddBranch(merge_block);
 
                 current_block = merge_block;
@@ -889,6 +901,7 @@ private:
                 repeat.data.repeat.cond = cond;
                 repeat.data.repeat.loop_header = loop_header_block;
                 repeat.data.repeat.merge = merge_block;
+                repeat.data.repeat.never = never_repeats;
 
                 auto& merge{syntax_list.emplace_back()};
                 merge.type = IR::AbstractSyntaxNode::Type::Block;

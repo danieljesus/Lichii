@@ -40,6 +40,7 @@ struct AbstractSyntaxNode {
             U1 cond;
             Block* loop_header;
             Block* merge;
+            bool never; ///< A breakable block: the back edge is never taken
         } repeat;
         struct {
             U1 cond;

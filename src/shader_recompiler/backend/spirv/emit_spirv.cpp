@@ -209,12 +209,7 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
             // A loop that never repeats (a breakable block) needs no iteration limit.
-            IR::Value repeat{node.data.repeat.cond.Resolve()};
-            if (!repeat.IsImmediate() && repeat.Inst()->GetOpcode() == IR::Opcode::ConditionRef) {
-                repeat = repeat.Inst()->Arg(0).Resolve();
-            }
-            const bool repeats{!repeat.IsImmediate() || repeat.U1()};
-            if (repeats && !Settings::values.disable_shader_loop_safety_checks) {
+            if (!node.data.repeat.never && !Settings::values.disable_shader_loop_safety_checks) {
                 const Id pointer_type{ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1])};
                 const Id safety_counter{ctx.AddGlobalVariable(
                     pointer_type, spv::StorageClass::Private, ctx.Const(0x2000u))};

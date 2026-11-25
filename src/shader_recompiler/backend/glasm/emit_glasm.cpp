@@ -225,7 +225,8 @@ void EmitCode(EmitContext& ctx, const IR::Program& program) {
             ctx.Add("REP;");
             break;
         case IR::AbstractSyntaxNode::Type::Repeat:
-            if (!Settings::values.disable_shader_loop_safety_checks) {
+            // A loop that never repeats (a breakable block) needs no iteration limit.
+            if (!node.data.repeat.never && !Settings::values.disable_shader_loop_safety_checks) {
                 const u32 loop_index{ctx.num_safety_loop_vars++};
                 const u32 vector_index{loop_index / 4};
                 const char component{"xyzw"[loop_index % 4]};

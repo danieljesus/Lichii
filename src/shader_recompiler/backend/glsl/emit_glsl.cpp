@@ -147,7 +147,8 @@ void EmitCode(EmitContext& ctx, const IR::Program& program) {
             ctx.Add("for(;;){{");
             break;
         case IR::AbstractSyntaxNode::Type::Repeat:
-            if (Settings::values.disable_shader_loop_safety_checks) {
+            // A loop that never repeats (a breakable block) needs no iteration limit.
+            if (node.data.repeat.never || Settings::values.disable_shader_loop_safety_checks) {
                 ctx.Add("if(!{}){{break;}}}}", ctx.var_alloc.Consume(node.data.repeat.cond));
             } else {
                 ctx.Add("if(--loop{}<0 || !{}){{break;}}}}", ctx.num_safety_loop_vars++,
