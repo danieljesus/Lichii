@@ -299,6 +299,18 @@ struct NupDecompressCache {
         it->second->charge -= DecoderCharge;
         bytes -= DecoderCharge;
     }
+
+    /// Stops charging an in-memory member's data, which could not be allocated.
+    void ReleaseData(std::size_t file_index, const NupMember& member, u64 size) {
+        std::scoped_lock lock{mutex};
+        const auto it = index.find(file_index);
+        if (it == index.end() || it->second->member.get() != &member ||
+            it->second->charge < size) {
+            return;
+        }
+        it->second->charge -= static_cast<std::size_t>(size);
+        bytes -= static_cast<std::size_t>(size);
+    }
 };
 
 namespace {
@@ -395,8 +407,14 @@ private:
                 ok = DecodeStep(member);
             } catch (...) {
                 // A step that throws (an allocation, a backing file's read) leaves the decoder in
-                // an unknown state: the member fails, and the readers waiting on it are woken to
-                // see that rather than waiting for a step that never ends.
+                // an unknown state: the member fails as any other failure does, its decoder freed
+                // while this thread still owns it, and the readers waiting on it are woken to see
+                // that rather than wait for a step that never ends.
+                try {
+                    FinishDecoder(member);
+                } catch (...) {
+                    // Only a lock that cannot be taken: the decoder stays until eviction.
+                }
                 lock.lock();
                 member.decoding = false;
                 member.failed = true;
@@ -411,18 +429,21 @@ private:
         return true;
     }
 
+    /// Frees the member's decoder and stops counting it; the caller owns the decoder.
+    void FinishDecoder(NupMember& member) const {
+        member.dctx.reset();
+        if (spilled) {
+            cache->RemoveSpillDecoder(member);
+        } else {
+            cache->ReleaseDecoder(cache_index, member);
+        }
+    }
+
     /// Decodes the next input chunk; the caller owns the member's decoder. The last byte is
     /// published only once the extent has ended exactly at the file size. False on failure.
     bool DecodeStep(NupMember& member) const {
         u64 decoded = member.decoded.load(std::memory_order_relaxed);
-        const auto finish = [&] {
-            member.dctx.reset();
-            if (spilled) {
-                cache->RemoveSpillDecoder(member);
-            } else {
-                cache->ReleaseDecoder(cache_index, member);
-            }
-        };
+        const auto finish = [&] { FinishDecoder(member); };
         const auto fail = [&](const char* reason) {
             LOG_ERROR(Loader, "NUP zstd decompression of {} failed at byte {}: {}", name,
                       member.produced, reason);
@@ -450,10 +471,13 @@ private:
                     }
                 } else {
                     // The size is the record's, which a damaged file can set to anything up to
-                    // half the cache cap: a failed allocation fails the member.
+                    // half the cache cap: a failed allocation fails the member, and its reads
+                    // return nothing, as for a member whose data is damaged. The cap stops
+                    // counting a buffer that does not exist.
                     member.data.reset(new (std::nothrow)
                                           u8[static_cast<std::size_t>(uncompressed_size)]);
                     if (!member.data) {
+                        cache->ReleaseData(cache_index, member, uncompressed_size);
                         return fail("cannot allocate the member");
                     }
                 }

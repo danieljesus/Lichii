@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <memory>
 #include <new>
@@ -413,42 +414,76 @@ TEST_CASE("NUP serves a sound sibling in place of a .zs member with no zstd head
 
 TEST_CASE("NUP zstd readers waiting on a member are woken when its decode throws",
           "[nup][nup-read]") {
-    // A backing file whose reads throw once armed, as an allocation inside one can.
+    // A backing file whose reads, once armed, wait until released and then throw, as an
+    // allocation inside one can.
     struct ThrowingFile : FileSys::VectorVfsFile {
         using VectorVfsFile::VectorVfsFile;
         std::size_t Read(u8* out, std::size_t length, std::size_t offset) const override {
             if (armed) {
+                entered = true;
+                while (!released) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                }
                 throw std::bad_alloc{};
             }
             return VectorVfsFile::Read(out, length, offset);
         }
         mutable std::atomic<bool> armed{};
+        mutable std::atomic<bool> entered{};
+        mutable std::atomic<bool> released{};
+    };
+    // A read on a thread of its own: joined when it ends in time, left behind (with everything it
+    // reads, which it holds) when it does not, so it cannot outlive a passing test.
+    struct Reader {
+        std::future<std::size_t> result;
+        std::thread thread;
+        Reader(FileSys::VirtualFile file, std::shared_ptr<ThrowingFile> backing) {
+            std::packaged_task<std::size_t()> task{[file, backing] {
+                std::array<u8, 16> out{};
+                return file->Read(out.data(), out.size(), 0);
+            }};
+            result = task.get_future();
+            thread = std::thread{std::move(task)};
+        }
+        bool Ended(std::chrono::milliseconds timeout) {
+            if (result.wait_for(timeout) != std::future_status::ready) {
+                thread.detach();
+                return false;
+            }
+            thread.join();
+            return true;
+        }
     };
     const auto content = Content(256 * 1024, 31);
-    const auto file = std::make_shared<ThrowingFile>(BuildNup({ZstdMember(content)}));
+    const auto backing = std::make_shared<ThrowingFile>(BuildNup({ZstdMember(content)}));
     TempDir t;
-    const auto nup = std::make_shared<NupContainer>(file, std::size_t{64} << 20, t.path);
-    REQUIRE(nup->GetStatus() == Loader::ResultStatus::Success);
-    const auto member = nup->OpenFile(0);
-    std::array<u8, 16> buffer{};
-    file->armed = true;
-    REQUIRE_THROWS_AS(member->Read(buffer.data(), buffer.size(), 0), std::bad_alloc);
-    file->armed = false;
-    // The member failed: a later read returns nothing rather than waiting for the step that
-    // threw. The thread is left behind, with what it reads, if it never returns.
-    const auto done = std::make_shared<std::atomic<int>>(-1);
-    std::thread([member, done] {
-        std::array<u8, 16> out{};
-        done->store(static_cast<int>(member->Read(out.data(), out.size(), 0)));
-    }).detach();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
-    while (done->load() < 0 && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    NupContainer nup{backing, std::size_t{64} << 20, t.path};
+    REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
+    const auto file = nup.OpenFile(0);
+    backing->armed = true;
+    // The first reader takes the decode step and waits in the backing file's read.
+    Reader first{file, backing};
+    while (!backing->entered) {
+        std::this_thread::yield();
     }
-    REQUIRE(done->load() == 0);
+    // The second waits for that step to end.
+    Reader second{file, backing};
+    REQUIRE(second.result.wait_for(std::chrono::milliseconds{200}) ==
+            std::future_status::timeout);
+    backing->released = true;
+    REQUIRE(first.Ended(std::chrono::seconds{10}));
+    REQUIRE_THROWS_AS(first.result.get(), std::bad_alloc);
+    // The step threw: the waiting reader is woken and reads nothing from the failed member.
+    REQUIRE(second.Ended(std::chrono::seconds{10}));
+    REQUIRE(second.result.get() == 0);
+    // So does a later one, without reaching the backing file, whose reads would still throw.
+    Reader third{file, backing};
+    REQUIRE(third.Ended(std::chrono::seconds{10}));
+    REQUIRE(third.result.get() == 0);
 }
 
-// A sanitizer reports an allocation this large instead of failing it.
+// A sanitizer reports an allocation this large instead of failing it. Elsewhere the nothrow form
+// returns null (glibc, macOS and MSVC alike; it cannot throw std::bad_array_new_length).
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) ||                       \
     __has_feature(memory_sanitizer) || __has_feature(hwaddress_sanitizer)
@@ -460,20 +495,39 @@ TEST_CASE("NUP zstd readers waiting on a member are woken when its decode throws
 #endif
 #ifndef NUP_TEST_NO_HUGE_ALLOCATION
 TEST_CASE("NUP zstd reads fail a member too large to allocate", "[nup][nup-read]") {
-    // A record claiming 2^61 bytes, under half a cache cap that allows it: the member is decoded
-    // in memory, and no address space has room for it.
-    Member member = ZstdMember(Content(4096, 32));
-    member.size = u64{1} << 61;
+    // Records claiming 2^61 bytes, half a cache cap of 2^62: decoded in memory, and no address
+    // space has room for them. A backing file that counts its reads shows whether a small member
+    // read before them is still cached, which it is only if the failed members stopped counting
+    // against the cap.
+    struct CountingFile : FileSys::VectorVfsFile {
+        using VectorVfsFile::VectorVfsFile;
+        std::size_t Read(u8* out, std::size_t length, std::size_t offset) const override {
+            ++reads;
+            return VectorVfsFile::Read(out, length, offset);
+        }
+        mutable std::atomic<std::size_t> reads{};
+    };
+    const auto content = Content(4096, 32);
+    Member huge = ZstdMember(content);
+    huge.size = u64{1} << 61;
+    const auto backing = std::make_shared<CountingFile>(
+        BuildNup({ZstdMember(content), huge, huge}));
     TempDir t;
-    NupContainer nup{Backing(BuildNup({member})), std::numeric_limits<std::size_t>::max(),
-                     t.path};
+    NupContainer nup{backing, std::size_t{1} << 62, t.path};
     REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
-    const auto file = nup.OpenFile(0);
+    REQUIRE(nup.OpenFile(0)->ReadAllBytes() == content);
     std::array<u8, 16> buffer{};
-    std::size_t read = 1;
-    REQUIRE_NOTHROW(read = file->Read(buffer.data(), buffer.size(), 0));
-    REQUIRE(read == 0);
-    REQUIRE_NOTHROW(read = file->Read(buffer.data(), buffer.size(), 0));
-    REQUIRE(read == 0);
+    for (const std::size_t index : {1, 2}) {
+        CAPTURE(index);
+        const auto file = nup.OpenFile(index);
+        std::size_t read = 1;
+        REQUIRE_NOTHROW(read = file->Read(buffer.data(), buffer.size(), 0));
+        REQUIRE(read == 0);
+        REQUIRE_NOTHROW(read = file->Read(buffer.data(), buffer.size(), 0));
+        REQUIRE(read == 0);
+    }
+    backing->reads = 0;
+    REQUIRE(nup.OpenFile(0)->ReadAllBytes() == content);
+    REQUIRE(backing->reads == 0);
 }
 #endif
