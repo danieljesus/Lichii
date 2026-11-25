@@ -13,6 +13,10 @@ namespace Shader {
 struct HostTranslateInfo;
 namespace Maxwell {
 
+/// Tests only: from how many conditional gotos to one label the forward ones leave a breakable
+/// block instead of nesting a selection each (default 64; 0 never does).
+void SetBreakableBlockGotosForTest(u32 gotos) noexcept;
+
 [[nodiscard]] IR::AbstractSyntaxList BuildASL(ObjectPool<IR::Inst>& inst_pool,
                                               ObjectPool<IR::Block>& block_pool, Environment& env,
                                               Flow::CFG& cfg, const HostTranslateInfo& host_info);

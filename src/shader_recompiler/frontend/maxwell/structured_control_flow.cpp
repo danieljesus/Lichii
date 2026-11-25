@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <string>
 #include "common/container/unordered_map.h"
@@ -324,8 +325,9 @@ bool AreOrdered(Node left_sibling, Node right_sibling) noexcept {
 
 /// From this many conditional gotos to one label on, the forward ones leave one breakable block
 /// instead of each wrapping the rest in a selection: N nested selections are N brackets deep in
-/// the shading language (Metal rejects more than 256), and a breakable block is two.
-constexpr u32 BREAKABLE_BLOCK_GOTOS = 64;
+/// the shading language (Metal rejects more than 256), and a breakable block is two. Tests change
+/// it (SetBreakableBlockGotosForTest) to put the blocks in small programs; 0 never makes one.
+std::atomic<u32> breakable_block_gotos{64};
 
 /// A break in `stmt` that leaves the loop enclosing `stmt` (not one inside a loop of its own).
 bool HasEnclosingLoopBreak(const Statement& stmt) {
@@ -552,7 +554,8 @@ private:
     /// EliminateAsConditional, when the label has few gotos or when the code to move holds a
     /// break of an enclosing loop, which would then leave the new loop instead.
     bool EliminateAsBreak(Node goto_stmt, Node label_stmt) {
-        if (gotos_per_label[&*label_stmt] < BREAKABLE_BLOCK_GOTOS) {
+        const u32 threshold{breakable_block_gotos.load(std::memory_order_relaxed)};
+        if (threshold == 0 || gotos_per_label[&*label_stmt] < threshold) {
             return false;
         }
         Tree& body{goto_stmt->up->children};
@@ -1115,6 +1118,10 @@ private:
     const Flow::Block dummy_flow_block{};
 };
 } // Anonymous namespace
+
+void SetBreakableBlockGotosForTest(u32 gotos) noexcept {
+    breakable_block_gotos.store(gotos, std::memory_order_relaxed);
+}
 
 IR::AbstractSyntaxList BuildASL(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
                                 Environment& env, Flow::CFG& cfg,
