@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <random>
 #include <span>
 #include <string_view>
@@ -389,7 +390,19 @@ private:
             }
             member.decoding = true;
             lock.unlock();
-            const bool ok = DecodeStep(member);
+            bool ok = false;
+            try {
+                ok = DecodeStep(member);
+            } catch (...) {
+                // A step that throws (an allocation, a backing file's read) leaves the decoder in
+                // an unknown state: the member fails, and the readers waiting on it are woken to
+                // see that rather than waiting for a step that never ends.
+                lock.lock();
+                member.decoding = false;
+                member.failed = true;
+                member.progress.notify_all();
+                throw;
+            }
             lock.lock();
             member.decoding = false;
             member.failed = !ok;
@@ -436,8 +449,13 @@ private:
                         return fail("cannot create the temporary file");
                     }
                 } else {
-                    member.data = std::make_unique_for_overwrite<u8[]>(
-                        static_cast<std::size_t>(uncompressed_size));
+                    // The size is the record's, which a damaged file can set to anything up to
+                    // half the cache cap: a failed allocation fails the member.
+                    member.data.reset(new (std::nothrow)
+                                          u8[static_cast<std::size_t>(uncompressed_size)]);
+                    if (!member.data) {
+                        return fail("cannot allocate the member");
+                    }
                 }
             }
             // A spilled member whose decoder was freed starts over; output already in its

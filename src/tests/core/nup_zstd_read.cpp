@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <memory>
+#include <new>
 #include <random>
 #include <string>
 #include <string_view>
@@ -406,3 +410,70 @@ TEST_CASE("NUP serves a sound sibling in place of a .zs member with no zstd head
     REQUIRE(package != nullptr);
     REQUIRE(package->GetFile("Rock_WaterTemple_Gate_M_01_Nrm.bntx.zs")->ReadAllBytes() == damaged);
 }
+
+TEST_CASE("NUP zstd readers waiting on a member are woken when its decode throws",
+          "[nup][nup-read]") {
+    // A backing file whose reads throw once armed, as an allocation inside one can.
+    struct ThrowingFile : FileSys::VectorVfsFile {
+        using VectorVfsFile::VectorVfsFile;
+        std::size_t Read(u8* out, std::size_t length, std::size_t offset) const override {
+            if (armed) {
+                throw std::bad_alloc{};
+            }
+            return VectorVfsFile::Read(out, length, offset);
+        }
+        mutable std::atomic<bool> armed{};
+    };
+    const auto content = Content(256 * 1024, 31);
+    const auto file = std::make_shared<ThrowingFile>(BuildNup({ZstdMember(content)}));
+    TempDir t;
+    const auto nup = std::make_shared<NupContainer>(file, std::size_t{64} << 20, t.path);
+    REQUIRE(nup->GetStatus() == Loader::ResultStatus::Success);
+    const auto member = nup->OpenFile(0);
+    std::array<u8, 16> buffer{};
+    file->armed = true;
+    REQUIRE_THROWS_AS(member->Read(buffer.data(), buffer.size(), 0), std::bad_alloc);
+    file->armed = false;
+    // The member failed: a later read returns nothing rather than waiting for the step that
+    // threw. The thread is left behind, with what it reads, if it never returns.
+    const auto done = std::make_shared<std::atomic<int>>(-1);
+    std::thread([member, done] {
+        std::array<u8, 16> out{};
+        done->store(static_cast<int>(member->Read(out.data(), out.size(), 0)));
+    }).detach();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (done->load() < 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    REQUIRE(done->load() == 0);
+}
+
+// A sanitizer reports an allocation this large instead of failing it.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) ||                       \
+    __has_feature(memory_sanitizer) || __has_feature(hwaddress_sanitizer)
+#define NUP_TEST_NO_HUGE_ALLOCATION
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define NUP_TEST_NO_HUGE_ALLOCATION
+#endif
+#ifndef NUP_TEST_NO_HUGE_ALLOCATION
+TEST_CASE("NUP zstd reads fail a member too large to allocate", "[nup][nup-read]") {
+    // A record claiming 2^61 bytes, under half a cache cap that allows it: the member is decoded
+    // in memory, and no address space has room for it.
+    Member member = ZstdMember(Content(4096, 32));
+    member.size = u64{1} << 61;
+    TempDir t;
+    NupContainer nup{Backing(BuildNup({member})), std::numeric_limits<std::size_t>::max(),
+                     t.path};
+    REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
+    const auto file = nup.OpenFile(0);
+    std::array<u8, 16> buffer{};
+    std::size_t read = 1;
+    REQUIRE_NOTHROW(read = file->Read(buffer.data(), buffer.size(), 0));
+    REQUIRE(read == 0);
+    REQUIRE_NOTHROW(read = file->Read(buffer.data(), buffer.size(), 0));
+    REQUIRE(read == 0);
+}
+#endif
