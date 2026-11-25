@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <initializer_list>
 #include <memory>
@@ -28,7 +29,8 @@ struct Write {
 /// Memory that reads as zero and records each write.
 class Callbacks final : public DmntCheatVm::Callbacks {
 public:
-    explicit Callbacks(std::vector<Write>& writes_) : writes{writes_} {}
+    explicit Callbacks(std::vector<Write>& writes_, bool logs_ = false)
+        : writes{writes_}, logs{logs_} {}
     void MemoryReadUnsafe(VAddr, void* data, u64 size) override {
         std::memset(data, 0, static_cast<std::size_t>(size));
     }
@@ -44,9 +46,13 @@ public:
     void ResumeProcess() override {}
     void DebugLog(u8, u64) override {}
     void CommandLog(std::string_view) override {}
+    bool LogsCommands() const override {
+        return logs;
+    }
 
 private:
     std::vector<Write>& writes;
+    bool logs;
 };
 
 CheatEntry Cheat(const std::vector<u32>& words) {
@@ -280,4 +286,23 @@ TEST_CASE("Cheat VM runs a store after an else that an if left open in a loop en
     // A stated limit, not a requirement: the static walk, at depth 0 there, abandons the cheat
     // and leaves the store out. No well-formed cheat leaves an if open inside a loop.
     CHECK(DmntCheatVm::MainStaticStores({Cheat(words)}).empty());
+}
+
+TEST_CASE("Cheat VM opcode cost", "[.][cheats_bench]") {
+    // A loop of N iterations: 300R0000 N, 78010000 00000001 (register 1 += 1), 310R0000, with and
+    // without the per-opcode log lines.
+    for (const bool logs : {true, false}) {
+    for (const u32 iterations : {10'000u, 100'000u}) {
+        const std::vector<u32> words{0x30000000, iterations, 0x78010000, 1, 0x31000000};
+        std::vector<Write> writes;
+        DmntCheatVm vm{std::make_unique<Callbacks>(writes, logs)};
+        REQUIRE(vm.LoadProgram({Cheat(words)}));
+        const auto begin = std::chrono::steady_clock::now();
+        vm.Execute(CheatProcessMetadata{});
+        const auto elapsed = std::chrono::steady_clock::now() - begin;
+        const double ns = std::chrono::duration<double, std::nano>(elapsed).count();
+        WARN("CHEATBENCH logs=" << logs << " " << iterations * 2 << " opcodes in " << ns / 1e6
+                                << " ms: " << ns / (iterations * 2.0) << " ns per opcode");
+    }
+    }
 }

@@ -40,6 +40,7 @@ public:
     void ResumeProcess() override;
     void DebugLog(u8 id, u64 value) override;
     void CommandLog(std::string_view data) override;
+    bool LogsCommands() const override;
 
 private:
     bool IsAddressInRange(VAddr address) const;

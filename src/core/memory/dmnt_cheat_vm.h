@@ -282,6 +282,10 @@ public:
 
         virtual void DebugLog(u8 id, u64 value) = 0;
         virtual void CommandLog(std::string_view data) = 0;
+        /// Whether CommandLog is read: the per-opcode lines are only made when it is.
+        virtual bool LogsCommands() const {
+            return true;
+        }
     };
 
     static constexpr std::size_t MaximumProgramOpcodeCount = 0x400;

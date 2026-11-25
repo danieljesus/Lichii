@@ -129,6 +129,10 @@ void StandardVmCallbacks::CommandLog(std::string_view data) {
               data.back() == '\n' ? data.substr(0, data.size() - 1) : data);
 }
 
+bool StandardVmCallbacks::LogsCommands() const {
+    return Common::Log::IsLevelEnabled(Common::Log::Class::CheatEngine, Common::Log::Level::Debug);
+}
+
 bool StandardVmCallbacks::IsAddressInRange(VAddr in) const {
     if ((in < metadata.main_nso_extents.base ||
          in >= metadata.main_nso_extents.base + metadata.main_nso_extents.size) &&

@@ -913,18 +913,23 @@ void DmntCheatVm::Execute(const CheatProcessMetadata& metadata) {
     ResetState();
 
     // Loop until program finishes.
+    const bool log_commands = callbacks->LogsCommands();
     while (DecodeNextOpcode(cur_opcode)) {
-        callbacks->CommandLog(
-            fmt::format("Instruction Ptr: {:04X}", static_cast<u32>(instruction_ptr)));
+        // About 35 lines an opcode, which cost more than running it: only when someone reads them.
+        if (log_commands) {
+            callbacks->CommandLog(
+                fmt::format("Instruction Ptr: {:04X}", static_cast<u32>(instruction_ptr)));
 
-        for (std::size_t i = 0; i < NumRegisters; i++) {
-            callbacks->CommandLog(fmt::format("Registers[{:02X}]: {:016X}", i, registers[i]));
-        }
+            for (std::size_t i = 0; i < NumRegisters; i++) {
+                callbacks->CommandLog(fmt::format("Registers[{:02X}]: {:016X}", i, registers[i]));
+            }
 
-        for (std::size_t i = 0; i < NumRegisters; i++) {
-            callbacks->CommandLog(fmt::format("SavedRegs[{:02X}]: {:016X}", i, saved_values[i]));
+            for (std::size_t i = 0; i < NumRegisters; i++) {
+                callbacks->CommandLog(
+                    fmt::format("SavedRegs[{:02X}]: {:016X}", i, saved_values[i]));
+            }
+            LogOpcode(cur_opcode);
         }
-        LogOpcode(cur_opcode);
 
         // Increment conditional depth, if relevant.
         if (cur_opcode.begin_conditional_block) {
