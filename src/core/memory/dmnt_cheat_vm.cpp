@@ -814,8 +814,11 @@ std::vector<DmntCheatVm::MainStore> DmntCheatVm::MainStaticStores(
         }
         if (const auto* store = std::get_if<StoreStaticOpcode>(&opcode.opcode)) {
             const auto offset = values[store->offset_register & 0xF];
+            // Execute writes only these widths: a store of another width writes nothing.
+            const bool writes = store->bit_width == 1 || store->bit_width == 2 ||
+                                store->bit_width == 4 || store->bit_width == 8;
             if (store->mem_type == MemoryAccessType::MainNso && loop_depth == 0 && offset &&
-                position < ends.size()) {
+                writes && position < ends.size()) {
                 const u64 begin = store->rel_address + *offset;
                 stores.push_back({ends[position].second, begin, begin + store->bit_width});
             }

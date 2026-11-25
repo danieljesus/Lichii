@@ -281,3 +281,20 @@ TEST_CASE("Cheat VM runs a store after an else that an if left open in a loop en
     // and leaves the store out. No well-formed cheat leaves an if open inside a loop.
     CHECK(DmntCheatVm::MainStaticStores({Cheat(words)}).empty());
 }
+
+TEST_CASE("Cheat VM's static stores leave out a store of a width Execute does not write",
+          "[core][cheats]") {
+    // 03000000 00001000 V: a static store of width 3. Execute writes widths 1, 2, 4 and 8 only.
+    const std::vector<u32> words{0x03000000, 0x1000, 1};
+    CHECK(Run(words).empty());
+    CHECK(DmntCheatVm::MainStaticStores({Cheat(words)}).empty());
+    // The widths it writes are listed.
+    for (const u32 width : {1u, 2u, 4u, 8u}) {
+        CAPTURE(width);
+        const auto words_ok = width == 8 ? std::vector<u32>{0x08000000, 0x1000, 0, 1}
+                                         : StoreStatic(width, 1);
+        const auto stores = DmntCheatVm::MainStaticStores({Cheat(words_ok)});
+        REQUIRE(stores.size() == 1);
+        CHECK(stores[0].end - stores[0].begin == width);
+    }
+}
