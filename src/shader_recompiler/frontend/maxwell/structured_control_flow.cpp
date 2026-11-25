@@ -850,6 +850,10 @@ private:
 
                 IR::Block* const continue_block{block_pool.Create(inst_pool)};
                 IR::Block* const merge_block{MergeBlock(parent, stmt)};
+                if (stmt.cond->type == StatementType::Identity &&
+                    stmt.cond->guest_cond == IR::Condition{false}) {
+                    never_repeating_merges.push_back(merge_block);
+                }
 
                 const size_t loop_node_index{syntax_list.size()};
                 syntax_list.emplace_back();
@@ -975,12 +979,24 @@ private:
         std::vector<IR::U1> demote_conds;
         u32 num_epilogues{};
         u32 branch_depth{};
+        // Loops that never repeat (breakable blocks, GotoPass::EliminateAsBreak): a demote in one
+        // is not taken out, as its condition is computed on a path the block may have left.
+        u32 never_repeating_depth{};
+        const auto never_repeats = [&](const IR::Block* merge) {
+            return std::ranges::find(never_repeating_merges, merge) != never_repeating_merges.end();
+        };
         for (const IR::AbstractSyntaxNode& node : syntax_list) {
             if (node.type == Type::If) {
                 ++branch_depth;
             }
             if (node.type == Type::EndIf) {
                 --branch_depth;
+            }
+            if (node.type == Type::Loop && never_repeats(node.data.loop.merge)) {
+                ++never_repeating_depth;
+            }
+            if (node.type == Type::Repeat && never_repeats(node.data.repeat.merge)) {
+                --never_repeating_depth;
             }
             if (node.type != Type::Block) {
                 continue;
@@ -989,7 +1005,7 @@ private:
                 const IR::Opcode op{inst.GetOpcode()};
                 if (op == IR::Opcode::DemoteToHelperInvocation) {
                     // Skip reordering nested demote branches.
-                    if (branch_depth <= 1) {
+                    if (branch_depth <= 1 && never_repeating_depth == 0) {
                         demote_blocks.push_back(node.data.block);
                     }
                     break;
@@ -1082,6 +1098,7 @@ private:
     Environment& env;
     IR::AbstractSyntaxList& syntax_list;
     bool uses_demote_to_helper{};
+    std::vector<IR::Block*> never_repeating_merges;
     const Flow::Block dummy_flow_block{};
 };
 } // Anonymous namespace
