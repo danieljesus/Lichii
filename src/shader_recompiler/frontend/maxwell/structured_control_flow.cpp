@@ -341,6 +341,23 @@ bool HasEnclosingLoopBreak(const Statement& stmt) {
     }
 }
 
+/// Whether execution can continue past `last`, the last statement of a breakable block's body:
+/// a block whose end cannot be reached would have a continue block nothing branches to.
+bool FallsThrough(const Statement& last) {
+    switch (last.type) {
+    case StatementType::Return:
+    case StatementType::Unreachable:
+        return false;
+    case StatementType::Loop:
+        // A loop that always repeats ends only through a break of its own
+        return !(last.cond->type == StatementType::Identity &&
+                 last.cond->guest_cond == IR::Condition{true}) ||
+               std::ranges::any_of(last.children, HasEnclosingLoopBreak);
+    default:
+        return true;
+    }
+}
+
 bool NeedsLift(Node goto_stmt, Node label_stmt) noexcept {
     const Node sibling{SiblingFromNephew(goto_stmt, label_stmt)};
     return AreOrdered(sibling, goto_stmt);
@@ -566,6 +583,11 @@ private:
         }
         const Node moved_end{block ? std::prev(label_stmt) : label_stmt};
         if (std::any_of(std::next(goto_stmt), moved_end, HasEnclosingLoopBreak)) {
+            return false;
+        }
+        // The label is reached only through the gotos when the code before it does not fall
+        // through to it (it returns, as a chain of early exits to an error label does).
+        if (!block && !FallsThrough(*std::prev(label_stmt))) {
             return false;
         }
         if (!block) {
@@ -870,6 +892,9 @@ private:
                 const size_t body_block_index{syntax_list.size()};
                 Visit(stmt, merge_block, continue_block);
 
+                if (never_repeats && continue_block->ImmPredecessors().empty()) {
+                    throw LogicError("The body of a breakable block does not reach its end");
+                }
                 // The continue block is located at the end of the loop
                 IR::IREmitter ir{*continue_block};
                 const IR::U1 cond{ir.ConditionRef(VisitExpr(ir, *stmt.cond))};

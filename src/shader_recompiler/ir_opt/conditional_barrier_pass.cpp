@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -53,7 +54,17 @@ bool IsDivergentSource(const IR::Inst& inst) {
 class Divergence {
 public:
     explicit Divergence(IR::Program& program_)
-        : program{program_}, divergent_loops(program.syntax_list.size()) {
+        : program{program_}, divergent_loops(program.syntax_list.size()),
+          never_loops(program.syntax_list.size()) {
+        std::unordered_map<const IR::Block*, size_t> loop_of_merge;
+        for (size_t index = 0; index < program.syntax_list.size(); ++index) {
+            const IR::AbstractSyntaxNode& node{program.syntax_list[index]};
+            if (node.type == NodeType::Loop) {
+                loop_of_merge[node.data.loop.merge] = index;
+            } else if (node.type == NodeType::Repeat && node.data.repeat.never) {
+                never_loops[loop_of_merge.at(node.data.repeat.merge)] = true;
+            }
+        }
         while (Walk(Mode::Analyze)) {
         }
     }
@@ -106,6 +117,9 @@ private:
     struct Construct {
         size_t node;
         bool divergent;
+        /// A loop that never repeats (a breakable block): there is no next iteration, so a
+        /// divergent break makes only what follows it divergent, as an if around the rest would.
+        bool never{};
     };
 
     // The divergent branches whose way decides whether some invocations skip a barrier: an if
@@ -251,7 +265,7 @@ private:
                 // Values computed in a loop that invocations leave on different iterations differ
                 // after it, even when every iteration computes them uniformly.
                 const bool divergent_loop{std::ranges::any_of(stack, [&](const Construct& c) {
-                    return syntax_list[c.node].type == NodeType::Loop && c.divergent;
+                    return syntax_list[c.node].type == NodeType::Loop && c.divergent && !c.never;
                 })};
                 const bool divergent_merge{divergent_merges.contains(node.data.block)};
                 IR::Block& block{*node.data.block};
@@ -296,7 +310,7 @@ private:
                 break;
             }
             case NodeType::Loop:
-                stack.push_back({index, divergent_loops[index]});
+                stack.push_back({index, divergent_loops[index], never_loops[index]});
                 break;
             case NodeType::Break: {
                 if (mode == Mode::Vote) {
@@ -311,7 +325,11 @@ private:
                                                                 NodeType::Loop;
                                                      })};
                 if (loop != stack.rend()) {
-                    changed |= MarkLoop(loop->node);
+                    if (loop->never) {
+                        loop->divergent = true;
+                    } else {
+                        changed |= MarkLoop(loop->node);
+                    }
                 }
                 break;
             }
@@ -323,6 +341,14 @@ private:
                     Vote(index, node.data.repeat.cond);
                 }
                 const size_t loop{stack.back().node};
+                if (stack.back().never) {
+                    // Invocations reach the merge from different breaks: its phis differ
+                    if (stack.back().divergent) {
+                        changed |= divergent_merges.insert(node.data.repeat.merge).second;
+                    }
+                    stack.pop_back();
+                    break;
+                }
                 if (IsDivergent(node.data.repeat.cond)) {
                     changed |= MarkLoop(loop);
                 }
@@ -340,7 +366,7 @@ private:
                 // ones that returned.
                 exited = true;
                 for (const Construct& construct : stack) {
-                    if (syntax_list[construct.node].type == NodeType::Loop) {
+                    if (syntax_list[construct.node].type == NodeType::Loop && !construct.never) {
                         changed |= MarkLoop(construct.node);
                     }
                 }
@@ -357,6 +383,7 @@ private:
     std::unordered_set<const IR::Inst*> values;
     std::unordered_set<const IR::Block*> divergent_merges;
     std::vector<bool> divergent_loops;
+    std::vector<bool> never_loops;
     std::vector<bool> votes;
     u32 vote_offset{};
     u32 workgroup_size{};
