@@ -2,6 +2,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #ifdef _WIN32
@@ -104,6 +106,44 @@ TEST_CASE("Windows guest memory is committed as it is handed out or mapped",
     CHECK(Query(memory.VirtualBasePointer() + 0x80000).Type != MEM_MAPPED);
     Common::HostMemoryTestAccess::FailCommits(memory, false);
     CHECK(Query(backing + 0x60000).State == MEM_RESERVE);
+}
+
+TEST_CASE("Windows guest memory the fault handler can't track is committed whole",
+          "[host_memory_commit]") {
+    if (!ReservesSection()) {
+        SKIP("the section is committed whole");
+    }
+    // The fault handler tracks 16 sections: past them a reserved one would fault with no handler.
+    constexpr size_t Count = 17;
+    std::vector<std::unique_ptr<Common::HostMemory>> memories;
+    for (size_t i = 0; i < Count; ++i) {
+        memories.push_back(std::make_unique<Common::HostMemory>(Backing, Virtual));
+        REQUIRE(memories.back()->BackingBasePointer() != nullptr);
+        if (memories.back()->VirtualBasePointer() == nullptr) {
+            SKIP("no fastmem arena");
+        }
+    }
+    size_t committed_whole = 0;
+    for (const auto& memory : memories) {
+        u8* const backing = memory->BackingBasePointer();
+        if (Query(backing).State != MEM_COMMIT) {
+            continue;
+        }
+        ++committed_whole;
+        CHECK(Query(backing + Backing - 1).State == MEM_COMMIT);
+        // Nothing handed this page out: a host access must not need the handler.
+        backing[Backing - 1] = 0x5a;
+        CHECK(backing[Backing - 1] == 0x5a);
+        CHECK(memory->CommittedBytes() == 0);
+    }
+    CHECK(committed_whole >= 1);
+    CHECK(Query(memories.front()->BackingBasePointer()).State == MEM_RESERVE);
+
+    // Their slots come back once they are gone.
+    memories.clear();
+    Common::HostMemory memory{Backing, Virtual};
+    REQUIRE(memory.BackingBasePointer() != nullptr);
+    CHECK(Query(memory.BackingBasePointer()).State == MEM_RESERVE);
 }
 #endif
 

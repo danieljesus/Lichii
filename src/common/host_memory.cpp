@@ -166,7 +166,7 @@ struct AddressRange {
 constexpr size_t MaxRanges = 16;
 std::array<AddressRange, MaxRanges> g_backing_ranges;
 std::array<CommitStats, MaxRanges> g_backing_stats;
-CommitStats g_untracked_stats; ///< Counts for guest memory that found no free slot
+CommitStats g_untracked_stats; ///< Counts for a section committed whole, which never faults
 
 void ResetStats(CommitStats& stats) {
     stats.committed_bytes.store(0, std::memory_order_relaxed);
@@ -179,7 +179,8 @@ void ResetStats(CommitStats& stats) {
     }
 }
 
-/// Registers a backing range for the fault handler; returns the counters of its slot.
+/// Registers a backing range for the fault handler; returns the counters of its slot, or nullptr
+/// when every slot is taken.
 CommitStats* AddRange(uintptr_t begin, uintptr_t end) {
     for (size_t i = 0; i < MaxRanges; ++i) {
         auto& range = g_backing_ranges[i];
@@ -192,8 +193,7 @@ CommitStats* AddRange(uintptr_t begin, uintptr_t end) {
             return &g_backing_stats[i];
         }
     }
-    LOG_ERROR(HW_Memory, "No room to track guest memory range {:#x}", begin);
-    return &g_untracked_stats;
+    return nullptr;
 }
 
 void RemoveRange(uintptr_t begin) {
@@ -328,6 +328,31 @@ public:
         // commit of the same size does grow the page file, so make one, release it and try again.
         const char* const commit_all = std::getenv("EDEN_BACKING_COMMIT_ALL");
         reserve_only = commit_all == nullptr || commit_all[0] != '1';
+        if (!MapArena()) {
+            return false;
+        }
+        if (!reserve_only) {
+            return true;
+        }
+        static std::once_flag handler_flag;
+        std::call_once(handler_flag, [] { AddVectoredExceptionHandler(1, ReservedBackingFaultHandler); });
+        if (CommitStats* const range_stats = AddRange(reinterpret_cast<uintptr_t>(backing_base), reinterpret_cast<uintptr_t>(backing_base) + backing_size)) {
+            stats = range_stats;
+            LOG_INFO(HW_Memory, "Guest memory section reserves {} MiB; pages are committed as the kernel hands them out", backing_size >> 20);
+            return true;
+        }
+        // The fault handler tracks MaxRanges sections. In one it doesn't, a host access to a page
+        // nothing committed would be an unhandled access violation: commit this one whole instead,
+        // as SEC_COMMIT did, and keep its fastmem arena.
+        LOG_WARNING(HW_Memory, "{} guest memory sections are already tracked: committing all {} MiB of this one", MaxRanges, backing_size >> 20);
+        Release();
+        reserve_only = false;
+        return MapArena();
+    }
+
+    /// Creates the section (reserved or committed, by reserve_only), its backing view and the
+    /// virtual address placeholder.
+    bool MapArena() {
         const ULONG section_flags = reserve_only ? SEC_RESERVE : SEC_COMMIT;
         for (int attempt = 1; attempt <= BackingAttempts && !backing_handle; ++attempt) {
             backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, section_flags, backing_size, nullptr, nullptr, 0);
@@ -377,12 +402,6 @@ public:
             Release();
             LOG_CRITICAL(HW_Memory, "Failed to reserve {} GiB of virtual memory", virtual_size >> 30);
             return false;
-        }
-        if (reserve_only) {
-            static std::once_flag handler_flag;
-            std::call_once(handler_flag, [] { AddVectoredExceptionHandler(1, ReservedBackingFaultHandler); });
-            stats = AddRange(reinterpret_cast<uintptr_t>(backing_base), reinterpret_cast<uintptr_t>(backing_base) + backing_size);
-            LOG_INFO(HW_Memory, "Guest memory section reserves {} MiB; pages are committed as the kernel hands them out", backing_size >> 20);
         }
         return true;
     }
