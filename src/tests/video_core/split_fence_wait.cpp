@@ -4,6 +4,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <future>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -60,8 +65,15 @@ public:
         : VideoCommon::FenceManager<Traits>{rasterizer_, gpu_, texture, buffer, query},
           submission{submission_} {}
 
+    ~FenceManager() override {
+        if (on_destroy) {
+            on_destroy();
+        }
+    }
+
     u64 queued{};
     u32 submissions{};
+    std::function<void()> on_destroy; ///< Runs first in the destructor, before the base's
 
 protected:
     std::shared_ptr<Fence> CreateFence(bool stubbed) override {
@@ -96,6 +108,15 @@ protected:
 private:
     Submission& submission;
 };
+
+/// Waits up to 30 s for `future`. Past that the test's threads still use its frame (the hook,
+/// the latches, the manager), so the run cannot go on: it aborts, naming what did not happen.
+void WaitOrAbort(std::future<void>& future, const char* what) {
+    if (future.wait_for(std::chrono::seconds{30}) != std::future_status::ready) {
+        std::fprintf(stderr, "split_fence_wait: %s within 30 s\n", what);
+        std::abort();
+    }
+}
 
 } // namespace
 
@@ -160,4 +181,45 @@ TEST_CASE("Immediate fence waits still submit outstanding work", "[video_core][s
         REQUIRE_FALSE(submission.wrong_owner);
     }
     REQUIRE(callback.load());
+}
+
+TEST_CASE("Destroying the fence manager wakes a fencing thread about to sleep",
+          "[video_core][split_fence_wait]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    Cache texture, buffer, query;
+    Submission submission;
+    const auto previous = Settings::values.gpu_fence_behavior.GetValue();
+    SCOPE_EXIT { Settings::values.gpu_fence_behavior.SetValue(previous); };
+    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Accurate);
+    auto manager =
+        std::make_unique<FenceManager>(rasterizer, gpu, texture, buffer, query, submission);
+    // The fencing thread runs the marker's callback, finds no fences and, with guard held, is
+    // about to sleep: there it waits until the destructor has begun, so the destructor begins
+    // while the thread is between its look at the stop flag and its sleep.
+    bool marker_ran{}; // Fencing thread only
+    bool held{};       // Fencing thread only
+    std::promise<void> in_window;
+    std::latch destroying{1};
+    manager->SetFenceThreadSleepHookForTest([&] {
+        if (marker_ran && !held) {
+            held = true;
+            in_window.set_value();
+            destroying.wait();
+        }
+    });
+    manager->on_destroy = [&] { destroying.count_down(); };
+    manager->SignalFence([&] { marker_ran = true; });
+    auto reached = in_window.get_future();
+    WaitOrAbort(reached, "the fencing thread did not reach its sleep after the marker");
+    std::promise<void> destroyed;
+    auto done = destroyed.get_future();
+    std::thread{[&manager, &destroyed] {
+        manager.reset();
+        destroyed.set_value();
+    }}.detach();
+    // A lost wake-up leaves the join waiting forever
+    WaitOrAbort(done, "the fence manager was not destroyed");
 }
