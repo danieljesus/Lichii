@@ -6,6 +6,13 @@
 // deep. The programs read their input from c0[0], store through the global pointer in c0[0x310]
 // and exit through one label, so the same program can also be run on a device to compare the
 // emitted code before and after a change (LICHII_TEST_GOTO_CHAIN_DUMP=<dir> writes the modules).
+//
+// Not proposed upstream. The breakable blocks this branch adds hold up structurally, but they
+// change which pointer or texture handle the trackers pick when it differs by path: both take
+// the candidate nearest by phi depth, and flattening puts every path's value at the same depth,
+// so candidates that differed now tie. In 20,000 random programs (seeds 1000-20999, 12,395 with
+// a breakable block), 153,055 stores were lost only with the change and 35,777 only without it.
+// Making it neutral means changing both trackers. Kept as a reference for the shape finder below.
 
 #include <algorithm>
 #include <array>
