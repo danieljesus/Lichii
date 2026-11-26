@@ -30,9 +30,11 @@ add_executable(tests
     core/address_space.cpp
     core/nx2_streamplay.cpp
     core/nx2_gpu_only_regions.cpp
+    core/nx2_hdr_notifications.cpp
     core/nx2_video_ready.cpp
     core/general_channel.cpp
     core/home_menu.cpp
+    core/window_system.cpp
     core/native_home_bootstrap.cpp
     core/guest_memory_commit.cpp
     core/kernel_core_threads.cpp
@@ -41,6 +43,8 @@ add_executable(tests
     core/nx2_debug_server.cpp
     core/nx2_zip.cpp
     core/nx2_present_pacer.cpp
+    core/nx2_present_queue.cpp
+    core/nx2_syncpoint_allocator.cpp
     core/nx2_fence_action.cpp
     core/nx2_frame_interval.cpp
     core/ldn_lan_protocol.cpp
@@ -109,6 +113,7 @@ add_executable(tests
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
     core/vfs_vector.cpp
+    core/vfs_real.cpp
     core/kip_ini.cpp
     core/add_on_application_id.cpp
     core/ncz_cache.cpp
@@ -126,12 +131,14 @@ add_executable(tests
     video_core/native_texture_header_index.cpp
     video_core/texture_alias_ticks.cpp
     video_core/texture_cache_gob_layout.cpp
+    video_core/image_view_slots.cpp
     video_core/sampled_views.cpp
     video_core/texture_handles.cpp
     video_core/ampere_selevet_modes.cpp
     video_core/ampere_selevet_spills.cpp
     video_core/blit_dither.cpp
     video_core/maxwell_numeric.cpp
+    video_core/maxwell_r2p.cpp
     video_core/maxwell_permute_lod.cpp
     video_core/submission_policy.cpp
     video_core/native_pending_policy.cpp
@@ -162,12 +169,15 @@ add_executable(tests
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/spirv_fragment_shuffle.cpp
+    video_core/phi_identity_operand.cpp
     video_core/mesh_fallback.cpp
     video_core/mesh_vertex_input.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/gpu_trace.cpp
     video_core/nx2_render_follower.cpp
+    video_core/buffer_arena.cpp
+    video_core/nx2_render_view.cpp
     video_core/gpu_written_pages.cpp
     video_core/nx2_semaphore_mirror.cpp
     video_core/command_writer.cpp
@@ -230,9 +240,11 @@ add_executable(tests
     video_core/spirv_software_matrix.cpp
     video_core/spirv_program_name.cpp
     video_core/spirv_builtin_capabilities.cpp
+    video_core/spirv_frag_depth_d24.cpp
     video_core/spirv_min_max_denorms.cpp
     video_core/spirv_nan_safe_min_max.cpp
     video_core/spirv_scalar_constants.cpp
+    video_core/spirv_emit_twice.cpp
     video_core/ssa_fixed_variables.cpp
     video_core/virtual_range_cache.cpp
     video_core/ocarina_upscale.cpp
@@ -322,6 +334,7 @@ add_executable(tests
     video_core/turing_macro_effects.cpp
     video_core/turing_macro_ram.cpp
     video_core/uniform_stream_reuse.cpp
+    video_core/vk_stream_ring.cpp
     video_core/usage_tracker.cpp
     video_core/nx2_backx.cpp
     video_core/vertex_input_cache.cpp
