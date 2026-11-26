@@ -89,6 +89,10 @@ struct Assembler {
     void Exit() {
         Emit(0xe30000000007000fULL);
     }
+    /// @P[pred] EXIT
+    void ExitIf(u32 pred) {
+        Emit(0xe30000000000000fULL | (u64{pred} << 16));
+    }
     std::vector<u64> Code() const {
         std::vector<u64> code;
         for (u32 i = 0; i < insns.size(); ++i) {
@@ -186,6 +190,31 @@ std::vector<u64> TwoKills(bool predicated) {
     a.Label("skip");
     a.Store(0, 0);
     a.Exit();
+    return a.Code();
+}
+
+/// A program whose only EXIT, on R0 == 3, comes before a KIL on R0 == 5 (after a guest loop with
+/// a KIL in it, with `loop`): the other inputs end in a branch to itself, so no EXIT follows the
+/// KIL.
+std::vector<u64> ExitBeforeKill(bool loop) {
+    Assembler a;
+    a.LoadConst(0, 0, false);
+    a.LoadConst(2, 0x310, true);
+    a.SetPred(0, 0, 2, 3);
+    a.ExitIf(0);
+    if (loop) {
+        a.AddImm(20, 255, 2);
+        a.Label("head");
+        a.Kill(7);
+        a.AddImm(20, 20, 0xffffffff);
+        a.SetPred(2, 20, 4, 0, true);
+        a.Branch(2, "head");
+    }
+    a.SetPred(1, 0, 2, 5);
+    a.Kill(1);
+    a.Store(0, 0);
+    a.Label("tail");
+    a.Branch(7, "tail");
     return a.Code();
 }
 
@@ -659,6 +688,42 @@ TEST_CASE("Demote reordering keeps a demote it cannot move along with one it cou
                 INFO("input " << input);
                 CHECK(Discards(program, input));
             }
+        }
+    }
+}
+
+TEST_CASE("Demote reordering leaves a demote that comes after the only return",
+          "[shader][demote_reorder]") {
+    for (const bool loop : {false, true}) {
+        for (const bool reorder : {false, true}) {
+            INFO("loop " << loop << " reorder " << reorder);
+            ObjectPool<IR::Inst> inst_pool;
+            ObjectPool<IR::Block> block_pool;
+            const auto code = ExitBeforeKill(loop);
+            IR::Program program = Translate(inst_pool, block_pool, code, reorder);
+            CHECK(DominanceProblems(program).empty());
+            // The epilogue block comes before the demote after the loop, which stays there
+            std::optional<size_t> epilogue_node, last_demote_node;
+            const auto& list{program.syntax_list};
+            for (size_t index = 0; index < list.size(); ++index) {
+                if (list[index].type != IR::AbstractSyntaxNode::Type::Block) {
+                    continue;
+                }
+                for (const IR::Inst& inst : *list[index].data.block) {
+                    if (inst.GetOpcode() == IR::Opcode::Epilogue) {
+                        epilogue_node = index;
+                    } else if (inst.GetOpcode() == IR::Opcode::DemoteToHelperInvocation) {
+                        last_demote_node = index;
+                    }
+                }
+            }
+            REQUIRE(epilogue_node);
+            REQUIRE(last_demote_node);
+            CHECK(*last_demote_node > *epilogue_node);
+            // Input 3 leaves through the EXIT before any KIL
+            CHECK_FALSE(Discards(program, 3));
+            CHECK_NOTHROW(Emit(program, fmt::format("only_return{}{}", loop ? "_loop" : "",
+                                                    reorder ? "_reorder" : "")));
         }
     }
 }
