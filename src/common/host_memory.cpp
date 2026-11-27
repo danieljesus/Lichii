@@ -334,20 +334,36 @@ public:
         if (!reserve_only) {
             return true;
         }
-        static std::once_flag handler_flag;
-        std::call_once(handler_flag, [] { AddVectoredExceptionHandler(1, ReservedBackingFaultHandler); });
-        if (CommitStats* const range_stats = AddRange(reinterpret_cast<uintptr_t>(backing_base), reinterpret_cast<uintptr_t>(backing_base) + backing_size)) {
+        // Without the fault handler, or in a section it doesn't track (it tracks MaxRanges), a host
+        // access to a page nothing committed would be an unhandled access violation: commit the
+        // section whole instead, as SEC_COMMIT did, and keep its fastmem arena.
+        if (!InstallFaultHandler()) {
+            LOG_ERROR(HW_Memory, "Couldn't install the guest memory fault handler: committing all {} MiB of this section", backing_size >> 20);
+        } else if (CommitStats* const range_stats = AddRange(reinterpret_cast<uintptr_t>(backing_base), reinterpret_cast<uintptr_t>(backing_base) + backing_size)) {
             stats = range_stats;
             LOG_INFO(HW_Memory, "Guest memory section reserves {} MiB; pages are committed as the kernel hands them out", backing_size >> 20);
             return true;
+        } else {
+            LOG_WARNING(HW_Memory, "{} guest memory sections are already tracked: committing all {} MiB of this one", MaxRanges, backing_size >> 20);
         }
-        // The fault handler tracks MaxRanges sections. In one it doesn't, a host access to a page
-        // nothing committed would be an unhandled access violation: commit this one whole instead,
-        // as SEC_COMMIT did, and keep its fastmem arena.
-        LOG_WARNING(HW_Memory, "{} guest memory sections are already tracked: committing all {} MiB of this one", MaxRanges, backing_size >> 20);
         Release();
         reserve_only = false;
         return MapArena();
+    }
+
+    /// Whether the fault handler is installed. A failed registration (Win32 returns null) is
+    /// tried again by the next section.
+    static bool InstallFaultHandler() {
+        if (allocation_test_control && allocation_test_control->fail_fault_handler) {
+            return false;
+        }
+        static std::mutex mutex;
+        static PVOID handler{};
+        std::scoped_lock lock{mutex};
+        if (!handler) {
+            handler = AddVectoredExceptionHandler(1, ReservedBackingFaultHandler);
+        }
+        return handler != nullptr;
     }
 
     /// Creates the section (reserved or committed, by reserve_only), its backing view and the

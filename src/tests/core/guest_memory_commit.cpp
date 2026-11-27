@@ -145,6 +145,42 @@ TEST_CASE("Windows guest memory the fault handler can't track is committed whole
     REQUIRE(memory.BackingBasePointer() != nullptr);
     CHECK(Query(memory.BackingBasePointer()).State == MEM_RESERVE);
 }
+
+TEST_CASE("Windows guest memory is committed whole when the fault handler can't be installed",
+          "[host_memory_commit]") {
+    if (!ReservesSection()) {
+        SKIP("the section is committed whole");
+    }
+    {
+        Common::HostMemoryTestAccess access;
+        access.AllowFastmem();
+        access.FailFaultHandler();
+        const size_t backing_size = access.BackingSize();
+        // Every section, not only the first, while the registration keeps failing.
+        std::vector<std::unique_ptr<Common::HostMemory>> memories;
+        for (size_t i = 0; i < 2; ++i) {
+            memories.push_back(std::make_unique<Common::HostMemory>(Backing, Virtual));
+            REQUIRE(memories.back()->BackingBasePointer() != nullptr);
+            if (memories.back()->VirtualBasePointer() == nullptr) {
+                SKIP("no fastmem arena");
+            }
+        }
+        CHECK(access.FastmemAttempts() == 2);
+        for (const auto& memory : memories) {
+            u8* const backing = memory->BackingBasePointer();
+            CHECK(Query(backing).State == MEM_COMMIT);
+            CHECK(Query(backing + backing_size - 1).State == MEM_COMMIT);
+            // Nothing committed this page: with no handler, the access must not need one.
+            backing[backing_size - 1] = 0x5a;
+            CHECK(backing[backing_size - 1] == 0x5a);
+            CHECK(memory->CommittedBytes() == 0);
+        }
+    }
+    // A failed registration isn't kept: the next section installs the handler and reserves.
+    Common::HostMemory memory{Backing, Virtual};
+    REQUIRE(memory.BackingBasePointer() != nullptr);
+    CHECK(Query(memory.BackingBasePointer()).State == MEM_RESERVE);
+}
 #endif
 
 TEST_CASE("Kernel allocations fail softly when guest memory can't be committed",

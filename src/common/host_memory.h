@@ -142,6 +142,7 @@ private:
         bool fail_fallback;
         size_t fastmem_attempts{};
         size_t fallback_attempts{};
+        bool fail_fault_handler{}; ///< Windows: as if the fault handler's registration failed
     };
     static thread_local AllocationTestControl* allocation_test_control;
 

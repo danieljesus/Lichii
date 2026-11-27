@@ -29,6 +29,20 @@ public:
         control.fail_fallback = true;
     }
 
+    void AllowFastmem() {
+        control.fail_fastmem = false;
+    }
+
+    /// Windows: the fault handler's registration fails, as when AddVectoredExceptionHandler
+    /// returns null.
+    void FailFaultHandler() {
+        control.fail_fault_handler = true;
+    }
+
+    size_t BackingSize() const {
+        return control.backing_size;
+    }
+
     size_t FastmemAttempts() const {
         return control.fastmem_attempts;
     }
