@@ -152,7 +152,7 @@ TEST_CASE("Windows guest memory is committed whole when the fault handler can't 
         SKIP("the section is committed whole");
     }
     {
-        Common::HostMemoryTestAccess access;
+        Common::HostMemoryTestAccess access{false};
         access.AllowFastmem();
         access.FailFaultHandler();
         const size_t backing_size = access.BackingSize();
@@ -170,16 +170,21 @@ TEST_CASE("Windows guest memory is committed whole when the fault handler can't 
             u8* const backing = memory->BackingBasePointer();
             CHECK(Query(backing).State == MEM_COMMIT);
             CHECK(Query(backing + backing_size - 1).State == MEM_COMMIT);
-            // Nothing committed this page: with no handler, the access must not need one.
+            // Nothing handed this page out: with no handler, the access must not need one.
             backing[backing_size - 1] = 0x5a;
             CHECK(backing[backing_size - 1] == 0x5a);
             CHECK(memory->CommittedBytes() == 0);
         }
     }
-    // A failed registration isn't kept: the next section installs the handler and reserves.
+    // Once the injected failure is gone, a new section reserves again, and a write to a page
+    // nothing handed out is committed by the fault handler.
     Common::HostMemory memory{Backing, Virtual};
-    REQUIRE(memory.BackingBasePointer() != nullptr);
-    CHECK(Query(memory.BackingBasePointer()).State == MEM_RESERVE);
+    u8* const backing = memory.BackingBasePointer();
+    REQUIRE(backing != nullptr);
+    CHECK(Query(backing).State == MEM_RESERVE);
+    backing[0] = 0x5a;
+    CHECK(backing[0] == 0x5a);
+    CHECK(Query(backing).State == MEM_COMMIT);
 }
 #endif
 
