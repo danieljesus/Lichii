@@ -522,60 +522,64 @@ jobs:
           if [[ '${{ matrix.pgo }}' == 'true' ]]; then
             if cmake --build build/release --target $targets --parallel 2>&1 |
                 tee --output-error=warn "$RUNNER_TEMP/pgo-build.log"; then
-              # A function whose code changed since training loses its profile data and is compiled
-              # as without a profile. The summary splits those in this repository's src/ that the
-              # training reached (a nonzero discarded count) from the rest, and the job warns with
-              # their names: nothing fails, but none ships unprofiled unseen. ThinLTO can name the
-              # object under build/release/src/ instead of the source, so both count as src/. One is
-              # known and counted apart: lichii-cmd's main, whose name the profile trained on the
-              # lichii executable's main also has.
-              root=$(pwd -P)
-              if command -v cygpath > /dev/null; then root=$(cygpath -m "$root"); fi
-              hot_list="$RUNNER_TEMP/pgo-hot-mismatches.txt"
-              : > "$hot_list"
-              # The paths go through the environment: awk -v would read a Windows path's backslashes
-              # as escapes.
-              PGO_ROOT="$root" PGO_HOT_LIST="$hot_list" awk -v platform='${{ matrix.platform }}' '
-                function norm(s) { gsub(/\\/, "/", s); return tolower(s) }
-                BEGIN { nroot = norm(ENVIRON["PGO_ROOT"]) "/"; hot_list = ENVIRON["PGO_HOT_LIST"] }
-                /function control flow change detected \(hash mismatch\).* up to [0-9]+ count discarded/ {
-                  total++
-                  counted = $0 ~ / up to [1-9][0-9]* count discarded/
-                  if (counted) nonzero++
-                  line = norm($0)
-                  at = index(line, nroot)
-                  rest = at ? substr(line, at + length(nroot)) : ""
-                  if (counted && rest ~ /^(build\/release\/)?src\//) {
-                    name = match($0, /\(hash mismatch\) [^ ]+/) ? substr($0, RSTART + 16, RLENGTH - 16) : ""
-                    if (name == "main" && rest ~ /^(build\/release\/)?src\/lichii_cmd\//) {
-                      known++
-                    } else {
-                      ours++
-                      if (name != "") print name > hot_list
+              # The summary only reports: the binaries are built by now, so nothing in it may fail the
+              # step. It runs in a subshell whose failure is a warning.
+              (
+                # A function whose code changed since training loses its profile data and is compiled
+                # as without a profile. The summary splits those in this repository's src/ that the
+                # training reached (a nonzero discarded count) from the rest, and the job warns with
+                # their names: nothing fails, but none ships unprofiled unseen. ThinLTO can name the
+                # object under build/release/src/ instead of the source, so both count as src/. One is
+                # known and counted apart: lichii-cmd's main, whose name the profile trained on the
+                # lichii executable's main also has.
+                root=$(pwd -P)
+                if command -v cygpath > /dev/null; then root=$(cygpath -m "$root"); fi
+                hot_list="$RUNNER_TEMP/pgo-hot-mismatches.txt"
+                : > "$hot_list"
+                # The paths go through the environment: awk -v would read a Windows path's backslashes
+                # as escapes.
+                PGO_ROOT="$root" PGO_HOT_LIST="$hot_list" awk -v platform='${{ matrix.platform }}' '
+                  function norm(s) { gsub(/\\/, "/", s); return tolower(s) }
+                  BEGIN { nroot = norm(ENVIRON["PGO_ROOT"]) "/"; hot_list = ENVIRON["PGO_HOT_LIST"] }
+                  /function control flow change detected \(hash mismatch\).* up to [0-9]+ count discarded/ {
+                    total++
+                    counted = $0 ~ / up to [1-9][0-9]* count discarded/
+                    if (counted) nonzero++
+                    line = norm($0)
+                    at = index(line, nroot)
+                    rest = at ? substr(line, at + length(nroot)) : ""
+                    if (counted && rest ~ /^(build\/release\/)?src\//) {
+                      name = match($0, /\(hash mismatch\) [^ ]+/) ? substr($0, RSTART + 16, RLENGTH - 16) : ""
+                      if (name == "main" && rest ~ /^(build\/release\/)?src\/lichii_cmd\//) {
+                        known++
+                      } else {
+                        ours++
+                        if (name != "") print name > hot_list
+                      }
                     }
                   }
-                }
-                /no profile data available for function/ { missing++ }
-                END {
-                  printf "### PGO profile mismatches: %s\n\n", platform
-                  printf "- Discarded profile warnings: %d\n- With nonzero counts: %d\n", total, nonzero
-                  printf "- In src/ with nonzero counts (lost their profile): %d\n", ours
-                  printf "- Known: another executable'\''s main (src/lichii_cmd/): %d\n", known
-                  printf "- Others (no counts, or outside src/): %d\n", total - ours - known
-                  if (platform ~ /^linux/) printf "- Missing-profile warnings: %d\n", missing
-                }
-              ' "$RUNNER_TEMP/pgo-build.log" >> "$GITHUB_STEP_SUMMARY" ||
-                echo "::warning::Could not write PGO mismatch summary"
-              hot=$({ sort -u "$hot_list" | head -n 20 | paste -sd ' ' -; } 2> /dev/null || true)
-              if [ -n "$hot" ]; then
-                echo "::warning::Functions in src/ changed since the profile was trained and compile without profile data (retrain, see docs/CI.md): $hot"
-              fi
-              if [[ "${{ matrix.platform }}" == linux* ]]; then
-                missing=$(grep -c 'no profile data available for function' "$RUNNER_TEMP/pgo-build.log" || true)
-                if (( missing > PGO_MISSING_MAX )); then
-                  echo "::warning::$missing missing-profile warnings (more than $PGO_MISSING_MAX): the profile no longer matches this tree or its paths, see docs/CI.md"
+                  /no profile data available for function/ { missing++ }
+                  END {
+                    printf "### PGO profile mismatches: %s\n\n", platform
+                    printf "- Discarded profile warnings: %d\n- With nonzero counts: %d\n", total, nonzero
+                    printf "- In src/ with nonzero counts (lost their profile): %d\n", ours
+                    printf "- Known: another executable'\''s main (src/lichii_cmd/): %d\n", known
+                    printf "- Others (no counts, or outside src/): %d\n", total - ours - known
+                    if (platform ~ /^linux/) printf "- Missing-profile warnings: %d\n", missing
+                  }
+                ' "$RUNNER_TEMP/pgo-build.log" >> "$GITHUB_STEP_SUMMARY" ||
+                  echo "::warning::Could not write PGO mismatch summary"
+                hot=$({ sort -u "$hot_list" | head -n 20 | paste -sd ' ' -; } 2> /dev/null || true)
+                if [ -n "$hot" ]; then
+                  echo "::warning::Functions in src/ changed since the profile was trained and compile without profile data (retrain, see docs/CI.md): $hot"
                 fi
-              fi
+                if [[ "${{ matrix.platform }}" == linux* ]]; then
+                  missing=$(grep -c 'no profile data available for function' "$RUNNER_TEMP/pgo-build.log" || true)
+                  if (( missing > PGO_MISSING_MAX )); then
+                    echo "::warning::$missing missing-profile warnings (more than $PGO_MISSING_MAX): the profile no longer matches this tree or its paths, see docs/CI.md"
+                  fi
+                fi
+              ) || echo "::warning::PGO mismatch summary failed; the build itself succeeded"
             else
               build_status=${PIPESTATUS[0]}
               if (( build_status != 0 )); then exit "$build_status"; fi
