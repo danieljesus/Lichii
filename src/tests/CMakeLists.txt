@@ -529,6 +529,9 @@ if (NOT ANDROID)
         ../frontend_common/recommended_settings.cpp)
     target_link_libraries(config_tests PRIVATE common SimpleIni::SimpleIni Catch2::Catch2WithMain
         ${PLATFORM_LIBRARIES})
+    # Tests::InitializeTestLog, the same folder as the tests target's.
+    target_compile_definitions(config_tests PRIVATE
+        LICHII_TESTS_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test-log")
     add_test(NAME config_tests COMMAND config_tests)
 
     add_executable(profile_import_tests

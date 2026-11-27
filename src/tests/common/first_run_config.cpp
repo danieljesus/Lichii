@@ -20,6 +20,7 @@
 #include "frontend_common/config.h"
 #include "frontend_common/recommended_settings.h"
 #include "tests/common/restore_eden_path.h"
+#include "tests/common/test_log.h"
 
 namespace {
 
@@ -623,9 +624,8 @@ TEST_CASE("A fresh config keeps the data paths without an error", "[config]") {
     // dump, TAS and screenshot paths at every start.
     using Common::FS::EdenPath;
     ConfigDirectory directory;
-    // The log file stays where the first test to initialize the log put it: other tests read it
-    // back through Log::FilePath, so this one doesn't move or remove it.
-    Common::Log::Initialize();
+    // The log file goes to the tests' folder in the build tree, never the user's log folder.
+    Tests::InitializeTestLog();
     // Every class at every level, so a missing error line cannot be a filtered one. The ring has
     // no getter for its capacity, so it is turned off afterwards, as the other ring tests do.
     Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Trace});

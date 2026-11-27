@@ -12,6 +12,7 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "tests/common/test_log.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 
 namespace {
@@ -38,9 +39,8 @@ TEST_CASE("Optional instance extensions a driver lacks are left out without an e
     // The headless surface, debug utils and (on macOS) portability enumeration probes used the
     // required extensions' check, which logs "Required instance extension ... is not available"
     // at error level for each one the driver lacks.
-    // The log file stays where the first test to initialize the log put it: other tests read it
-    // back through Log::FilePath, so this one doesn't move or remove it.
-    Common::Log::Initialize();
+    // The log file goes to the tests' folder in the build tree, never the user's log folder.
+    Tests::InitializeTestLog();
     // Every class at every level, so a missing error line cannot be a filtered one. The ring has
     // no getter for its capacity, so it is turned off afterwards, as the other ring tests do.
     Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Trace});
