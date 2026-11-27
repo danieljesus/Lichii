@@ -179,9 +179,9 @@
     "moltenvk": {
         "artifact": "MoltenVK-macos.tar",
         "bundled": true,
-        "hash": "c5cad6382b5208a6fddcb08ac09b5a27aba5865201d48cfca93438bcd2146c866ae503244e4e5224117af79d17f5fcd07aa14cc04266fd8d995c4867bbb916a4",
+        "hash": "90f5979041ab2ae5b3f386cd5596dd699765da91b8034a2a7b06455d6d56e7468d9ef9c05635ed83699d0cee56fe2d61e69ac1371e64df42d11d9d0a33d3378e",
         "repo": "danieljesus/Ryujinx.MoltenVK",
-        "version": "v1.4.1-ryujinx-coopmat.2"
+        "version": "v1.4.1-ryujinx-coopmat.3"
     },
     "nlohmann": {
         "hash": "6cc1e86261f8fac21cc17a33da3b6b3c3cd5c116755651642af3c9e99bb3538fd42c1bd50397a77c8fb6821bc62d90e6b91bcdde77a78f58f2416c62fc53b97d",
