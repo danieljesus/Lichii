@@ -26,16 +26,18 @@ Build 9 against build 8, same scene, alternating runs:
 | Machine | Standing still | Turning the camera |
 |---|---|---|
 | Apple M6 (macOS, MoltenVK) | 37 → 60 fps (the game's cap) | 34 → 52 fps |
-| Steam Deck OLED, default power settings | 15.9 → 16.8 fps | 13.6 → 14.2 fps |
-| Steam Deck OLED, GPU clock fixed at 1600 MHz | 18.8 → 20.0 fps | 15.0 → 16.8 fps |
+| Steam Deck OLED | 21.4 → 22.8 fps | 17.6 → 18.6 fps |
 | RTX 5080 (Windows) | 59.8 → 59.6 fps (60 fps cap) | 50.8 → 50.5 fps |
 
-Build 9's gains are on macOS and on the Steam Deck (both Deck rows with GameMode turned off in the emulator; the fixed-clock row was measured with a diagnostic trace on, which costs about 2 % turning the camera); on Windows it performs the same as build 8. These are one game on three machines and say nothing about other titles.
+Build 9's gains are on macOS and on the Steam Deck (there with GameMode turned off in the emulator; absolute frame rates on the Deck vary from one session to another, the comparison between builds within a session is what holds); on Windows it performs the same as build 8. These are one game on three machines and say nothing about other titles. The Deck's row was measured on the published package; the Mac's and the Windows rows on builds made as the release job makes them, each then checked against the published package.
 
 ## Known issues
 
 - Rarely, the game stops on its opening video right after starting. Close the emulator and start again.
 - On Linux, GameMode 1.8 and later undoes the four-core thread layout unless its CPU pinning is turned off; the log explains how.
+- Rarely the emulator can crash from a race in the GPU query cache (seen once in over a hundred runs, while quitting; a fix is proposed upstream as #2627).
+- macOS: with the internal resolution at 2x, Ocarina of Time closes about a minute after starting. 1x and 1.5x are not affected; a fix is being tested.
+- Build 9's Linux PGO package was built with part of its optimization profile not applied; measured, it performs like a correctly built one. The next build fixes the release job.
 
 ## Thanks
 
