@@ -1,30 +1,30 @@
 {
-  "summary": "A shader cache that survives on a Mac, a safer cache file, and upstream's Mod Store.",
+  "summary": "Faster on a Mac and on a Steam Deck, the first-start picture bug fixed, and Lichii nx2 of late November.",
   "changes": [
     {
       "icon": "cpu",
-      "title": "Shader cache kept on a Mac",
-      "body": "On macOS the graphics driver's shader cache is no longer thrown away the second time you start a game. It loads, and the game is on screen a few seconds sooner. The first start after updating prepares the shaders once more."
-    },
-    {
-      "icon": "download",
-      "title": "A safer shader cache file",
-      "body": "Saving the driver's shader cache while a shader is being built no longer replaces a good file with an empty one, and a shader precache is marked as done only once its work is on disk."
+      "title": "Faster on a Mac",
+      "body": "The bundled MoltenVK lets Metal optimize the shaders' precise arithmetic, and more of the game's compute work takes the fast path. On an Apple M6, Ocarina of Time goes from about 37 frames per second to the game's 60 standing still, and from 34 to 52 turning the camera."
     },
     {
       "icon": "layers",
-      "title": "Precompiled shaders from another device",
-      "body": "A precompiled shader store made on a different kind of device (a PC's on a Mac, for example) now says so in the log, instead of counting those shaders as ready."
+      "title": "First-start picture bug fixed",
+      "body": "On macOS the picture could come out white, dark or covered in stretched triangles on a first start with nothing built yet. That is fixed."
     },
     {
-      "icon": "apps",
-      "title": "Mod Store",
-      "body": "From Lichii nx2: browse and install mods from the desktop app."
+      "icon": "cpu",
+      "title": "A core for the GPU thread on four-core CPUs",
+      "body": "On Linux, on CPUs with four cores and eight threads such as the Steam Deck's, the GPU thread gets a core to itself. On a Steam Deck, Ocarina of Time gains 3 to 6 % with default power settings, and up to 12 % with the GPU clock fixed at 1600 MHz and GameMode turned off in the emulator's settings. GameMode undoes the thread layout unless its CPU pinning is turned off; the log explains how."
+    },
+    {
+      "icon": "download",
+      "title": "Optimization profiles that apply in full",
+      "body": "The PGO builds for Linux and Windows are trained on this build's code, and no longer lose part of the profile because of the folder they were built in."
     },
     {
       "icon": "clock",
-      "title": "Also from nx2",
-      "body": "Large ASTC texture arrays are decoded in batches, FlyHigh frame generation is available as a Windows opt-in, and a hung GPU driver can be reported instead of freezing the app (opt-in)."
+      "title": "From Lichii nx2",
+      "body": "Fixes for textures used after they were retired, shader translation fixes, saves and installs that failed on open files on Windows, an option to keep the window size, and fixes for several other titles."
     },
     {
       "icon": "sparkles",

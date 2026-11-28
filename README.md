@@ -5,6 +5,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
+> [!NOTE]
+> This is the **`zelda` branch** of a personal fork: very experimental, tuned with *Ocarina of Time* only, and not an official Lichii release. See [ZELDA.md](ZELDA.md) for what it changes. For Lichii itself, go to [zortos293/Lichii](https://github.com/zortos293/Lichii).
+
 <h2 align="center">⚠️ Lichii has no official website ⚠️</h2>
 
 > [!CAUTION]
